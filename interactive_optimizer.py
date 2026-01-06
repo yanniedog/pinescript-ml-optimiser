@@ -98,7 +98,8 @@ def build_args(pine_file, options):
     """Build argument list for optimize_indicator.py main function."""
     args = [str(pine_file)]
     
-    if 'max_trials' in options:
+    # Only pass max_trials if it's a specific number (not None = unlimited)
+    if 'max_trials' in options and options['max_trials'] is not None:
         args.extend(['--max-trials', str(options['max_trials'])])
     
     if 'timeout' in options:
@@ -157,17 +158,12 @@ def main():
             print("[ERROR] Please enter a valid number")
     
     options['timeout'] = int(timeout_minutes * 60)
-    
-    # Auto-calculate trials based on time available
-    # Estimate: ~30 trials per minute is typical (varies by indicator complexity)
-    # We set a higher cap to ensure timeout is the limiting factor
-    TRIALS_PER_MINUTE = 30
-    auto_trials = max(50, int(timeout_minutes * TRIALS_PER_MINUTE * 1.5))  # 1.5x buffer
-    options['max_trials'] = auto_trials
+    # No trial limit - let it run unlimited trials until timeout
+    options['max_trials'] = None
     
     print(f"\nOptimization configured:")
     print(f"  - Time limit: {timeout_minutes:.1f} minute(s)")
-    print(f"  - Max trials: {auto_trials} (auto-calculated, time is the limiting factor)")
+    print(f"  - Trials: unlimited (will run as many as possible until time limit)")
     print(f"  - Press Ctrl-Q anytime to stop early and use current best results")
     
     # Ask if user wants to customize other options

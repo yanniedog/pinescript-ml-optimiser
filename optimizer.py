@@ -237,6 +237,7 @@ class OptimizationResult:
     study: optuna.Study = None
     improvement_history: List[dict] = field(default_factory=list)  # Detailed history with params
     baseline_objective: float = 0.0  # Original config's objective score
+    per_symbol_metrics: Dict[str, Dict[str, BacktestMetrics]] = field(default_factory=dict)  # {symbol: {'original': metrics, 'optimized': metrics}}
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
@@ -267,7 +268,7 @@ class PineOptimizer:
         self,
         parse_result: ParseResult,
         data: Dict[str, pd.DataFrame],
-        max_trials: int = 150,
+        max_trials: Optional[int] = None,  # None = unlimited trials (use timeout)
         timeout_seconds: int = 300,  # 5 minutes default
         n_startup_trials: int = 20,
         pruning_warmup_trials: int = 30,
@@ -280,7 +281,7 @@ class PineOptimizer:
         Args:
             parse_result: Parsed Pine Script information
             data: Dict of symbol -> DataFrame with OHLCV data
-            max_trials: Maximum optimization trials
+            max_trials: Maximum optimization trials (None = unlimited, use timeout)
             timeout_seconds: Maximum time for optimization
             n_startup_trials: Random trials before TPE kicks in
             pruning_warmup_trials: Trials before pruning starts
@@ -441,7 +442,8 @@ class PineOptimizer:
                 
                 # Warn about diminishing returns (only if we're actually improving)
                 if pct_vs_original > 0 and len(self.progress_tracker.improvement_history) >= 3:
-                    recent_pcts = [p for _, _, p in self.progress_tracker.improvement_history[-3:]]
+                    # History format: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
+                    recent_pcts = [entry[2] for entry in self.progress_tracker.improvement_history[-3:]]
                     # Check if improvement rate is slowing significantly
                     if len(recent_pcts) >= 2:
                         recent_gain = recent_pcts[-1] - recent_pcts[-2]
@@ -462,7 +464,8 @@ class PineOptimizer:
             OptimizationResult with best parameters and metrics
         """
         logger.info(f"Starting optimization with {len(self.optimizable_params)} parameters")
-        logger.info(f"Max trials: {self.max_trials}, Timeout: {self.timeout_seconds}s ({self.timeout_seconds/60:.1f} min)")
+        trials_str = "unlimited" if self.max_trials is None else str(self.max_trials)
+        logger.info(f"Max trials: {trials_str}, Timeout: {self.timeout_seconds}s ({self.timeout_seconds/60:.1f} min)")
         
         if self.enable_keyboard_interrupt:
             logger.info("Press Ctrl-Q at any time to stop optimization and use current best results")
@@ -529,8 +532,9 @@ class PineOptimizer:
             logger.info(f"Optimization stopped by user after {optimization_time:.1f}s ({self.trial_count} trials)")
             logger.info("Using best parameters found so far...")
         
-        # Evaluate original params first
-        original_metrics = self._evaluate_params(self.original_params)
+        # Evaluate original params first (per-symbol)
+        original_per_symbol = self._evaluate_params_per_symbol(self.original_params)
+        original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
         original_objective = self._calculate_overall_objective(original_metrics)
         
         # Get best params from study
@@ -539,9 +543,18 @@ class PineOptimizer:
             if p.name in study.best_params:
                 best_params_candidate[p.name] = study.best_params[p.name]
         
-        # Evaluate best params candidate
-        best_metrics_candidate = self._evaluate_params(best_params_candidate)
+        # Evaluate best params candidate (per-symbol)
+        optimized_per_symbol = self._evaluate_params_per_symbol(best_params_candidate)
+        best_metrics_candidate = self._aggregate_metrics(list(optimized_per_symbol.values()))
         best_objective = self._calculate_overall_objective(best_metrics_candidate)
+        
+        # Build per-symbol metrics dict
+        per_symbol_metrics = {}
+        for symbol in self.translators:
+            per_symbol_metrics[symbol] = {
+                'original': original_per_symbol.get(symbol, BacktestMetrics()),
+                'optimized': optimized_per_symbol.get(symbol, BacktestMetrics())
+            }
         
         # Only use optimized params if they're actually better
         if best_objective > original_objective:
@@ -551,6 +564,9 @@ class PineOptimizer:
         else:
             best_params = self.original_params.copy()
             best_metrics = original_metrics
+            # If keeping original, set optimized = original in per-symbol
+            for symbol in per_symbol_metrics:
+                per_symbol_metrics[symbol]['optimized'] = per_symbol_metrics[symbol]['original']
             logger.info(f"Original params were optimal. Keeping original configuration.")
         
         # Calculate improvements
@@ -576,7 +592,8 @@ class PineOptimizer:
             optimal_horizon=best_metrics.forecast_horizon,
             study=study,
             improvement_history=self.progress_tracker.get_detailed_history(),
-            baseline_objective=self.progress_tracker.baseline_objective or 0.0
+            baseline_objective=self.progress_tracker.baseline_objective or 0.0,
+            per_symbol_metrics=per_symbol_metrics
         )
         
         logger.info(f"\n{result.get_summary()}")
@@ -600,27 +617,11 @@ class PineOptimizer:
         
         return 0.35 * pf_score + 0.30 * acc_score + 0.20 * sharpe_score + 0.15 * win_score
     
-    def _evaluate_params(self, params: Dict[str, Any]) -> BacktestMetrics:
-        """Evaluate a parameter set across all symbols."""
-        all_metrics = []
-        
-        for symbol in self.translators:
-            translator = self.translators[symbol]
-            backtester = self.backtesters[symbol]
-            
-            try:
-                indicator_result = translator.run_indicator(params)
-                use_discrete = bool(self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions)
-                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=use_discrete)
-                all_metrics.append(metrics)
-            except Exception as e:
-                logger.debug(f"Evaluation failed for {symbol}: {e}")
-                continue
-        
+    def _aggregate_metrics(self, all_metrics: List[BacktestMetrics]) -> BacktestMetrics:
+        """Aggregate metrics from multiple symbols into a single BacktestMetrics."""
         if not all_metrics:
             return BacktestMetrics()
         
-        # Aggregate metrics
         return BacktestMetrics(
             total_trades=sum(m.total_trades for m in all_metrics),
             winning_trades=sum(m.winning_trades for m in all_metrics),
@@ -636,6 +637,30 @@ class PineOptimizer:
             forecast_horizon=int(np.median([m.forecast_horizon for m in all_metrics])),
             improvement_over_random=np.mean([m.improvement_over_random for m in all_metrics])
         )
+    
+    def _evaluate_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
+        """Evaluate a parameter set and return per-symbol metrics."""
+        symbol_metrics = {}
+        
+        for symbol in self.translators:
+            translator = self.translators[symbol]
+            backtester = self.backtesters[symbol]
+            
+            try:
+                indicator_result = translator.run_indicator(params)
+                use_discrete = bool(self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions)
+                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=use_discrete)
+                symbol_metrics[symbol] = metrics
+            except Exception as e:
+                logger.debug(f"Evaluation failed for {symbol}: {e}")
+                continue
+        
+        return symbol_metrics
+    
+    def _evaluate_params(self, params: Dict[str, Any]) -> BacktestMetrics:
+        """Evaluate a parameter set across all symbols."""
+        symbol_metrics = self._evaluate_params_per_symbol(params)
+        return self._aggregate_metrics(list(symbol_metrics.values()))
 
 
 def optimize_indicator(

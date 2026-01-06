@@ -292,6 +292,76 @@ class OutputGenerator:
             
             report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
         
+        # Add per-symbol performance comparison table
+        if opt.per_symbol_metrics:
+            report_lines.extend([
+                "",
+                "-" * 70,
+                "PER-SYMBOL PERFORMANCE",
+                "-" * 70,
+                "",
+                "  Profit Factor by Symbol:",
+                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+            ])
+            
+            for symbol in sorted(opt.per_symbol_metrics.keys()):
+                sym_data = opt.per_symbol_metrics[symbol]
+                orig_pf = sym_data['original'].profit_factor
+                opt_pf = sym_data['optimized'].profit_factor
+                if orig_pf > 0:
+                    change = (opt_pf - orig_pf) / orig_pf * 100
+                    change_str = f"{change:+.1f}%"
+                else:
+                    change_str = "N/A"
+                report_lines.append(f"  {symbol:<12} {orig_pf:>10.2f} {opt_pf:>10.2f} {change_str:>10}")
+            
+            report_lines.extend([
+                "",
+                "  Win Rate by Symbol:",
+                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+            ])
+            
+            for symbol in sorted(opt.per_symbol_metrics.keys()):
+                sym_data = opt.per_symbol_metrics[symbol]
+                orig_wr = sym_data['original'].win_rate * 100
+                opt_wr = sym_data['optimized'].win_rate * 100
+                change = opt_wr - orig_wr
+                report_lines.append(f"  {symbol:<12} {orig_wr:>9.1f}% {opt_wr:>9.1f}% {change:>+9.1f}pp")
+            
+            report_lines.extend([
+                "",
+                "  Directional Accuracy by Symbol:",
+                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+            ])
+            
+            for symbol in sorted(opt.per_symbol_metrics.keys()):
+                sym_data = opt.per_symbol_metrics[symbol]
+                orig_da = sym_data['original'].directional_accuracy * 100
+                opt_da = sym_data['optimized'].directional_accuracy * 100
+                change = opt_da - orig_da
+                report_lines.append(f"  {symbol:<12} {orig_da:>9.1f}% {opt_da:>9.1f}% {change:>+9.1f}pp")
+            
+            report_lines.extend([
+                "",
+                "  Trades by Symbol:",
+                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+            ])
+            
+            for symbol in sorted(opt.per_symbol_metrics.keys()):
+                sym_data = opt.per_symbol_metrics[symbol]
+                orig_trades = sym_data['original'].total_trades
+                opt_trades = sym_data['optimized'].total_trades
+                if orig_trades > 0:
+                    change = (opt_trades - orig_trades) / orig_trades * 100
+                    change_str = f"{change:+.1f}%"
+                else:
+                    change_str = "N/A"
+                report_lines.append(f"  {symbol:<12} {orig_trades:>10} {opt_trades:>10} {change_str:>10}")
+        
         # Add improvement history section
         report_lines.extend([
             "",

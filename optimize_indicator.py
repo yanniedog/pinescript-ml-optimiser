@@ -75,8 +75,8 @@ Examples:
     parser.add_argument(
         '--max-trials',
         type=int,
-        default=150,
-        help='Maximum optimization trials (default: 150)'
+        default=None,
+        help='Maximum optimization trials (default: unlimited, uses timeout)'
     )
     parser.add_argument(
         '--timeout',
@@ -185,7 +185,8 @@ Examples:
             print(f"   Sell signals: {signal_info.sell_conditions}")
         
         # Step 3: Run Optimization
-        print_step(3, total_steps, f"Running optimization ({args.max_trials} trials, ~{args.timeout/60:.1f} min)...")
+        trials_str = "unlimited" if args.max_trials is None else str(args.max_trials)
+        print_step(3, total_steps, f"Running optimization ({trials_str} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
         print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe")

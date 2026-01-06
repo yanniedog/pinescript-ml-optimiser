@@ -246,14 +246,22 @@ class WalkForwardBacktester:
         else:
             sharpe = 0
         
-        # Max drawdown
-        cumulative = np.cumsum(returns)
-        running_max = np.maximum.accumulate(cumulative)
-        drawdowns = cumulative - running_max
-        max_drawdown = abs(np.min(drawdowns)) if len(drawdowns) > 0 else 0
+        # Max drawdown - use compound equity curve, not sum of percentages
+        if len(returns) > 0:
+            # Convert percentage returns to multipliers and compound them
+            equity = 100 * np.cumprod(1 + np.array(returns) / 100)
+            running_max = np.maximum.accumulate(equity)
+            # Calculate drawdown as percentage of peak
+            drawdowns = (equity - running_max) / running_max * 100
+            max_drawdown = abs(np.min(drawdowns))
+            # Cap at 100% - can't lose more than total equity (no leverage modeled)
+            max_drawdown = min(100.0, max_drawdown)
+        else:
+            max_drawdown = 0
         
-        # Directional accuracy
+        # Directional accuracy (average across folds, clamped to valid range)
         directional_accuracy = np.mean([m.directional_accuracy for m in fold_metrics])
+        directional_accuracy = max(0.0, min(1.0, directional_accuracy))  # Safety clamp
         
         # Improvement over random (50% baseline)
         improvement_over_random = (directional_accuracy - 0.5) / 0.5 * 100 if directional_accuracy > 0.5 else 0
@@ -441,18 +449,28 @@ class WalkForwardBacktester:
         
         # Directional accuracy for this fold
         test_returns = future_returns[test_start:test_end]
+        valid_mask = ~np.isnan(test_returns)  # Filter out NaN future returns
+        
         if use_discrete_signals:
             buy_sigs = indicator_result.buy_signals[test_start:test_end]
             sell_sigs = indicator_result.sell_signals[test_start:test_end]
             
-            correct = np.sum((buy_sigs & (test_returns > 0)) | (sell_sigs & (test_returns < 0)))
-            total_sigs = np.sum(buy_sigs | sell_sigs)
+            # Only count signals where we have valid future returns
+            correct = np.sum((buy_sigs & (test_returns > 0) & valid_mask) | 
+                           (sell_sigs & (test_returns < 0) & valid_mask))
+            total_sigs = np.sum((buy_sigs | sell_sigs) & valid_mask)
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
         else:
             sig = indicator_result.combined_signal[test_start:test_end]
-            correct = np.sum(((sig > 0) & (test_returns > 0)) | ((sig < 0) & (test_returns < 0)))
-            total_sigs = np.sum((sig > 0.1) | (sig < -0.1))
+            # Use consistent threshold (0.1) for both correct and total_sigs
+            threshold = 0.1
+            correct = np.sum(((sig > threshold) & (test_returns > 0) & valid_mask) | 
+                           ((sig < -threshold) & (test_returns < 0) & valid_mask))
+            total_sigs = np.sum(((sig > threshold) | (sig < -threshold)) & valid_mask)
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
+        
+        # Safety clamp: accuracy should be between 0 and 1
+        directional_accuracy = max(0.0, min(1.0, directional_accuracy))
         
         return BacktestMetrics(
             total_trades=len(trades),
