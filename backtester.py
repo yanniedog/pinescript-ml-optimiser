@@ -59,6 +59,8 @@ class BacktestMetrics:
     directional_accuracy: float = 0.0  # How well signals predict direction
     forecast_horizon: int = 0  # Optimal forecast horizon in bars
     improvement_over_random: float = 0.0
+    tail_capture_rate: float = 0.0  # Ability to capture extreme moves
+    consistency_score: float = 0.0  # Stability across walk-forward folds
     trades: List[Trade] = field(default_factory=list)
     
     def to_dict(self) -> Dict:
@@ -75,7 +77,9 @@ class BacktestMetrics:
             'avg_holding_bars': self.avg_holding_bars,
             'directional_accuracy': self.directional_accuracy,
             'forecast_horizon': self.forecast_horizon,
-            'improvement_over_random': self.improvement_over_random
+            'improvement_over_random': self.improvement_over_random,
+            'tail_capture_rate': self.tail_capture_rate,
+            'consistency_score': self.consistency_score
         }
 
 
@@ -107,6 +111,8 @@ class WalkForwardBacktester:
     # Forecast horizons to test (in bars/hours for 1H data)
     # Broad continuum from 1 hour to 1 week (168 hours)
     FORECAST_HORIZONS = [1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 30, 36, 42, 48, 60, 72, 84, 96, 120, 144, 168]
+    EXTREME_RETURN_PERCENTILE = 0.8
+    SIGNAL_STRENGTH_PERCENTILE = 0.75
     
     def __init__(
         self,
@@ -280,6 +286,12 @@ class WalkForwardBacktester:
         # Directional accuracy (average across folds, clamped to valid range)
         directional_accuracy = np.mean([m.directional_accuracy for m in fold_metrics])
         directional_accuracy = max(0.0, min(1.0, directional_accuracy))  # Safety clamp
+
+        # Extreme move capture rate (average across folds)
+        tail_capture_rate = np.mean([m.tail_capture_rate for m in fold_metrics]) if fold_metrics else 0.0
+
+        # Consistency across folds (profit factor + directional accuracy stability)
+        consistency_score = self._calculate_consistency_score(fold_metrics)
         
         # Improvement over random (50% baseline)
         improvement_over_random = (directional_accuracy - 0.5) / 0.5 * 100 if directional_accuracy > 0.5 else 0
@@ -301,8 +313,32 @@ class WalkForwardBacktester:
             directional_accuracy=directional_accuracy,
             forecast_horizon=median_horizon,  # Use median of fold-specific horizons
             improvement_over_random=improvement_over_random,
+            tail_capture_rate=tail_capture_rate,
+            consistency_score=consistency_score,
             trades=all_trades
         )
+
+    def _calculate_consistency_score(self, fold_metrics: List[BacktestMetrics]) -> float:
+        """Estimate stability across folds (0-1). Higher = more consistent."""
+        if not fold_metrics:
+            return 0.0
+
+        def score(values: List[float]) -> float:
+            if not values:
+                return 0.0
+            mean = np.mean(values)
+            if mean <= 0:
+                return 0.0
+            cv = np.std(values) / mean
+            return 1 / (1 + cv)
+
+        pf_values = [m.profit_factor for m in fold_metrics if m.total_trades > 0]
+        acc_values = [m.directional_accuracy for m in fold_metrics if m.total_trades > 0]
+
+        pf_score = score(pf_values)
+        acc_score = score(acc_values)
+
+        return float(np.mean([pf_score, acc_score]))
     
     def _find_optimal_horizon(
         self,
@@ -456,6 +492,70 @@ class WalkForwardBacktester:
             total = pos_total + neg_total
         
         return total_correct / total if total > 0 else 0.5
+
+    def _calculate_tail_capture_rate(
+        self,
+        indicator_result: IndicatorResult,
+        fold: WalkForwardFold,
+        horizon: int,
+        use_discrete_signals: bool
+    ) -> float:
+        """
+        Measure how well the indicator captures significant highs/lows.
+
+        Thresholds are derived from training data only to avoid lookahead bias.
+        """
+        train_returns = self._future_returns[horizon][fold.train_start:fold.train_end]
+        train_returns = train_returns[~np.isnan(train_returns)]
+
+        if len(train_returns) < 50:
+            return 0.0
+
+        high_threshold = np.percentile(train_returns, self.EXTREME_RETURN_PERCENTILE * 100)
+        low_threshold = np.percentile(train_returns, (1 - self.EXTREME_RETURN_PERCENTILE) * 100)
+
+        test_end = fold.test_end
+        effective_end = min(test_end, self.length) - horizon
+        if effective_end <= fold.test_start:
+            return 0.0
+
+        test_returns = self._future_returns[horizon][fold.test_start:effective_end]
+        valid_mask = ~np.isnan(test_returns)
+
+        if not np.any(valid_mask):
+            return 0.0
+
+        up_moves = (test_returns >= high_threshold) & valid_mask
+        down_moves = (test_returns <= low_threshold) & valid_mask
+
+        if use_discrete_signals:
+            buy_sigs = indicator_result.buy_signals[fold.test_start:effective_end]
+            sell_sigs = indicator_result.sell_signals[fold.test_start:effective_end]
+        else:
+            train_signal = indicator_result.combined_signal[fold.train_start:fold.train_end]
+            train_signal = train_signal[~np.isnan(train_signal)]
+            if len(train_signal) < 50:
+                return 0.0
+            strength_threshold = np.percentile(
+                np.abs(train_signal),
+                self.SIGNAL_STRENGTH_PERCENTILE * 100
+            )
+            strength_threshold = max(0.1, strength_threshold)
+            test_signal = indicator_result.combined_signal[fold.test_start:effective_end]
+            buy_sigs = test_signal >= strength_threshold
+            sell_sigs = test_signal <= -strength_threshold
+
+        captured_up = np.sum(buy_sigs & up_moves)
+        captured_down = np.sum(sell_sigs & down_moves)
+        total_extremes = np.sum(up_moves) + np.sum(down_moves)
+
+        signal_count = np.sum(buy_sigs | sell_sigs)
+        captured_total = captured_up + captured_down
+
+        recall = captured_total / total_extremes if total_extremes > 0 else 0.0
+        precision = captured_total / signal_count if signal_count > 0 else 0.0
+
+        return (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
     
     def _evaluate_fold(
         self,
@@ -473,6 +573,10 @@ class WalkForwardBacktester:
         """
         test_start = fold.test_start
         test_end = fold.test_end
+        effective_end = min(test_end, self.length) - horizon
+        
+        if effective_end <= test_start:
+            return BacktestMetrics()
         
         # VALIDATION: Ensure we're only using test data, not training data
         if test_start < fold.train_end:
@@ -486,15 +590,12 @@ class WalkForwardBacktester:
         
         if use_discrete_signals:
             # Trade on discrete buy/sell signals
-            buy_signals = indicator_result.buy_signals[test_start:test_end]
-            sell_signals = indicator_result.sell_signals[test_start:test_end]
+            buy_signals = indicator_result.buy_signals[test_start:effective_end]
+            sell_signals = indicator_result.sell_signals[test_start:effective_end]
             
             for i in range(len(buy_signals)):
                 bar = test_start + i
-                exit_bar = min(bar + horizon, self.length - 1)
-                
-                if exit_bar >= self.length:
-                    continue
+                exit_bar = bar + horizon
                 
                 if buy_signals[i]:
                     trades.append(Trade(
@@ -515,7 +616,7 @@ class WalkForwardBacktester:
                     ))
         else:
             # Trade on directional signal
-            signal = indicator_result.combined_signal[test_start:test_end]
+            signal = indicator_result.combined_signal[test_start:effective_end]
             prev_signal = np.roll(signal, 1)
             prev_signal[0] = 0
             
@@ -524,10 +625,7 @@ class WalkForwardBacktester:
             
             for i in range(len(signal)):
                 bar = test_start + i
-                exit_bar = min(bar + horizon, self.length - 1)
-                
-                if exit_bar >= self.length:
-                    continue
+                exit_bar = bar + horizon
                 
                 # Long entry
                 if signal[i] > threshold and prev_signal[i] <= threshold:
@@ -564,14 +662,27 @@ class WalkForwardBacktester:
         gross_profit = sum(t.return_pct for t in winning)
         gross_loss = abs(sum(t.return_pct for t in losing))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (10.0 if gross_profit > 0 else 0)
+
+        # Sharpe ratio (annualized for hourly data)
+        if len(returns) > 1 and np.std(returns) > 0:
+            sharpe_ratio = np.mean(returns) / np.std(returns) * np.sqrt(8760 / horizon)
+        else:
+            sharpe_ratio = 0.0
+
+        # Max drawdown - use compound equity curve
+        equity = 100 * np.cumprod(1 + np.array(returns) / 100)
+        running_max = np.maximum.accumulate(equity)
+        drawdowns = (equity - running_max) / running_max * 100
+        max_drawdown = abs(np.min(drawdowns)) if len(drawdowns) > 0 else 0.0
+        max_drawdown = min(100.0, max_drawdown)
         
         # Directional accuracy for this fold
-        test_returns = future_returns[test_start:test_end]
+        test_returns = future_returns[test_start:effective_end]
         valid_mask = ~np.isnan(test_returns)  # Filter out NaN future returns
         
         if use_discrete_signals:
-            buy_sigs = indicator_result.buy_signals[test_start:test_end]
-            sell_sigs = indicator_result.sell_signals[test_start:test_end]
+            buy_sigs = indicator_result.buy_signals[test_start:effective_end]
+            sell_sigs = indicator_result.sell_signals[test_start:effective_end]
             
             # Only count signals where we have valid future returns
             correct = np.sum((buy_sigs & (test_returns > 0) & valid_mask) | 
@@ -579,7 +690,7 @@ class WalkForwardBacktester:
             total_sigs = np.sum((buy_sigs | sell_sigs) & valid_mask)
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
         else:
-            sig = indicator_result.combined_signal[test_start:test_end]
+            sig = indicator_result.combined_signal[test_start:effective_end]
             # Use consistent threshold (0.1) for both correct and total_sigs
             threshold = 0.1
             correct = np.sum(((sig > threshold) & (test_returns > 0) & valid_mask) | 
@@ -589,6 +700,13 @@ class WalkForwardBacktester:
         
         # Safety clamp: accuracy should be between 0 and 1
         directional_accuracy = max(0.0, min(1.0, directional_accuracy))
+
+        tail_capture_rate = self._calculate_tail_capture_rate(
+            indicator_result,
+            fold,
+            horizon,
+            use_discrete_signals
+        )
         
         return BacktestMetrics(
             total_trades=len(trades),
@@ -598,8 +716,11 @@ class WalkForwardBacktester:
             avg_return=avg_return,
             win_rate=win_rate,
             profit_factor=profit_factor,
+            sharpe_ratio=sharpe_ratio,
+            max_drawdown=max_drawdown,
             directional_accuracy=directional_accuracy,
             forecast_horizon=horizon,
+            tail_capture_rate=tail_capture_rate,
             trades=trades
         )
     
@@ -624,13 +745,25 @@ class WalkForwardBacktester:
         
         # Win rate bonus
         win_score = metrics.win_rate
+
+        # Extreme move capture (highs/lows)
+        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
+
+        # Consistency across folds
+        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
+
+        # Drawdown penalty (lower drawdown -> higher score)
+        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
         
         # Combine with weights
         objective = (
-            0.35 * pf_score +
-            0.30 * acc_score +
-            0.20 * sharpe_score +
-            0.15 * win_score
+            0.25 * pf_score +
+            0.20 * acc_score +
+            0.15 * sharpe_score +
+            0.10 * win_score +
+            0.15 * tail_score +
+            0.10 * consistency_score +
+            0.05 * drawdown_score
         )
         
         # Penalty for too few trades
@@ -660,7 +793,7 @@ if __name__ == "__main__":
     volume = np.random.randint(1000, 10000, n).astype(float)
     
     df = pd.DataFrame({
-        'timestamp': pd.date_range('2020-01-01', periods=n, freq='1H'),
+        'timestamp': pd.date_range('2020-01-01', periods=n, freq='h'),
         'open': close + np.random.randn(n) * 0.2,
         'high': high,
         'low': low,
@@ -691,4 +824,3 @@ if __name__ == "__main__":
     print(f"  Directional accuracy: {metrics.directional_accuracy:.1%}")
     print(f"  Optimal forecast horizon: {metrics.forecast_horizon}h")
     print(f"  Improvement over random: {metrics.improvement_over_random:.1f}%")
-

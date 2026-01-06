@@ -714,8 +714,19 @@ class PineOptimizer:
         acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
         sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
         win_score = metrics.win_rate
+        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
+        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
+        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
         
-        return 0.35 * pf_score + 0.30 * acc_score + 0.20 * sharpe_score + 0.15 * win_score
+        return (
+            0.25 * pf_score +
+            0.20 * acc_score +
+            0.15 * sharpe_score +
+            0.10 * win_score +
+            0.15 * tail_score +
+            0.10 * consistency_score +
+            0.05 * drawdown_score
+        )
     
     def _aggregate_metrics(self, all_metrics: List[BacktestMetrics]) -> BacktestMetrics:
         """Aggregate metrics from multiple symbols into a single BacktestMetrics."""
@@ -735,7 +746,9 @@ class PineOptimizer:
             avg_holding_bars=np.mean([m.avg_holding_bars for m in all_metrics]),
             directional_accuracy=np.mean([m.directional_accuracy for m in all_metrics]),
             forecast_horizon=int(np.median([m.forecast_horizon for m in all_metrics])),
-            improvement_over_random=np.mean([m.improvement_over_random for m in all_metrics])
+            improvement_over_random=np.mean([m.improvement_over_random for m in all_metrics]),
+            tail_capture_rate=np.mean([m.tail_capture_rate for m in all_metrics]),
+            consistency_score=np.mean([m.consistency_score for m in all_metrics])
         )
     
     def _evaluate_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
@@ -808,7 +821,7 @@ if __name__ == "__main__":
             close = 100 + trend + noise
             
             data[symbol] = pd.DataFrame({
-                'timestamp': pd.date_range('2020-01-01', periods=n, freq='1H'),
+                'timestamp': pd.date_range('2020-01-01', periods=n, freq='h'),
                 'open': close + np.random.randn(n) * 0.2,
                 'high': close + np.abs(np.random.randn(n) * 0.3),
                 'low': close - np.abs(np.random.randn(n) * 0.3),
@@ -837,4 +850,3 @@ if __name__ == "__main__":
                 print(f"  {name}: {orig_str} -> {val_str}")
     else:
         print("Usage: python optimizer.py <pine_script_file>")
-

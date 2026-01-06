@@ -209,7 +209,7 @@ Examples:
         print_step(3, total_steps, f"Running optimization ({trials_str} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
-        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe")
+        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency + Drawdown")
         print()
         print(f"   [TIP] Press Q at any time to stop and use current best results")
         print(f"         Watch improvement rate - diminishing returns suggest stopping early")
@@ -251,6 +251,8 @@ Examples:
 |    * Profit Factor:       {metrics.profit_factor:>6.2f}                                  |
 |    * Win Rate:            {metrics.win_rate*100:>5.1f}%                                  |
 |    * Directional Accuracy:{metrics.directional_accuracy*100:>5.1f}%                                  |
+|    * Extreme Capture:     {metrics.tail_capture_rate*100:>5.1f}%                                  |
+|    * Consistency Score:   {metrics.consistency_score:>6.2f}                                  |
 |    * Sharpe Ratio:        {metrics.sharpe_ratio:>6.2f}                                  |
 |                                                                      |
 |  WHEN TO USE:                                                        |
@@ -352,4 +354,3 @@ if __name__ == "__main__":
         optimize_all_in_directory()
     else:
         main()
-
