@@ -108,15 +108,40 @@ class OptimizationProgressTracker:
     def __init__(self):
         self.start_time = None
         self.baseline_objective = None  # Original config's performance (set before optimization)
+        self.original_params = {}  # Original config's parameters
         self.best_objective = None
         self.best_time = None
         # Full history with params: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params_dict)
         self.improvement_history = []
     
-    def set_baseline(self, baseline_objective: float):
+    def set_baseline(self, baseline_objective: float, original_params: Dict[str, Any] = None):
         """Set the baseline objective (original config's performance)."""
         self.baseline_objective = baseline_objective
-        logger.info(f"Baseline objective (original config): {baseline_objective:.4f}")
+        self.original_params = original_params or {}
+        
+        # Format parameters for display
+        if original_params:
+            param_parts = []
+            for name, value in sorted(original_params.items()):
+                if isinstance(value, float):
+                    if abs(value) < 0.0001:
+                        val_str = f"{value:.2e}"
+                    elif abs(value) < 1:
+                        val_str = f"{value:.4f}"
+                    else:
+                        val_str = f"{value:.2f}"
+                else:
+                    val_str = str(value)
+                param_parts.append(f"{name}={val_str}")
+            params_str = ", ".join(param_parts)
+        else:
+            params_str = "N/A"
+        
+        # Use ANSI bold escape code for terminal output
+        BOLD = '\033[1m'
+        RESET = '\033[0m'
+        logger.info(f"Baseline objective (original config): {BOLD}{baseline_objective:.4f}{RESET}")
+        logger.info(f"Original parameters: {params_str}")
     
     def start(self):
         """Start tracking."""
@@ -259,11 +284,26 @@ class OptimizationResult:
     improvement_history: List[dict] = field(default_factory=list)  # Detailed history with params
     baseline_objective: float = 0.0  # Original config's objective score
     per_symbol_metrics: Dict[str, Dict[str, BacktestMetrics]] = field(default_factory=dict)  # {symbol: {'original': metrics, 'optimized': metrics}}
+    datasets_used: List[str] = field(default_factory=list)  # List of datasets used (symbol names, e.g., ["BTCUSDT", "ETHUSDT"])
+    interval: str = ""  # Timeframe/interval used (e.g., "1h", "4h", "1d")
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
+        # Format time nicely
+        total_seconds = self.optimization_time
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds % 60
+        
+        if hours > 0:
+            time_str = f"{hours}h {minutes}m {seconds:.1f}s"
+        elif minutes > 0:
+            time_str = f"{minutes}m {seconds:.1f}s"
+        else:
+            time_str = f"{seconds:.1f}s"
+        
         lines = [
-            f"Optimization completed in {self.optimization_time:.1f}s ({self.n_trials} trials)",
+            f"Optimization completed in {time_str} ({self.n_trials} trials)",
             f"",
             f"Performance Comparison:",
             f"  Profit Factor:  {self.original_metrics.profit_factor:.2f} -> {self.best_metrics.profit_factor:.2f} ({self.improvement_pf:+.1f}%)",
@@ -274,6 +314,10 @@ class OptimizationResult:
             f"",
             f"Optimal Forecast Horizon: {self.optimal_horizon} hours",
         ]
+        if self.datasets_used:
+            interval_str = f" @ {self.interval}" if self.interval else ""
+            lines.append(f"")
+            lines.append(f"Historical Datasets Used: {', '.join(sorted(self.datasets_used))}{interval_str}")
         return "\n".join(lines)
 
 
@@ -516,7 +560,7 @@ class PineOptimizer:
         self.user_stopped = False
         
         # Start progress tracking with original config as baseline
-        self.progress_tracker.set_baseline(original_objective)
+        self.progress_tracker.set_baseline(original_objective, self.original_params)
         self.progress_tracker.start()
         
         # Start keyboard monitoring if enabled
@@ -615,6 +659,9 @@ class PineOptimizer:
         else:
             improvement_acc = 0
         
+        # Get list of datasets used (symbols)
+        datasets_used = sorted(list(self.data.keys()))
+        
         result = OptimizationResult(
             best_params=best_params,
             original_params=self.original_params,
@@ -628,10 +675,28 @@ class PineOptimizer:
             study=study,
             improvement_history=self.progress_tracker.get_detailed_history(),
             baseline_objective=self.progress_tracker.baseline_objective or 0.0,
-            per_symbol_metrics=per_symbol_metrics
+            per_symbol_metrics=per_symbol_metrics,
+            datasets_used=datasets_used
         )
         
+        # Format total time nicely for logging
+        total_seconds = optimization_time
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds % 60
+        
+        if hours > 0:
+            time_str = f"{hours}h {minutes}m {seconds:.1f}s"
+        elif minutes > 0:
+            time_str = f"{minutes}m {seconds:.1f}s"
+        else:
+            time_str = f"{seconds:.1f}s"
+        
         logger.info(f"\n{result.get_summary()}")
+        logger.info(f"Total optimization time: {time_str}")
+        if datasets_used:
+            interval_str = f" @ {result.interval}" if result.interval else ""
+            logger.info(f"Historical datasets used: {', '.join(datasets_used)}{interval_str}")
         
         # Log improvement trajectory summary
         if self.progress_tracker.improvement_history:
@@ -701,6 +766,7 @@ class PineOptimizer:
 def optimize_indicator(
     parse_result: ParseResult,
     data: Dict[str, pd.DataFrame],
+    interval: str = "",
     **kwargs
 ) -> OptimizationResult:
     """
@@ -709,13 +775,17 @@ def optimize_indicator(
     Args:
         parse_result: Parsed Pine Script
         data: Dict of symbol -> DataFrame
+        interval: Timeframe/interval used (e.g., "1h", "4h", "1d")
         **kwargs: Additional arguments for PineOptimizer
         
     Returns:
         OptimizationResult
     """
     optimizer = PineOptimizer(parse_result, data, **kwargs)
-    return optimizer.optimize()
+    result = optimizer.optimize()
+    # Set interval in result
+    result.interval = interval
+    return result
 
 
 if __name__ == "__main__":

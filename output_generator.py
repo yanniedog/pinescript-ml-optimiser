@@ -235,6 +235,19 @@ class OutputGenerator:
         orig_metrics = opt.original_metrics
         best_metrics = opt.best_metrics
         
+        # Format time nicely
+        total_seconds = opt.optimization_time
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds % 60
+        
+        if hours > 0:
+            time_str = f"{hours}h {minutes}m {seconds:.1f}s"
+        elif minutes > 0:
+            time_str = f"{minutes}m {seconds:.1f}s"
+        else:
+            time_str = f"{seconds:.1f}s"
+        
         report_lines = [
             "=" * 70,
             f"ML OPTIMIZATION REPORT: {self.parse_result.indicator_name}",
@@ -245,8 +258,23 @@ class OutputGenerator:
             "OPTIMIZATION SUMMARY",
             "-" * 70,
             f"  Trials completed:     {opt.n_trials}",
-            f"  Optimization time:    {opt.optimization_time:.1f} seconds",
+            f"  Total time taken:     {time_str} ({opt.optimization_time:.1f} seconds)",
             f"  Parameters optimized: {len([p for p in opt.best_params if opt.best_params[p] != opt.original_params.get(p)])}",
+        ]
+        
+        # Add historical datasets used
+        if opt.datasets_used:
+            interval_str = f" @ {opt.interval}" if opt.interval else ""
+            report_lines.append(f"  Historical datasets:   {len(opt.datasets_used)} symbols{interval_str}")
+            report_lines.append("")
+            report_lines.append("  Datasets referenced:")
+            for dataset in sorted(opt.datasets_used):
+                dataset_str = f"{dataset}{interval_str}" if opt.interval else dataset
+                report_lines.append(f"    - {dataset_str}")
+        else:
+            report_lines.append(f"  Historical datasets:   Not specified")
+        
+        report_lines.extend([
             "",
             "-" * 70,
             "PERFORMANCE COMPARISON",
@@ -254,7 +282,7 @@ class OutputGenerator:
             "",
             f"  {'Metric':<25} {'Original':>12} {'Optimized':>12} {'Change':>12}",
             f"  {'-'*25} {'-'*12} {'-'*12} {'-'*12}",
-        ]
+        ])
         
         # Add metric comparisons
         metrics_to_compare = [

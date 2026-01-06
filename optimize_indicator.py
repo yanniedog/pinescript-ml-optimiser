@@ -218,6 +218,7 @@ Examples:
         optimization_result = optimize_indicator(
             parse_result,
             data,
+            interval=interval,
             max_trials=args.max_trials,
             timeout_seconds=args.timeout
         )
