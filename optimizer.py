@@ -1,0 +1,420 @@
+"""
+Optuna Optimizer for Pine Script Indicators
+Uses TPE (Tree-Parzen Estimator) with early pruning for efficient optimization.
+Optimized for Surface Pro with limited resources.
+"""
+
+import numpy as np
+import pandas as pd
+import optuna
+import logging
+import time
+from typing import Dict, Any, List, Callable, Optional, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pine_parser import ParseResult, Parameter
+from pine_translator import PineTranslator, IndicatorResult
+from backtester import WalkForwardBacktester, BacktestMetrics
+
+# Suppress Optuna's verbose logging
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OptimizationResult:
+    """Result of parameter optimization."""
+    best_params: Dict[str, Any]
+    original_params: Dict[str, Any]
+    best_metrics: BacktestMetrics
+    original_metrics: BacktestMetrics
+    n_trials: int
+    optimization_time: float
+    improvement_pf: float  # Profit factor improvement %
+    improvement_accuracy: float  # Directional accuracy improvement %
+    optimal_horizon: int  # Best forecast horizon
+    study: optuna.Study = None
+    
+    def get_summary(self) -> str:
+        """Generate human-readable summary."""
+        lines = [
+            f"Optimization completed in {self.optimization_time:.1f}s ({self.n_trials} trials)",
+            f"",
+            f"Performance Comparison:",
+            f"  Profit Factor:  {self.original_metrics.profit_factor:.2f} -> {self.best_metrics.profit_factor:.2f} ({self.improvement_pf:+.1f}%)",
+            f"  Win Rate:       {self.original_metrics.win_rate:.1%} -> {self.best_metrics.win_rate:.1%}",
+            f"  Dir. Accuracy:  {self.original_metrics.directional_accuracy:.1%} -> {self.best_metrics.directional_accuracy:.1%} ({self.improvement_accuracy:+.1f}%)",
+            f"  Sharpe Ratio:   {self.original_metrics.sharpe_ratio:.2f} -> {self.best_metrics.sharpe_ratio:.2f}",
+            f"  vs Random:      {self.best_metrics.improvement_over_random:+.1f}%",
+            f"",
+            f"Optimal Forecast Horizon: {self.optimal_horizon} hours",
+        ]
+        return "\n".join(lines)
+
+
+class PineOptimizer:
+    """
+    Optuna-based optimizer for Pine Script indicator parameters.
+    
+    Uses TPE sampler for sample-efficient Bayesian optimization.
+    Implements early pruning to quickly discard poor configurations.
+    """
+    
+    def __init__(
+        self,
+        parse_result: ParseResult,
+        data: Dict[str, pd.DataFrame],
+        max_trials: int = 150,
+        timeout_seconds: int = 300,  # 5 minutes default
+        n_startup_trials: int = 20,
+        pruning_warmup_trials: int = 30,
+        min_improvement_threshold: float = 0.1
+    ):
+        """
+        Initialize optimizer.
+        
+        Args:
+            parse_result: Parsed Pine Script information
+            data: Dict of symbol -> DataFrame with OHLCV data
+            max_trials: Maximum optimization trials
+            timeout_seconds: Maximum time for optimization
+            n_startup_trials: Random trials before TPE kicks in
+            pruning_warmup_trials: Trials before pruning starts
+            min_improvement_threshold: Minimum improvement to continue
+        """
+        self.parse_result = parse_result
+        self.data = data
+        self.max_trials = max_trials
+        self.timeout_seconds = timeout_seconds
+        self.n_startup_trials = n_startup_trials
+        self.pruning_warmup_trials = pruning_warmup_trials
+        self.min_improvement_threshold = min_improvement_threshold
+        
+        # Extract parameter info
+        self.parameters = parse_result.parameters
+        self.original_params = {p.name: p.default for p in self.parameters}
+        
+        # Filter to optimizable parameters (exclude display/visual params)
+        self.optimizable_params = self._get_optimizable_params()
+        
+        # Create translators and backtesters for each symbol
+        self.translators = {}
+        self.backtesters = {}
+        
+        for symbol, df in data.items():
+            self.translators[symbol] = PineTranslator(parse_result, df)
+            self.backtesters[symbol] = WalkForwardBacktester(df)
+        
+        # Tracking
+        self.best_objective = 0.0
+        self.trial_count = 0
+        self.start_time = None
+    
+    def _get_optimizable_params(self) -> List[Parameter]:
+        """Filter parameters to only those worth optimizing."""
+        skip_keywords = ['show', 'display', 'color', 'style', 'size', 'line']
+        
+        optimizable = []
+        for p in self.parameters:
+            name_lower = p.name.lower()
+            title_lower = p.title.lower()
+            
+            # Skip visual/display parameters
+            if any(kw in name_lower or kw in title_lower for kw in skip_keywords):
+                continue
+            
+            # Skip bool parameters that are likely display toggles
+            if p.param_type == 'bool' and any(kw in name_lower or kw in title_lower for kw in skip_keywords):
+                continue
+            
+            optimizable.append(p)
+        
+        logger.info(f"Found {len(optimizable)} optimizable parameters out of {len(self.parameters)}")
+        return optimizable
+    
+    def _suggest_param(self, trial: optuna.Trial, param: Parameter) -> Any:
+        """Suggest a value for a parameter using Optuna."""
+        min_val, max_val, step = param.get_search_space()
+        
+        if param.param_type == 'bool':
+            return trial.suggest_categorical(param.name, [True, False])
+        elif param.param_type == 'int':
+            return trial.suggest_int(param.name, int(min_val), int(max_val), step=int(step) if step else 1)
+        else:  # float
+            return trial.suggest_float(param.name, float(min_val), float(max_val), step=float(step) if step else None)
+    
+    def _objective(self, trial: optuna.Trial) -> float:
+        """
+        Objective function for Optuna optimization.
+        Returns a score to maximize (higher is better).
+        """
+        self.trial_count += 1
+        
+        # Build parameter dict
+        params = self.original_params.copy()
+        for p in self.optimizable_params:
+            params[p.name] = self._suggest_param(trial, p)
+        
+        # Evaluate across all symbols
+        total_objective = 0.0
+        symbol_count = 0
+        
+        for symbol in self.translators:
+            translator = self.translators[symbol]
+            backtester = self.backtesters[symbol]
+            
+            try:
+                # Run indicator with trial params
+                indicator_result = translator.run_indicator(params)
+                
+                # Evaluate performance
+                use_discrete = self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions
+                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=bool(use_discrete))
+                
+                # Calculate objective
+                obj = backtester.calculate_objective(metrics)
+                
+                total_objective += obj
+                symbol_count += 1
+                
+            except Exception as e:
+                logger.debug(f"Trial failed for {symbol}: {e}")
+                continue
+        
+        # Early pruning check - report once at the end
+        if symbol_count > 0 and self.trial_count > self.pruning_warmup_trials:
+            avg_obj = total_objective / symbol_count
+            trial.report(avg_obj, 0)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+        
+        if symbol_count == 0:
+            return 0.0
+        
+        avg_objective = total_objective / symbol_count
+        
+        # Track best
+        if avg_objective > self.best_objective:
+            self.best_objective = avg_objective
+            elapsed = time.time() - self.start_time
+            logger.info(f"Trial {self.trial_count}: New best objective = {avg_objective:.4f} ({elapsed:.1f}s)")
+        
+        return avg_objective
+    
+    def optimize(self) -> OptimizationResult:
+        """
+        Run the optimization process.
+        
+        Returns:
+            OptimizationResult with best parameters and metrics
+        """
+        logger.info(f"Starting optimization with {len(self.optimizable_params)} parameters")
+        logger.info(f"Max trials: {self.max_trials}, Timeout: {self.timeout_seconds}s")
+        
+        self.start_time = time.time()
+        self.trial_count = 0
+        self.best_objective = 0.0
+        
+        # Create Optuna study with TPE sampler
+        sampler = optuna.samplers.TPESampler(
+            n_startup_trials=self.n_startup_trials,
+            seed=42
+        )
+        
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=self.pruning_warmup_trials,
+            n_warmup_steps=len(self.data) // 2
+        )
+        
+        study = optuna.create_study(
+            direction='maximize',
+            sampler=sampler,
+            pruner=pruner
+        )
+        
+        # Run optimization
+        study.optimize(
+            self._objective,
+            n_trials=self.max_trials,
+            timeout=self.timeout_seconds,
+            show_progress_bar=False,
+            catch=(Exception,)
+        )
+        
+        optimization_time = time.time() - self.start_time
+        
+        # Evaluate original params first
+        original_metrics = self._evaluate_params(self.original_params)
+        original_objective = self._calculate_overall_objective(original_metrics)
+        
+        # Get best params from study
+        best_params_candidate = self.original_params.copy()
+        for p in self.optimizable_params:
+            if p.name in study.best_params:
+                best_params_candidate[p.name] = study.best_params[p.name]
+        
+        # Evaluate best params candidate
+        best_metrics_candidate = self._evaluate_params(best_params_candidate)
+        best_objective = self._calculate_overall_objective(best_metrics_candidate)
+        
+        # Only use optimized params if they're actually better
+        if best_objective > original_objective:
+            best_params = best_params_candidate
+            best_metrics = best_metrics_candidate
+            logger.info(f"Optimization improved performance: {original_objective:.4f} -> {best_objective:.4f}")
+        else:
+            best_params = self.original_params.copy()
+            best_metrics = original_metrics
+            logger.info(f"Original params were optimal. Keeping original configuration.")
+        
+        # Calculate improvements
+        if original_metrics.profit_factor > 0:
+            improvement_pf = (best_metrics.profit_factor - original_metrics.profit_factor) / original_metrics.profit_factor * 100
+        else:
+            improvement_pf = 100 if best_metrics.profit_factor > 0 else 0
+        
+        if original_metrics.directional_accuracy > 0:
+            improvement_acc = (best_metrics.directional_accuracy - original_metrics.directional_accuracy) / original_metrics.directional_accuracy * 100
+        else:
+            improvement_acc = 0
+        
+        result = OptimizationResult(
+            best_params=best_params,
+            original_params=self.original_params,
+            best_metrics=best_metrics,
+            original_metrics=original_metrics,
+            n_trials=len(study.trials),
+            optimization_time=optimization_time,
+            improvement_pf=improvement_pf,
+            improvement_accuracy=improvement_acc,
+            optimal_horizon=best_metrics.forecast_horizon,
+            study=study
+        )
+        
+        logger.info(f"\n{result.get_summary()}")
+        
+        return result
+    
+    def _calculate_overall_objective(self, metrics: BacktestMetrics) -> float:
+        """Calculate overall objective score for comparison."""
+        if metrics.total_trades < 10:
+            return 0.0
+        
+        # Weighted combination - same as backtester
+        pf_score = min(metrics.profit_factor, 5.0) / 5.0
+        acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
+        sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
+        win_score = metrics.win_rate
+        
+        return 0.35 * pf_score + 0.30 * acc_score + 0.20 * sharpe_score + 0.15 * win_score
+    
+    def _evaluate_params(self, params: Dict[str, Any]) -> BacktestMetrics:
+        """Evaluate a parameter set across all symbols."""
+        all_metrics = []
+        
+        for symbol in self.translators:
+            translator = self.translators[symbol]
+            backtester = self.backtesters[symbol]
+            
+            try:
+                indicator_result = translator.run_indicator(params)
+                use_discrete = bool(self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions)
+                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=use_discrete)
+                all_metrics.append(metrics)
+            except Exception as e:
+                logger.debug(f"Evaluation failed for {symbol}: {e}")
+                continue
+        
+        if not all_metrics:
+            return BacktestMetrics()
+        
+        # Aggregate metrics
+        return BacktestMetrics(
+            total_trades=sum(m.total_trades for m in all_metrics),
+            winning_trades=sum(m.winning_trades for m in all_metrics),
+            losing_trades=sum(m.losing_trades for m in all_metrics),
+            total_return=np.mean([m.total_return for m in all_metrics]),
+            avg_return=np.mean([m.avg_return for m in all_metrics]),
+            win_rate=np.mean([m.win_rate for m in all_metrics]),
+            profit_factor=np.mean([m.profit_factor for m in all_metrics]),
+            sharpe_ratio=np.mean([m.sharpe_ratio for m in all_metrics]),
+            max_drawdown=np.max([m.max_drawdown for m in all_metrics]),
+            avg_holding_bars=np.mean([m.avg_holding_bars for m in all_metrics]),
+            directional_accuracy=np.mean([m.directional_accuracy for m in all_metrics]),
+            forecast_horizon=int(np.median([m.forecast_horizon for m in all_metrics])),
+            improvement_over_random=np.mean([m.improvement_over_random for m in all_metrics])
+        )
+
+
+def optimize_indicator(
+    parse_result: ParseResult,
+    data: Dict[str, pd.DataFrame],
+    **kwargs
+) -> OptimizationResult:
+    """
+    Convenience function to run optimization.
+    
+    Args:
+        parse_result: Parsed Pine Script
+        data: Dict of symbol -> DataFrame
+        **kwargs: Additional arguments for PineOptimizer
+        
+    Returns:
+        OptimizationResult
+    """
+    optimizer = PineOptimizer(parse_result, data, **kwargs)
+    return optimizer.optimize()
+
+
+if __name__ == "__main__":
+    # Test with sample data
+    from pine_parser import parse_pine_script
+    import sys
+    
+    if len(sys.argv) > 1:
+        # Parse Pine Script
+        parse_result = parse_pine_script(sys.argv[1])
+        
+        # Create sample data
+        np.random.seed(42)
+        n = 3000
+        
+        data = {}
+        for symbol in ['BTCUSDT', 'ETHUSDT']:
+            trend = np.cumsum(np.random.randn(n) * 0.1)
+            noise = np.random.randn(n) * 0.5
+            close = 100 + trend + noise
+            
+            data[symbol] = pd.DataFrame({
+                'timestamp': pd.date_range('2020-01-01', periods=n, freq='1H'),
+                'open': close + np.random.randn(n) * 0.2,
+                'high': close + np.abs(np.random.randn(n) * 0.3),
+                'low': close - np.abs(np.random.randn(n) * 0.3),
+                'close': close,
+                'volume': np.random.randint(1000, 10000, n).astype(float)
+            })
+        
+        # Run optimization
+        result = optimize_indicator(
+            parse_result,
+            data,
+            max_trials=50,
+            timeout_seconds=60
+        )
+        
+        print("\n" + "="*60)
+        print("OPTIMIZATION RESULTS")
+        print("="*60)
+        print(result.get_summary())
+        print("\nOptimized Parameters:")
+        for name, value in result.best_params.items():
+            orig = result.original_params.get(name)
+            if orig != value:
+                orig_str = f"{orig:.4f}" if isinstance(orig, float) and abs(orig) < 1 else (f"{orig:.2f}" if isinstance(orig, float) else str(orig))
+                val_str = f"{value:.4f}" if isinstance(value, float) and abs(value) < 1 else (f"{value:.2f}" if isinstance(value, float) else str(value))
+                print(f"  {name}: {orig_str} -> {val_str}")
+    else:
+        print("Usage: python optimizer.py <pine_script_file>")
+

@@ -1,0 +1,33 @@
+//@version=5
+indicator("MACD", shorttitle="MACD", overlay=false)
+
+// Inputs (standard defaults)
+fastLen   = input.int(12, "Fast EMA Length", minval=1)
+slowLen   = input.int(26, "Slow EMA Length", minval=1)
+signalLen = input.int(9,  "Signal SMA Length", minval=1)
+
+src = input.source(close, "Source")
+
+// MACD calculation
+fastEMA = ta.ema(src, fastLen)
+slowEMA = ta.ema(src, slowLen)
+
+macdLine   = fastEMA - slowEMA
+signalLine = ta.sma(macdLine, signalLen)
+hist       = macdLine - signalLine
+
+// Zero line
+hline(0, "Zero", color=color.gray)
+
+// Lines
+plot(macdLine, "MACD", color=color.blue, linewidth=2)
+plot(signalLine, "Signal", color=color.orange, linewidth=2)
+
+// Area plot (instead of histogram)
+plot(hist, "Histogram", style=plot.style_area, color=(hist >= 0 ? color.new(color.lime, 70) : color.new(color.red, 70)))
+
+// Alerts
+alertcondition(ta.crossover(macdLine, signalLine), "MACD Bullish Cross", "MACD crossed above Signal")
+alertcondition(ta.crossunder(macdLine, signalLine), "MACD Bearish Cross", "MACD crossed below Signal")
+alertcondition(ta.crossover(hist, 0), "Histogram Up Through Zero", "MACD crossed above zero")
+alertcondition(ta.crossunder(hist, 0), "Histogram Down Through Zero", "MACD crossed below zero")

@@ -1,0 +1,5 @@
+*.txt
+*.csv
+__pycache__
+*.pine
+!MACD_demo_pinescript.pine
