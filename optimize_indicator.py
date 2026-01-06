@@ -82,7 +82,13 @@ Examples:
         '--timeout',
         type=int,
         default=300,
-        help='Maximum time in seconds (default: 300 = 5 minutes)'
+        help='Maximum time in seconds (default: 300 = 5 minutes). Also supports --timeout-minutes.'
+    )
+    parser.add_argument(
+        '--timeout-minutes',
+        type=float,
+        default=None,
+        help='Maximum time in minutes (overrides --timeout if specified)'
     )
     parser.add_argument(
         '--symbols',
@@ -102,6 +108,10 @@ Examples:
     )
     
     args = parser.parse_args()
+    
+    # Handle timeout-minutes override
+    if args.timeout_minutes is not None:
+        args.timeout = int(args.timeout_minutes * 60)
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -175,10 +185,13 @@ Examples:
             print(f"   Sell signals: {signal_info.sell_conditions}")
         
         # Step 3: Run Optimization
-        print_step(3, total_steps, f"Running optimization ({args.max_trials} trials, ~{args.timeout//60} min)...")
+        print_step(3, total_steps, f"Running optimization ({args.max_trials} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
         print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe")
+        print()
+        print(f"   [TIP] Press Ctrl-Q at any time to stop and use current best results")
+        print(f"         Watch improvement rate - diminishing returns suggest stopping early")
         print()
         
         optimization_result = optimize_indicator(
@@ -219,8 +232,8 @@ Examples:
 |    * Sharpe Ratio:        {metrics.sharpe_ratio:>6.2f}                                  |
 |                                                                      |
 |  WHEN TO USE:                                                        |
-|    Best during trending conditions, optimal holding period           |
-|    of {metrics.forecast_horizon}-{metrics.forecast_horizon*2} hours for peak profitability.                        |
+|    Best during trending conditions, optimal forecast                 |
+|    horizon of ~{metrics.forecast_horizon} hours for peak profitability.                         |
 |                                                                      |
 +======================================================================+
         """)

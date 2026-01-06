@@ -9,6 +9,8 @@ import pandas as pd
 import optuna
 import logging
 import time
+import sys
+import threading
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,10 +19,207 @@ from pine_parser import ParseResult, Parameter
 from pine_translator import PineTranslator, IndicatorResult
 from backtester import WalkForwardBacktester, BacktestMetrics
 
+# Platform-specific keyboard handling
+if sys.platform == 'win32':
+    import msvcrt
+else:
+    import select
+    import termios
+    import tty
+
 # Suppress Optuna's verbose logging
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+class KeyboardMonitor:
+    """Monitor for Ctrl-Q keyboard input to allow early stopping."""
+    
+    def __init__(self):
+        self.stop_requested = False
+        self._monitor_thread = None
+        self._running = False
+    
+    def start(self):
+        """Start monitoring keyboard input."""
+        self._running = True
+        self._monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor_thread.start()
+    
+    def stop(self):
+        """Stop monitoring."""
+        self._running = False
+    
+    def _monitor_loop(self):
+        """Background thread to monitor keyboard input."""
+        while self._running:
+            try:
+                if sys.platform == 'win32':
+                    if msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        # Ctrl-Q is ASCII 17
+                        if key == b'\x11':
+                            self.stop_requested = True
+                            print("\n[!] Ctrl-Q detected - stopping optimization gracefully...")
+                            break
+                else:
+                    # Unix-like systems
+                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                        key = sys.stdin.read(1)
+                        if ord(key) == 17:  # Ctrl-Q
+                            self.stop_requested = True
+                            print("\n[!] Ctrl-Q detected - stopping optimization gracefully...")
+                            break
+                time.sleep(0.1)
+            except Exception:
+                pass
+
+
+class OptimizationProgressTracker:
+    """Track and report progressive improvement during optimization.
+    
+    Uses the ORIGINAL CONFIG's performance as baseline, not the first trial.
+    This means early trials may show negative improvement until ML finds
+    something better than the original.
+    """
+    
+    def __init__(self):
+        self.start_time = None
+        self.baseline_objective = None  # Original config's performance (set before optimization)
+        self.best_objective = None
+        self.best_time = None
+        # Full history with params: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params_dict)
+        self.improvement_history = []
+    
+    def set_baseline(self, baseline_objective: float):
+        """Set the baseline objective (original config's performance)."""
+        self.baseline_objective = baseline_objective
+        logger.info(f"Baseline objective (original config): {baseline_objective:.4f}")
+    
+    def start(self):
+        """Start tracking."""
+        self.start_time = time.time()
+        self.best_objective = None
+        self.best_time = None
+        self.improvement_history = []
+    
+    def update(self, objective: float, params: Dict[str, Any] = None) -> Optional[dict]:
+        """
+        Update with a new objective value. Returns improvement info if this is a new best.
+        
+        Args:
+            objective: The objective score for this trial
+            params: The parameter configuration that achieved this objective
+        
+        Returns:
+            dict with improvement info if new best, None otherwise
+        
+        Rates explained:
+            - improvement_rate_pct: % improvement vs ORIGINAL CONFIG, per second elapsed
+              (can be negative initially until ML beats the original)
+            - marginal_rate_pct: % improvement from last best trial, per second since last best
+              (recent rate - if this drops, you're seeing diminishing returns)
+        """
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        
+        # Use baseline (original config) if set, otherwise first objective
+        if self.baseline_objective is None:
+            self.baseline_objective = objective
+        
+        if self.best_objective is None:
+            self.best_objective = objective
+            self.best_time = current_time
+            # Record first trial vs baseline
+            pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
+            avg_rate = pct_vs_baseline / elapsed if elapsed > 0 else 0
+            # Store: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
+            self.improvement_history.append((elapsed, objective, pct_vs_baseline, avg_rate, 0, params.copy() if params else {}))
+            return {
+                'new_objective': objective,
+                'old_objective': self.baseline_objective,
+                'baseline_objective': self.baseline_objective,
+                'pct_improvement_total': pct_vs_baseline,
+                'improvement_rate_pct': avg_rate,
+                'pct_improvement_marginal': 0,
+                'marginal_rate_pct': 0,
+                'elapsed_seconds': elapsed,
+                'time_since_last_best': 0,
+                'is_first': True,
+                'params': params.copy() if params else {}
+            }
+        
+        if objective > self.best_objective:
+            # Calculate improvement as % vs ORIGINAL CONFIG (baseline)
+            pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
+            improvement_rate_pct = pct_vs_baseline / elapsed if elapsed > 0 else 0  # %/sec
+            
+            # Calculate marginal improvement as % of previous best, per second
+            time_since_last_best = current_time - self.best_time
+            pct_improvement_marginal = ((objective - self.best_objective) / self.best_objective * 100) if self.best_objective > 0 else 0
+            marginal_rate_pct = pct_improvement_marginal / time_since_last_best if time_since_last_best > 0 else 0  # %/sec
+            
+            result = {
+                'new_objective': objective,
+                'old_objective': self.best_objective,
+                'baseline_objective': self.baseline_objective,
+                'pct_improvement_total': pct_vs_baseline,  # vs original config
+                'improvement_rate_pct': improvement_rate_pct,  # %/sec average vs original
+                'pct_improvement_marginal': pct_improvement_marginal,
+                'marginal_rate_pct': marginal_rate_pct,  # %/sec recent
+                'elapsed_seconds': elapsed,
+                'time_since_last_best': time_since_last_best,
+                'is_first': False,
+                'params': params.copy() if params else {}
+            }
+            
+            # Store: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
+            self.improvement_history.append((elapsed, objective, pct_vs_baseline, improvement_rate_pct, marginal_rate_pct, params.copy() if params else {}))
+            self.best_objective = objective
+            self.best_time = current_time
+            
+            return result
+        
+        return None
+    
+    def get_summary(self) -> str:
+        """Get a summary of the improvement trajectory vs original config."""
+        if not self.improvement_history:
+            return "No improvements recorded."
+        
+        lines = [f"Improvement History vs Original Config (baseline={self.baseline_objective:.4f}):"]
+        for entry in self.improvement_history:
+            elapsed, obj, pct_vs_baseline, avg_rate, marginal_rate, params = entry
+            sign = "+" if pct_vs_baseline >= 0 else ""
+            lines.append(f"  {elapsed:6.1f}s: objective={obj:.4f} ({sign}{pct_vs_baseline:.2f}% vs original)")
+            lines.append(f"         avg rate: {avg_rate:+.3f}%/s, marginal: {marginal_rate:.3f}%/s")
+        
+        # Final improvement summary
+        if self.improvement_history:
+            final_entry = self.improvement_history[-1]
+            final_pct = final_entry[2]
+            final_elapsed = final_entry[0]
+            if final_elapsed > 0:
+                avg_rate = final_pct / final_elapsed
+                lines.append(f"\nFinal: {'+' if final_pct >= 0 else ''}{final_pct:.2f}% vs original @ {avg_rate:.3f}%/sec avg rate")
+        
+        return "\n".join(lines)
+    
+    def get_detailed_history(self) -> List[dict]:
+        """Get detailed improvement history for report generation."""
+        history = []
+        for entry in self.improvement_history:
+            elapsed, obj, pct_vs_baseline, avg_rate, marginal_rate, params = entry
+            history.append({
+                'elapsed_seconds': elapsed,
+                'objective': obj,
+                'pct_vs_original': pct_vs_baseline,
+                'avg_rate_pct_per_sec': avg_rate,
+                'marginal_rate_pct_per_sec': marginal_rate,
+                'params': params
+            })
+        return history
 
 
 @dataclass
@@ -36,6 +235,8 @@ class OptimizationResult:
     improvement_accuracy: float  # Directional accuracy improvement %
     optimal_horizon: int  # Best forecast horizon
     study: optuna.Study = None
+    improvement_history: List[dict] = field(default_factory=list)  # Detailed history with params
+    baseline_objective: float = 0.0  # Original config's objective score
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
@@ -70,7 +271,8 @@ class PineOptimizer:
         timeout_seconds: int = 300,  # 5 minutes default
         n_startup_trials: int = 20,
         pruning_warmup_trials: int = 30,
-        min_improvement_threshold: float = 0.1
+        min_improvement_threshold: float = 0.1,
+        enable_keyboard_interrupt: bool = True
     ):
         """
         Initialize optimizer.
@@ -83,6 +285,7 @@ class PineOptimizer:
             n_startup_trials: Random trials before TPE kicks in
             pruning_warmup_trials: Trials before pruning starts
             min_improvement_threshold: Minimum improvement to continue
+            enable_keyboard_interrupt: Allow Ctrl-Q to stop optimization
         """
         self.parse_result = parse_result
         self.data = data
@@ -91,6 +294,7 @@ class PineOptimizer:
         self.n_startup_trials = n_startup_trials
         self.pruning_warmup_trials = pruning_warmup_trials
         self.min_improvement_threshold = min_improvement_threshold
+        self.enable_keyboard_interrupt = enable_keyboard_interrupt
         
         # Extract parameter info
         self.parameters = parse_result.parameters
@@ -111,6 +315,11 @@ class PineOptimizer:
         self.best_objective = 0.0
         self.trial_count = 0
         self.start_time = None
+        
+        # Progress tracking and keyboard monitoring
+        self.progress_tracker = OptimizationProgressTracker()
+        self.keyboard_monitor = KeyboardMonitor() if enable_keyboard_interrupt else None
+        self.user_stopped = False
     
     def _get_optimizable_params(self) -> List[Parameter]:
         """Filter parameters to only those worth optimizing."""
@@ -151,6 +360,11 @@ class PineOptimizer:
         Returns a score to maximize (higher is better).
         """
         self.trial_count += 1
+        
+        # Check for user stop request
+        if self.keyboard_monitor and self.keyboard_monitor.stop_requested:
+            self.user_stopped = True
+            raise optuna.TrialPruned()
         
         # Build parameter dict
         params = self.original_params.copy()
@@ -195,11 +409,48 @@ class PineOptimizer:
         
         avg_objective = total_objective / symbol_count
         
-        # Track best
-        if avg_objective > self.best_objective:
+        # Track best and report improvement rate vs original config
+        improvement_info = self.progress_tracker.update(avg_objective, params)
+        if improvement_info:
+            elapsed = improvement_info['elapsed_seconds']
+            pct_vs_original = improvement_info['pct_improvement_total']
+            rate_pct = improvement_info['improvement_rate_pct']
+            baseline = improvement_info['baseline_objective']
+            
+            # Format sign for improvement vs original
+            sign = "+" if pct_vs_original >= 0 else ""
+            
+            if improvement_info.get('is_first'):
+                # First trial
+                logger.info(
+                    f"Trial {self.trial_count}: FIRST = {avg_objective:.4f} "
+                    f"({sign}{pct_vs_original:.2f}% vs original {baseline:.4f})"
+                )
+            else:
+                marginal_rate_pct = improvement_info['marginal_rate_pct']
+                time_since_last = improvement_info['time_since_last_best']
+                
+                logger.info(
+                    f"Trial {self.trial_count}: NEW BEST = {avg_objective:.4f} "
+                    f"({sign}{pct_vs_original:.2f}% vs original) | elapsed: {elapsed:.1f}s"
+                )
+                logger.info(
+                    f"  -> Avg rate: {rate_pct:+.3f}%/sec vs original | "
+                    f"Marginal: {marginal_rate_pct:.3f}%/sec (waited {time_since_last:.1f}s)"
+                )
+                
+                # Warn about diminishing returns (only if we're actually improving)
+                if pct_vs_original > 0 and len(self.progress_tracker.improvement_history) >= 3:
+                    recent_pcts = [p for _, _, p in self.progress_tracker.improvement_history[-3:]]
+                    # Check if improvement rate is slowing significantly
+                    if len(recent_pcts) >= 2:
+                        recent_gain = recent_pcts[-1] - recent_pcts[-2]
+                        earlier_gain = recent_pcts[-2] - recent_pcts[-3] if len(recent_pcts) >= 3 else recent_gain
+                        if earlier_gain > 0 and recent_gain < earlier_gain * 0.3:
+                            logger.info("  -> [!] Diminishing returns detected - consider pressing Ctrl-Q")
+            
+            # Also update internal tracking
             self.best_objective = avg_objective
-            elapsed = time.time() - self.start_time
-            logger.info(f"Trial {self.trial_count}: New best objective = {avg_objective:.4f} ({elapsed:.1f}s)")
         
         return avg_objective
     
@@ -211,11 +462,28 @@ class PineOptimizer:
             OptimizationResult with best parameters and metrics
         """
         logger.info(f"Starting optimization with {len(self.optimizable_params)} parameters")
-        logger.info(f"Max trials: {self.max_trials}, Timeout: {self.timeout_seconds}s")
+        logger.info(f"Max trials: {self.max_trials}, Timeout: {self.timeout_seconds}s ({self.timeout_seconds/60:.1f} min)")
+        
+        if self.enable_keyboard_interrupt:
+            logger.info("Press Ctrl-Q at any time to stop optimization and use current best results")
+        
+        # Evaluate original config FIRST to establish baseline
+        logger.info("Evaluating original config as baseline...")
+        original_metrics = self._evaluate_params(self.original_params)
+        original_objective = self._calculate_overall_objective(original_metrics)
         
         self.start_time = time.time()
         self.trial_count = 0
         self.best_objective = 0.0
+        self.user_stopped = False
+        
+        # Start progress tracking with original config as baseline
+        self.progress_tracker.set_baseline(original_objective)
+        self.progress_tracker.start()
+        
+        # Start keyboard monitoring if enabled
+        if self.keyboard_monitor:
+            self.keyboard_monitor.start()
         
         # Create Optuna study with TPE sampler
         sampler = optuna.samplers.TPESampler(
@@ -234,16 +502,32 @@ class PineOptimizer:
             pruner=pruner
         )
         
+        # Custom callback to check for user stop request
+        def stop_callback(study, trial):
+            if self.keyboard_monitor and self.keyboard_monitor.stop_requested:
+                study.stop()
+        
         # Run optimization
-        study.optimize(
-            self._objective,
-            n_trials=self.max_trials,
-            timeout=self.timeout_seconds,
-            show_progress_bar=False,
-            catch=(Exception,)
-        )
+        try:
+            study.optimize(
+                self._objective,
+                n_trials=self.max_trials,
+                timeout=self.timeout_seconds,
+                show_progress_bar=False,
+                catch=(Exception,),
+                callbacks=[stop_callback] if self.keyboard_monitor else None
+            )
+        finally:
+            # Stop keyboard monitor
+            if self.keyboard_monitor:
+                self.keyboard_monitor.stop()
         
         optimization_time = time.time() - self.start_time
+        
+        # Report if user stopped
+        if self.user_stopped or (self.keyboard_monitor and self.keyboard_monitor.stop_requested):
+            logger.info(f"Optimization stopped by user after {optimization_time:.1f}s ({self.trial_count} trials)")
+            logger.info("Using best parameters found so far...")
         
         # Evaluate original params first
         original_metrics = self._evaluate_params(self.original_params)
@@ -290,10 +574,16 @@ class PineOptimizer:
             improvement_pf=improvement_pf,
             improvement_accuracy=improvement_acc,
             optimal_horizon=best_metrics.forecast_horizon,
-            study=study
+            study=study,
+            improvement_history=self.progress_tracker.get_detailed_history(),
+            baseline_objective=self.progress_tracker.baseline_objective or 0.0
         )
         
         logger.info(f"\n{result.get_summary()}")
+        
+        # Log improvement trajectory summary
+        if self.progress_tracker.improvement_history:
+            logger.info("\n" + self.progress_tracker.get_summary())
         
         return result
     

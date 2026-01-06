@@ -156,7 +156,7 @@ class OutputGenerator:
             f"// OPTIMAL FORECAST HORIZON: {metrics.forecast_horizon} hours",
             f"// ",
             f"// WHEN TO USE: This indicator is optimized for {self._get_optimal_conditions()}",
-            f"// EXPECTED PROFITABILITY: Best results holding positions for {metrics.forecast_horizon}-{metrics.forecast_horizon*2}h",
+            f"// EXPECTED PROFITABILITY: Best results with ~{metrics.forecast_horizon}h forecast horizon",
             "// ---------------------------------------------------------------------------",
             "// PARAMETER CHANGES:",
         ]
@@ -187,13 +187,19 @@ class OutputGenerator:
         elif metrics.profit_factor < 1.5:
             conditions.append("ranging/consolidating markets")
         
-        # Based on forecast horizon
-        if metrics.forecast_horizon <= 12:
-            conditions.append("short-term moves")
-        elif metrics.forecast_horizon >= 72:
+        # Based on forecast horizon - fluid continuum
+        if metrics.forecast_horizon <= 4:
+            conditions.append("scalping/ultra-short-term")
+        elif metrics.forecast_horizon <= 12:
+            conditions.append("short-term intraday moves")
+        elif metrics.forecast_horizon <= 24:
+            conditions.append("intraday holds")
+        elif metrics.forecast_horizon <= 48:
+            conditions.append("overnight to multi-day holds")
+        elif metrics.forecast_horizon <= 96:
             conditions.append("swing trades")
         else:
-            conditions.append("intraday to multi-day holds")
+            conditions.append("position trades/longer holds")
         
         return ", ".join(conditions) if conditions else "general market conditions"
     
@@ -286,13 +292,112 @@ class OutputGenerator:
             
             report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
         
+        # Add improvement history section
         report_lines.extend([
+            "",
+            "-" * 70,
+            "OPTIMIZATION PROGRESS (New Bests Found)",
+            "-" * 70,
+            "",
+            f"  Baseline (original config) objective: {opt.baseline_objective:.4f}",
+            "",
+        ])
+        
+        if opt.improvement_history:
+            for i, entry in enumerate(opt.improvement_history, 1):
+                elapsed = entry['elapsed_seconds']
+                obj = entry['objective']
+                pct = entry['pct_vs_original']
+                avg_rate = entry['avg_rate_pct_per_sec']
+                marginal_rate = entry['marginal_rate_pct_per_sec']
+                params = entry['params']
+                
+                sign = "+" if pct >= 0 else ""
+                report_lines.append(f"  [{i}] @ {elapsed:.1f}s: objective={obj:.4f} ({sign}{pct:.2f}% vs original)")
+                report_lines.append(f"      Avg rate: {avg_rate:+.3f}%/sec | Marginal rate: {marginal_rate:.3f}%/sec")
+                
+                # Show changed params (vs original)
+                changed_params = []
+                for pname, pval in params.items():
+                    orig_val = opt.original_params.get(pname)
+                    if orig_val != pval:
+                        changed_params.append(f"{pname}={self._format_value(pval)}")
+                
+                if changed_params:
+                    # Split into multiple lines if too long
+                    param_str = ", ".join(changed_params)
+                    if len(param_str) > 55:
+                        report_lines.append(f"      Config changes:")
+                        for cp in changed_params:
+                            report_lines.append(f"        - {cp}")
+                    else:
+                        report_lines.append(f"      Config: {param_str}")
+                report_lines.append("")
+            
+            # Summary of improvement trajectory
+            if len(opt.improvement_history) >= 2:
+                first_entry = opt.improvement_history[0]
+                last_entry = opt.improvement_history[-1]
+                
+                first_rate = first_entry['avg_rate_pct_per_sec']
+                last_rate = last_entry['avg_rate_pct_per_sec']
+                
+                report_lines.append(f"  Improvement Trajectory:")
+                report_lines.append(f"    First improvement rate: {first_rate:+.3f}%/sec")
+                report_lines.append(f"    Final improvement rate: {last_rate:+.3f}%/sec")
+                
+                if first_rate > 0 and last_rate > 0:
+                    slowdown = (1 - last_rate / first_rate) * 100
+                    if slowdown > 0:
+                        report_lines.append(f"    Rate slowdown: {slowdown:.1f}% (diminishing returns observed)")
+                    else:
+                        report_lines.append(f"    Rate acceleration: {-slowdown:.1f}% (improving efficiency)")
+                report_lines.append("")
+        else:
+            report_lines.append("  No improvements found during optimization.")
+            report_lines.append("")
+        
+        report_lines.extend([
+            "-" * 70,
+            "UNDERSTANDING THE METRICS",
+            "-" * 70,
+            "",
+            "  PROFIT FACTOR (Primary Metric)",
+            "    What it measures: Gross Profit / Gross Loss",
+            "    Good value: > 1.5 (above 1.0 = profitable)",
+            "    Why it matters: Directly measures profitability. A PF of 1.5 means",
+            "                    you make $1.50 for every $1.00 you lose.",
+            "",
+            "  WIN RATE",
+            "    What it measures: Percentage of trades that are profitable",
+            "    Good value: > 55%",
+            "    Why it matters: Psychological comfort - easier to trade with higher",
+            "                    win rates. But high win rate with small wins and",
+            "                    big losses can still lose money!",
+            "",
+            "  DIRECTIONAL ACCURACY",
+            "    What it measures: How well signals predict future price direction",
+            "    Good value: > 55% (50% = random chance)",
+            "    Why it matters: Shows if the indicator has genuine predictive power",
+            "                    vs just getting lucky. Doesn't account for move size.",
+            "",
+            "  SHARPE RATIO",
+            "    What it measures: Risk-adjusted return (return / volatility)",
+            "    Good value: > 1.0 (> 2.0 = excellent)",
+            "    Why it matters: Balances returns against risk. High Sharpe = more",
+            "                    consistent returns with less volatility/drawdowns.",
+            "",
+            "  OPTIMIZATION WEIGHTS USED:",
+            "    * Profit Factor:       35% (primary - are we making money?)",
+            "    * Directional Accuracy: 30% (does the indicator actually predict?)",
+            "    * Sharpe Ratio:         20% (is it consistent/low risk?)",
+            "    * Win Rate:             15% (psychological tradability)",
             "",
             "-" * 70,
             "OPTIMAL FORECAST HORIZON",
             "-" * 70,
             f"  Peak performance at: {best_metrics.forecast_horizon} hours ahead",
-            f"  Recommended holding period: {best_metrics.forecast_horizon} - {best_metrics.forecast_horizon * 2} hours",
+            f"  Optimal forecast horizon: ~{best_metrics.forecast_horizon} hours",
             "",
             "-" * 70,
             "EXPECTED PROFITABILITY",
@@ -322,7 +427,79 @@ class OutputGenerator:
                 report_lines.append(f"    Optimized: {best_val}")
                 report_lines.append("")
         
+        # Add interpretation guide
         report_lines.extend([
+            "-" * 70,
+            "HOW TO INTERPRET THESE RESULTS",
+            "-" * 70,
+            "",
+        ])
+        
+        # Add contextual interpretation based on actual metrics
+        pf = best_metrics.profit_factor
+        wr = best_metrics.win_rate
+        sr = best_metrics.sharpe_ratio
+        da = best_metrics.directional_accuracy
+        
+        # Profit Factor assessment
+        if pf >= 2.0:
+            pf_assessment = "EXCELLENT - Strong edge, likely profitable in live trading"
+        elif pf >= 1.5:
+            pf_assessment = "GOOD - Solid edge, should be profitable with discipline"
+        elif pf >= 1.2:
+            pf_assessment = "MODERATE - Small edge, requires strict risk management"
+        elif pf >= 1.0:
+            pf_assessment = "MARGINAL - Barely profitable, high risk of losses with fees/slippage"
+        else:
+            pf_assessment = "POOR - Currently unprofitable, needs more optimization or different approach"
+        
+        # Win Rate assessment
+        if wr >= 0.65:
+            wr_assessment = "HIGH - Psychologically easy to trade, watch for small wins/big losses"
+        elif wr >= 0.55:
+            wr_assessment = "GOOD - Balanced, sustainable for most traders"
+        elif wr >= 0.45:
+            wr_assessment = "MODERATE - Requires discipline, ensure winners > losers in size"
+        else:
+            wr_assessment = "LOW - Trend-following style, needs big winners to compensate"
+        
+        # Sharpe assessment
+        if sr >= 2.0:
+            sr_assessment = "EXCELLENT - Very consistent, low-stress trading"
+        elif sr >= 1.0:
+            sr_assessment = "GOOD - Reasonable risk-adjusted returns"
+        elif sr >= 0.5:
+            sr_assessment = "MODERATE - Some volatility, expect drawdowns"
+        else:
+            sr_assessment = "LOW - High volatility, prepare for significant swings"
+        
+        report_lines.extend([
+            f"  PROFIT FACTOR ({pf:.2f}): {pf_assessment}",
+            "",
+            f"  WIN RATE ({wr:.1%}): {wr_assessment}",
+            "",
+            f"  SHARPE RATIO ({sr:.2f}): {sr_assessment}",
+            "",
+            "-" * 70,
+            "PRACTICAL RECOMMENDATIONS",
+            "-" * 70,
+            "",
+            f"  1. POSITION SIZING: With Sharpe of {sr:.2f}, consider {'conservative' if sr < 1.0 else 'moderate' if sr < 2.0 else 'normal'} position sizes",
+            "",
+            f"  2. HOLD TIME: Optimal results with ~{best_metrics.forecast_horizon}h hold periods",
+            "",
+            f"  3. MARKET CONDITIONS: Best during {self._get_optimal_conditions()}",
+            "",
+            "  4. RISK MANAGEMENT:",
+            f"     - Max drawdown seen: {best_metrics.max_drawdown:.1f}%",
+            f"     - Set stop losses accounting for this volatility",
+            f"     - Never risk more than 1-2% per trade",
+            "",
+            "  5. VALIDATION: Before live trading:",
+            "     - Paper trade for at least 20-30 signals",
+            "     - Verify results match backtest expectations",
+            "     - Account for fees, slippage, and execution delays",
+            "",
             "=" * 70,
             "END OF REPORT",
             "=" * 70,
@@ -348,7 +525,7 @@ class OutputGenerator:
         print(f"Performance vs Original: {opt.improvement_pf:+.1f}% profit factor improvement")
         print(f"Performance vs Random:   {metrics.improvement_over_random:+.1f}% improvement")
         print(f"Expected Profitability:  Best during {self._get_optimal_conditions()}")
-        print(f"                         Optimal holding period: {metrics.forecast_horizon}-{metrics.forecast_horizon*2} hours")
+        print(f"                         Optimal forecast horizon: ~{metrics.forecast_horizon} hours")
         print()
         print("Optimized Parameters:")
         

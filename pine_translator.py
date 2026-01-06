@@ -43,6 +43,92 @@ def safe_divide(a, b, default=0.0):
 class PineTranslator:
     """Translates Pine Script to executable Python indicator functions."""
     
+    def _get_param(self, *names, default=None, param_type=None):
+        """
+        Look up a parameter by trying multiple possible names.
+        NEVER uses hardcoded defaults if a matching parameter exists in the Pine Script.
+        
+        Args:
+            *names: Possible parameter names to try (case-insensitive fuzzy match)
+            default: Fallback value ONLY if no parameter found at all
+            param_type: 'int', 'float', or None for auto-detect
+            
+        Returns:
+            The parameter value from self.params, or default if not found
+        """
+        # First, try exact matches
+        for name in names:
+            if name in self.params:
+                val = self.params[name]
+                if param_type == 'int':
+                    return int(val)
+                elif param_type == 'float':
+                    return float(val)
+                return val
+        
+        # Second, try case-insensitive matches
+        params_lower = {k.lower(): k for k in self.params}
+        for name in names:
+            if name.lower() in params_lower:
+                val = self.params[params_lower[name.lower()]]
+                if param_type == 'int':
+                    return int(val)
+                elif param_type == 'float':
+                    return float(val)
+                return val
+        
+        # Third, try fuzzy matches (remove underscores, handle camelCase vs snake_case)
+        def normalize(s):
+            # Convert to lowercase, remove underscores
+            return s.lower().replace('_', '').replace('-', '')
+        
+        params_normalized = {normalize(k): k for k in self.params}
+        for name in names:
+            norm_name = normalize(name)
+            if norm_name in params_normalized:
+                val = self.params[params_normalized[norm_name]]
+                if param_type == 'int':
+                    return int(val)
+                elif param_type == 'float':
+                    return float(val)
+                return val
+            
+            # Try partial matches (e.g., 'length' matches 'rsiLength')
+            for norm_key, orig_key in params_normalized.items():
+                if norm_name in norm_key or norm_key in norm_name:
+                    val = self.params[orig_key]
+                    if param_type == 'int':
+                        return int(val)
+                    elif param_type == 'float':
+                        return float(val)
+                    return val
+        
+        # No match found - use default but log warning
+        if default is not None:
+            logger.debug(f"Parameter not found for {names}, using default: {default}")
+        
+        if param_type == 'int' and default is not None:
+            return int(default)
+        elif param_type == 'float' and default is not None:
+            return float(default)
+        return default
+    
+    def _get_all_int_params(self) -> Dict[str, int]:
+        """Get all integer parameters from the parsed Pine Script."""
+        result = {}
+        for p in self.parse_result.parameters:
+            if p.param_type == 'int':
+                result[p.name] = int(self.params.get(p.name, p.default))
+        return result
+    
+    def _get_all_float_params(self) -> Dict[str, float]:
+        """Get all float parameters from the parsed Pine Script."""
+        result = {}
+        for p in self.parse_result.parameters:
+            if p.param_type == 'float':
+                result[p.name] = float(self.params.get(p.name, p.default))
+        return result
+    
     # Translation mappings for Pine Script to Python
     TA_MAPPINGS = {
         'ta.sma': 'ta.sma',
@@ -153,6 +239,13 @@ class PineTranslator:
         if params:
             self.update_params(params)
         
+        # Verify all parsed parameters are available in self.params
+        for p in self.parse_result.parameters:
+            if p.name not in self.params:
+                logger.warning(f"Parameter '{p.name}' from Pine Script not in params dict!")
+            else:
+                logger.debug(f"Using parameter {p.name}={self.params[p.name]} (default was {p.default})")
+        
         # Determine which indicator type we're dealing with
         indicator_name = self.parse_result.indicator_name.lower()
         
@@ -170,14 +263,14 @@ class PineTranslator:
         Run MFV (Money Flow Volume) style indicator.
         Based on EyeX_MFV_v5.pine structure.
         """
-        # Get parameters with defaults
-        mfv_threshold = self.params.get('mfvThreshold', 0)
-        bar_range1 = int(self.params.get('barRange1', 50))
-        bar_range2 = int(self.params.get('barRange2', 75))
-        bar_range3 = int(self.params.get('barRange3', 100))
-        bar_range4 = int(self.params.get('barRange4', 200))
-        pivot_lookback = int(self.params.get('pivotLookback', 5))
-        price_proximity = self.params.get('priceProximity', 0.00001)
+        # Get parameters - use _get_param to respect Pine Script config
+        mfv_threshold = self._get_param('mfvThreshold', 'mfv_threshold', 'threshold', default=0, param_type='float')
+        bar_range1 = self._get_param('barRange1', 'bar_range1', 'range1', default=50, param_type='int')
+        bar_range2 = self._get_param('barRange2', 'bar_range2', 'range2', default=75, param_type='int')
+        bar_range3 = self._get_param('barRange3', 'bar_range3', 'range3', default=100, param_type='int')
+        bar_range4 = self._get_param('barRange4', 'bar_range4', 'range4', default=200, param_type='int')
+        pivot_lookback = self._get_param('pivotLookback', 'pivot_lookback', 'lookback', default=5, param_type='int')
+        price_proximity = self._get_param('priceProximity', 'price_proximity', 'proximity', default=0.00001, param_type='float')
         
         # MFV Calculation
         rng = self.high - self.low
@@ -259,23 +352,23 @@ class PineTranslator:
         Run Wisdom Gauge style indicator.
         Based on pso_indicator.pine structure.
         """
-        # Get parameters
-        atr_len = int(self.params.get('atrLen', 23))
-        vol_len = int(self.params.get('volLen', 119))
-        eff_len = int(self.params.get('effLen', 91))
-        smooth_f = int(self.params.get('smoothF', 33))
-        smooth_gauge = int(self.params.get('smoothGauge', 12))
-        fast_len = int(self.params.get('fastLen', 24))
-        slow_len = int(self.params.get('slowLen', 43))
-        wick_w = self.params.get('wickW', 1.47)
-        tau = self.params.get('tau', 0.64)
-        alpha = self.params.get('alpha', 5.3)
-        k_scale = self.params.get('kScale', 4.14)
-        norm_window = int(self.params.get('normWindow', 243))
-        confirm_len = int(self.params.get('confirmLen', 11))
-        cooldown_bars = int(self.params.get('cooldownBars', 45))
-        buy_level = self.params.get('buyLevel', -23)
-        sell_level = self.params.get('sellLevel', 36)
+        # Get parameters - use _get_param to respect Pine Script config
+        atr_len = self._get_param('atrLen', 'atr_len', 'atrLength', default=23, param_type='int')
+        vol_len = self._get_param('volLen', 'vol_len', 'volLength', default=119, param_type='int')
+        eff_len = self._get_param('effLen', 'eff_len', 'effLength', default=91, param_type='int')
+        smooth_f = self._get_param('smoothF', 'smooth_f', 'smoothFactor', default=33, param_type='int')
+        smooth_gauge = self._get_param('smoothGauge', 'smooth_gauge', default=12, param_type='int')
+        fast_len = self._get_param('fastLen', 'fast_len', 'fastLength', default=24, param_type='int')
+        slow_len = self._get_param('slowLen', 'slow_len', 'slowLength', default=43, param_type='int')
+        wick_w = self._get_param('wickW', 'wick_w', 'wickWeight', default=1.47, param_type='float')
+        tau = self._get_param('tau', 'tauValue', default=0.64, param_type='float')
+        alpha = self._get_param('alpha', 'alphaValue', default=5.3, param_type='float')
+        k_scale = self._get_param('kScale', 'k_scale', 'kScaleFactor', default=4.14, param_type='float')
+        norm_window = self._get_param('normWindow', 'norm_window', 'normLength', default=243, param_type='int')
+        confirm_len = self._get_param('confirmLen', 'confirm_len', 'confirmLength', default=11, param_type='int')
+        cooldown_bars = self._get_param('cooldownBars', 'cooldown_bars', 'cooldown', default=45, param_type='int')
+        buy_level = self._get_param('buyLevel', 'buy_level', 'buyThreshold', default=-23, param_type='float')
+        sell_level = self._get_param('sellLevel', 'sell_level', 'sellThreshold', default=36, param_type='float')
         
         eps = 1e-10
         
@@ -397,25 +490,38 @@ class PineTranslator:
         
         # Check for common patterns in the content
         content = self.parse_result.raw_content.lower()
+        indicator_name = self.parse_result.indicator_name.lower()
+        
+        # Check if this looks like a MACD indicator (by name or content)
+        is_macd = ('macd' in indicator_name or 
+                   ('ta.ema' in content and 'fastema' in content.replace(' ', '').replace('_', '')) or
+                   ('ta.ema' in content and 'slowema' in content.replace(' ', '').replace('_', '')) or
+                   ('fastlen' in content.replace(' ', '').replace('_', '') and 'slowlen' in content.replace(' ', '').replace('_', '')))
         
         if 'ta.rsi' in content:
-            rsi_len = int(self.params.get('rsiLength', self.params.get('length', 14)))
+            rsi_len = self._get_param('rsiLength', 'rsi_length', 'length', 'len', 'period', default=14, param_type='int')
             main_values = ta.rsi(self.close, rsi_len) - 50  # Center around 0
-        elif 'ta.macd' in content:
-            fast = int(self.params.get('fastLength', 12))
-            slow = int(self.params.get('slowLength', 26))
-            signal = int(self.params.get('signalLength', 9))
-            macd_line, _, histogram = ta.macd(self.close, fast, slow, signal)
+        elif is_macd or 'ta.macd' in content:
+            # Use _get_param to find MACD parameters with various naming conventions
+            fast = self._get_param('fastLen', 'fastLength', 'fast', 'fastEmaLen', 'fast_len', default=12, param_type='int')
+            slow = self._get_param('slowLen', 'slowLength', 'slow', 'slowEmaLen', 'slow_len', default=26, param_type='int')
+            signal = self._get_param('signalLen', 'signalLength', 'signal', 'signalSmaLen', 'signal_len', default=9, param_type='int')
+            
+            # Ensure fast < slow
+            if fast >= slow:
+                fast, slow = min(fast, slow - 1), max(fast + 1, slow)
+            
+            macd_line, signal_line, histogram = ta.macd(self.close, fast, slow, signal)
             main_values = histogram
         elif 'ta.cci' in content:
-            cci_len = int(self.params.get('cciLength', self.params.get('length', 20)))
+            cci_len = self._get_param('cciLength', 'cci_length', 'length', 'len', 'period', default=20, param_type='int')
             main_values = self._cci(cci_len)
         elif 'ta.mfi' in content:
-            mfi_len = int(self.params.get('mfiLength', self.params.get('length', 14)))
+            mfi_len = self._get_param('mfiLength', 'mfi_length', 'length', 'len', 'period', default=14, param_type='int')
             main_values = self._mfi(mfi_len) - 50  # Center around 0
         else:
-            # Default: use price momentum
-            mom_len = int(self.params.get('length', 14))
+            # Default: use price momentum with any 'length' parameter we can find
+            mom_len = self._get_param('length', 'len', 'period', 'lookback', default=14, param_type='int')
             main_values = ta.roc(self.close, mom_len)
         
         # Generate signals based on signal type

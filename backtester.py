@@ -101,7 +101,8 @@ class WalkForwardBacktester:
     """
     
     # Forecast horizons to test (in bars/hours for 1H data)
-    FORECAST_HORIZONS = [6, 12, 24, 48, 72, 96]
+    # Broad continuum from 1 hour to 1 week (168 hours)
+    FORECAST_HORIZONS = [1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 30, 36, 42, 48, 60, 72, 84, 96, 120, 144, 168]
     
     def __init__(
         self,
