@@ -173,7 +173,7 @@ def download_new_data(dm: DataManager):
         if symbols_input == 'TOP20':
             symbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 
                       'MATIC', 'LTC', 'SHIB', 'TRX', 'AVAX', 'LINK', 'ATOM',
-                      'UNI', 'XMR', 'ETC', 'XLM', 'BCH']
+                      'UNI', 'XMR', 'ETC', 'XLM', 'PAXG']
             print(f"  Selected top 20: {', '.join(symbols)}")
         else:
             symbols = [s.strip().replace('USDT', '') for s in symbols_input.split(',')]

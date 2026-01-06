@@ -98,6 +98,10 @@ class WalkForwardBacktester:
     - Multiple forecast horizon testing
     - Directional accuracy measurement
     - Profit factor and Sharpe ratio calculation
+    
+    CRITICAL: Each fold selects its optimal forecast horizon using ONLY its training data.
+    Test data is never used for horizon selection, preventing lookahead bias. The selected
+    horizon is then used to evaluate that fold's test data.
     """
     
     # Forecast horizons to test (in bars/hours for 1H data)
@@ -193,6 +197,9 @@ class WalkForwardBacktester:
         """
         Evaluate indicator performance across all folds and horizons.
         
+        CRITICAL: Each fold selects its optimal horizon using ONLY its training data,
+        then evaluates test data with that fold-specific horizon. This prevents lookahead bias.
+        
         Args:
             indicator_result: Result from running the indicator
             use_discrete_signals: Use buy/sell signals vs directional
@@ -200,18 +207,26 @@ class WalkForwardBacktester:
         Returns:
             Aggregated metrics across all folds
         """
-        # Find optimal forecast horizon
-        best_horizon = self._find_optimal_horizon(indicator_result, use_discrete_signals)
-        
-        # Aggregate metrics across folds
+        # Aggregate metrics across folds - each fold selects its own optimal horizon
         all_trades = []
         fold_metrics = []
+        fold_horizons = []
         
         for fold in self.folds:
+            # CRITICAL: Select optimal horizon using ONLY this fold's training data
+            # This prevents lookahead bias by ensuring test data is never used for horizon selection
+            fold_best_horizon = self._find_optimal_horizon(
+                indicator_result,
+                use_discrete_signals,
+                fold=fold  # Pass fold to restrict to training data only
+            )
+            fold_horizons.append(fold_best_horizon)
+            
+            # Evaluate test data using the horizon selected from training data
             metrics = self._evaluate_fold(
                 indicator_result,
                 fold,
-                best_horizon,
+                fold_best_horizon,  # Use fold-specific horizon
                 use_discrete_signals
             )
             if metrics.total_trades >= self.min_trades_per_fold:
@@ -240,9 +255,12 @@ class WalkForwardBacktester:
         gross_loss = abs(sum(r for r in returns if r < 0))
         profit_factor = gross_profit / gross_loss if gross_loss > 0 else (10.0 if gross_profit > 0 else 0)
         
+        # Use median horizon across folds for Sharpe ratio calculation
+        median_horizon = int(np.median(fold_horizons)) if fold_horizons else 24
+        
         # Sharpe ratio (annualized for hourly data)
         if len(returns) > 1 and np.std(returns) > 0:
-            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(8760 / best_horizon)
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(8760 / median_horizon)
         else:
             sharpe = 0
         
@@ -281,7 +299,7 @@ class WalkForwardBacktester:
             max_drawdown=max_drawdown,
             avg_holding_bars=avg_holding,
             directional_accuracy=directional_accuracy,
-            forecast_horizon=best_horizon,
+            forecast_horizon=median_horizon,  # Use median of fold-specific horizons
             improvement_over_random=improvement_over_random,
             trades=all_trades
         )
@@ -289,17 +307,67 @@ class WalkForwardBacktester:
     def _find_optimal_horizon(
         self,
         indicator_result: IndicatorResult,
-        use_discrete_signals: bool
+        use_discrete_signals: bool,
+        fold: Optional[WalkForwardFold] = None
     ) -> int:
-        """Find the forecast horizon with best directional accuracy."""
+        """
+        Find the forecast horizon with best directional accuracy.
+        
+        Args:
+            indicator_result: Indicator result with signals
+            use_discrete_signals: Whether to use buy/sell signals vs directional
+            fold: Optional fold to restrict search to training data only.
+                  If None, uses all data (for backwards compatibility, but should be avoided)
+        
+        Returns:
+            Optimal forecast horizon in bars
+        """
         best_horizon = 24  # Default
         best_accuracy = 0.0
+        
+        # Determine data range: use training data from fold if provided
+        if fold is not None:
+            start_idx = fold.train_start
+            end_idx = fold.train_end
+            # CRITICAL VALIDATION: Ensure we don't use test data or embargo period
+            # The training period must end before the test period starts
+            if end_idx > fold.test_start:
+                logger.warning(
+                    f"Fold training end ({end_idx}) exceeds test start ({fold.test_start}). "
+                    f"Truncating to prevent lookahead bias."
+                )
+                end_idx = fold.test_start
+            
+            # Additional validation: ensure indices are valid
+            if start_idx < 0 or end_idx <= start_idx:
+                logger.error(
+                    f"Invalid fold training range: start={start_idx}, end={end_idx}. "
+                    f"Using default horizon."
+                )
+                return 24  # Return default on invalid range
+            
+            # Log that we're using only training data
+            logger.debug(
+                f"Selecting optimal horizon using training data only: "
+                f"bars {start_idx} to {end_idx} (fold test starts at {fold.test_start})"
+            )
+        else:
+            # No fold provided - use all data (backwards compatibility)
+            # WARNING: This can cause lookahead bias if test data is included
+            logger.warning(
+                "_find_optimal_horizon called without fold parameter. "
+                "This may cause lookahead bias if test data is included."
+            )
+            start_idx = None
+            end_idx = None
         
         for horizon in self.FORECAST_HORIZONS:
             accuracy = self._calculate_directional_accuracy(
                 indicator_result,
                 horizon,
-                use_discrete_signals
+                use_discrete_signals,
+                start_idx=start_idx,
+                end_idx=end_idx
             )
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
@@ -311,41 +379,78 @@ class WalkForwardBacktester:
         self,
         indicator_result: IndicatorResult,
         horizon: int,
-        use_discrete_signals: bool
+        use_discrete_signals: bool,
+        start_idx: Optional[int] = None,
+        end_idx: Optional[int] = None
     ) -> float:
         """
         Calculate how accurately the indicator predicts future direction.
         CRITICAL: Only uses past indicator values to predict future returns.
+        
+        Args:
+            indicator_result: Indicator result with signals
+            horizon: Forecast horizon in bars
+            use_discrete_signals: Whether to use buy/sell signals vs directional
+            start_idx: Optional start index to restrict calculation (default: 0)
+            end_idx: Optional end index to restrict calculation (default: end of data)
         """
         future_returns = self._future_returns[horizon]
         
+        # Apply data range restrictions if provided
+        if start_idx is None:
+            start_idx = 0
+        if end_idx is None:
+            end_idx = len(future_returns)
+        
+        # Ensure indices are within bounds
+        start_idx = max(0, min(start_idx, len(future_returns)))
+        end_idx = max(start_idx, min(end_idx, len(future_returns)))
+        
+        # VALIDATION: Ensure we have valid data range
+        if end_idx <= start_idx:
+            logger.warning(
+                f"Invalid data range for directional accuracy: start={start_idx}, end={end_idx}. "
+                f"Returning default accuracy."
+            )
+            return 0.5
+        
+        # VALIDATION: Log when using restricted range (training data only)
+        if start_idx > 0 or end_idx < len(future_returns):
+            logger.debug(
+                f"Calculating directional accuracy on restricted range: "
+                f"bars {start_idx} to {end_idx} (total data: {len(future_returns)})"
+            )
+        
+        # Slice arrays to the specified range
+        future_returns_slice = future_returns[start_idx:end_idx]
+        
         if use_discrete_signals:
             # Use buy/sell signals
-            buy_signals = indicator_result.buy_signals
-            sell_signals = indicator_result.sell_signals
+            buy_signals = indicator_result.buy_signals[start_idx:end_idx]
+            sell_signals = indicator_result.sell_signals[start_idx:end_idx]
             
             # Buy signal should predict positive returns
-            buy_correct = np.sum((buy_signals) & (future_returns > 0) & ~np.isnan(future_returns))
-            buy_total = np.sum((buy_signals) & ~np.isnan(future_returns))
+            buy_correct = np.sum((buy_signals) & (future_returns_slice > 0) & ~np.isnan(future_returns_slice))
+            buy_total = np.sum((buy_signals) & ~np.isnan(future_returns_slice))
             
             # Sell signal should predict negative returns
-            sell_correct = np.sum((sell_signals) & (future_returns < 0) & ~np.isnan(future_returns))
-            sell_total = np.sum((sell_signals) & ~np.isnan(future_returns))
+            sell_correct = np.sum((sell_signals) & (future_returns_slice < 0) & ~np.isnan(future_returns_slice))
+            sell_total = np.sum((sell_signals) & ~np.isnan(future_returns_slice))
             
             total_correct = buy_correct + sell_correct
             total = buy_total + sell_total
             
         else:
             # Use directional signal
-            signal = indicator_result.combined_signal
+            signal = indicator_result.combined_signal[start_idx:end_idx]
             
             # Positive signal should predict positive returns
-            pos_correct = np.sum((signal > 0) & (future_returns > 0) & ~np.isnan(future_returns))
-            pos_total = np.sum((signal > 0) & ~np.isnan(future_returns))
+            pos_correct = np.sum((signal > 0) & (future_returns_slice > 0) & ~np.isnan(future_returns_slice))
+            pos_total = np.sum((signal > 0) & ~np.isnan(future_returns_slice))
             
             # Negative signal should predict negative returns
-            neg_correct = np.sum((signal < 0) & (future_returns < 0) & ~np.isnan(future_returns))
-            neg_total = np.sum((signal < 0) & ~np.isnan(future_returns))
+            neg_correct = np.sum((signal < 0) & (future_returns_slice < 0) & ~np.isnan(future_returns_slice))
+            neg_total = np.sum((signal < 0) & ~np.isnan(future_returns_slice))
             
             total_correct = pos_correct + neg_correct
             total = pos_total + neg_total
@@ -359,9 +464,22 @@ class WalkForwardBacktester:
         horizon: int,
         use_discrete_signals: bool
     ) -> BacktestMetrics:
-        """Evaluate indicator on a single fold's test set."""
+        """
+        Evaluate indicator on a single fold's test set.
+        
+        CRITICAL: This method ONLY uses test data (test_start to test_end).
+        The horizon parameter should have been selected using only training data
+        from this fold to prevent lookahead bias.
+        """
         test_start = fold.test_start
         test_end = fold.test_end
+        
+        # VALIDATION: Ensure we're only using test data, not training data
+        if test_start < fold.train_end:
+            logger.warning(
+                f"Test start ({test_start}) is before training end ({fold.train_end}). "
+                f"This may indicate data contamination."
+            )
         
         trades = []
         future_returns = self._future_returns[horizon]
