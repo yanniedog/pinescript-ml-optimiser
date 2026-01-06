@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 class KeyboardMonitor:
-    """Monitor for Ctrl-Q keyboard input to allow early stopping."""
+    """Monitor for 'Q' keyboard input to allow early stopping with confirmation."""
     
     def __init__(self):
         self.stop_requested = False
@@ -51,26 +51,47 @@ class KeyboardMonitor:
         """Stop monitoring."""
         self._running = False
     
+    def _get_key_windows(self):
+        """Get a key press on Windows (non-blocking)."""
+        if msvcrt.kbhit():
+            return msvcrt.getch()
+        return None
+    
+    def _get_key_confirm_windows(self):
+        """Get a key press on Windows (blocking for confirmation)."""
+        return msvcrt.getch()
+    
     def _monitor_loop(self):
         """Background thread to monitor keyboard input."""
         while self._running:
             try:
                 if sys.platform == 'win32':
-                    if msvcrt.kbhit():
-                        key = msvcrt.getch()
-                        # Ctrl-Q is ASCII 17
-                        if key == b'\x11':
+                    key = self._get_key_windows()
+                    if key and key.lower() in [b'q', b'Q']:
+                        # Ask for confirmation
+                        print("\n[?] Stop optimization and use current best? (Y/N): ", end='', flush=True)
+                        confirm = self._get_key_confirm_windows()
+                        if confirm and confirm.lower() in [b'y', b'Y']:
                             self.stop_requested = True
-                            print("\n[!] Ctrl-Q detected - stopping optimization gracefully...")
+                            print("Y")
+                            print("[!] Stopping optimization gracefully...")
                             break
+                        else:
+                            print("N")
+                            print("[i] Continuing optimization... (press Q to quit)")
                 else:
                     # Unix-like systems
                     if select.select([sys.stdin], [], [], 0.1)[0]:
                         key = sys.stdin.read(1)
-                        if ord(key) == 17:  # Ctrl-Q
-                            self.stop_requested = True
-                            print("\n[!] Ctrl-Q detected - stopping optimization gracefully...")
-                            break
+                        if key.lower() == 'q':
+                            print("\n[?] Stop optimization and use current best? (Y/N): ", end='', flush=True)
+                            confirm = sys.stdin.read(1)
+                            if confirm.lower() == 'y':
+                                self.stop_requested = True
+                                print("[!] Stopping optimization gracefully...")
+                                break
+                            else:
+                                print("[i] Continuing optimization... (press Q to quit)")
                 time.sleep(0.1)
             except Exception:
                 pass
@@ -286,7 +307,7 @@ class PineOptimizer:
             n_startup_trials: Random trials before TPE kicks in
             pruning_warmup_trials: Trials before pruning starts
             min_improvement_threshold: Minimum improvement to continue
-            enable_keyboard_interrupt: Allow Ctrl-Q to stop optimization
+            enable_keyboard_interrupt: Allow Q key to stop optimization
         """
         self.parse_result = parse_result
         self.data = data
@@ -421,24 +442,38 @@ class PineOptimizer:
             # Format sign for improvement vs original
             sign = "+" if pct_vs_original >= 0 else ""
             
+            # Build concise config string (only changed params)
+            config_parts = []
+            for pname, pval in params.items():
+                orig_val = self.original_params.get(pname)
+                if orig_val != pval:
+                    if isinstance(pval, float):
+                        config_parts.append(f"{pname}={pval:.4g}")
+                    else:
+                        config_parts.append(f"{pname}={pval}")
+            config_str = ", ".join(config_parts) if config_parts else "(no changes)"
+            
+            # Format elapsed time as Xm Ys
+            elapsed_mins = int(elapsed // 60)
+            elapsed_secs = int(elapsed % 60)
+            elapsed_str = f"{elapsed_mins}m {elapsed_secs}s" if elapsed_mins > 0 else f"{elapsed_secs}s"
+            
             if improvement_info.get('is_first'):
                 # First trial
                 logger.info(
                     f"Trial {self.trial_count}: FIRST = {avg_objective:.4f} "
-                    f"({sign}{pct_vs_original:.2f}% vs original {baseline:.4f})"
+                    f"({sign}{pct_vs_original:.2f}% vs original)"
                 )
+                logger.info(f"  -> Config: {config_str}")
             else:
                 marginal_rate_pct = improvement_info['marginal_rate_pct']
                 time_since_last = improvement_info['time_since_last_best']
                 
                 logger.info(
                     f"Trial {self.trial_count}: NEW BEST = {avg_objective:.4f} "
-                    f"({sign}{pct_vs_original:.2f}% vs original) | elapsed: {elapsed:.1f}s"
+                    f"({sign}{pct_vs_original:.2f}% vs original) | {elapsed_str} | rate: {rate_pct:+.3f}%/s"
                 )
-                logger.info(
-                    f"  -> Avg rate: {rate_pct:+.3f}%/sec vs original | "
-                    f"Marginal: {marginal_rate_pct:.3f}%/sec (waited {time_since_last:.1f}s)"
-                )
+                logger.info(f"  -> Config: {config_str}")
                 
                 # Warn about diminishing returns (only if we're actually improving)
                 if pct_vs_original > 0 and len(self.progress_tracker.improvement_history) >= 3:
@@ -449,7 +484,7 @@ class PineOptimizer:
                         recent_gain = recent_pcts[-1] - recent_pcts[-2]
                         earlier_gain = recent_pcts[-2] - recent_pcts[-3] if len(recent_pcts) >= 3 else recent_gain
                         if earlier_gain > 0 and recent_gain < earlier_gain * 0.3:
-                            logger.info("  -> [!] Diminishing returns detected - consider pressing Ctrl-Q")
+                            logger.info("  -> [!] Diminishing returns - consider pressing Q to quit")
             
             # Also update internal tracking
             self.best_objective = avg_objective
@@ -468,7 +503,7 @@ class PineOptimizer:
         logger.info(f"Max trials: {trials_str}, Timeout: {self.timeout_seconds}s ({self.timeout_seconds/60:.1f} min)")
         
         if self.enable_keyboard_interrupt:
-            logger.info("Press Ctrl-Q at any time to stop optimization and use current best results")
+            logger.info("Press Q at any time to stop optimization and use current best results")
         
         # Evaluate original config FIRST to establish baseline
         logger.info("Evaluating original config as baseline...")

@@ -94,7 +94,13 @@ Examples:
         '--symbols',
         type=str,
         default=None,
-        help='Comma-separated list of symbols to use (default: all)'
+        help='Comma-separated list of symbols to use (default: all available)'
+    )
+    parser.add_argument(
+        '--interval',
+        type=str,
+        default='1h',
+        help='Timeframe/interval (e.g., 1h, 4h, 1d). Default: 1h'
     )
     parser.add_argument(
         '--force-download',
@@ -129,37 +135,51 @@ Examples:
     print(f"Optimizing: {pine_path.name}")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
+    # Initialize data manager
+    dm = DataManager()
+    interval = args.interval
+    
     # Determine symbols to use
     if args.symbols:
         symbols = [s.strip().upper() for s in args.symbols.split(',')]
+        # Ensure USDT suffix
+        symbols = [s if s.endswith('USDT') else s + 'USDT' for s in symbols]
     else:
-        symbols = SYMBOLS
+        # Use all available symbols for this interval
+        symbols = dm.get_available_symbols(interval)
+        if not symbols:
+            # Fall back to defaults if no data exists
+            symbols = SYMBOLS
     
     total_steps = 5
     
     try:
         # Step 1: Load/Download Historical Data
-        print_step(1, total_steps, f"Loading historical data ({len(symbols)} symbols)...")
-        
-        dm = DataManager()
+        print_step(1, total_steps, f"Loading historical data ({len(symbols)} symbols @ {interval})...")
         
         # Check which symbols need downloading
-        missing = [s for s in symbols if not dm.symbol_exists(s)]
+        missing = [s for s in symbols if not dm.symbol_exists(s, interval)]
         if missing or args.force_download:
             print(f"   Downloading: {missing if missing else 'all (forced)'}")
             for symbol in (symbols if args.force_download else missing):
-                if symbol in SYMBOLS:
-                    dm.download_symbol(symbol, force=args.force_download)
+                try:
+                    dm.download_symbol(symbol, interval, force=args.force_download)
+                except Exception as e:
+                    print(f"   [WARN] Failed to download {symbol}: {e}")
         
         # Load all data
         data = {}
         for symbol in symbols:
-            if dm.symbol_exists(symbol):
-                data[symbol] = dm.load_symbol(symbol)
-                print(f"   [OK] {symbol}: {len(data[symbol]):,} candles")
+            if dm.symbol_exists(symbol, interval):
+                try:
+                    data[symbol] = dm.load_symbol(symbol, interval)
+                    print(f"   [OK] {symbol}: {len(data[symbol]):,} candles")
+                except Exception as e:
+                    print(f"   [WARN] Failed to load {symbol}: {e}")
         
         if not data:
-            print("Error: No historical data available. Please check symbols.")
+            print(f"Error: No historical data available for interval '{interval}'.")
+            print(f"       Run the interactive mode to download data first.")
             sys.exit(1)
         
         # Step 2: Parse Pine Script
@@ -191,7 +211,7 @@ Examples:
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
         print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe")
         print()
-        print(f"   [TIP] Press Ctrl-Q at any time to stop and use current best results")
+        print(f"   [TIP] Press Q at any time to stop and use current best results")
         print(f"         Watch improvement rate - diminishing returns suggest stopping early")
         print()
         
