@@ -291,12 +291,18 @@ class OutputGenerator:
         """Generate optimization metadata header comment."""
         opt = self.optimization_result
         metrics = opt.best_metrics
+        data_summary = self._get_optimization_data_summary()
         
         header_lines = [
             "// ===========================================================================",
             "// ML-OPTIMISED PARAMETERS",
             f"// Optimized: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
             f"// Trials: {opt.n_trials} | Time: {opt.optimization_time:.1f}s",
+            "// ---------------------------------------------------------------------------",
+            f"// Strategy: {getattr(opt, 'strategy', 'tpe')} | Sampler: {getattr(opt, 'sampler_name', 'tpe')}",
+            f"// Timeframe: {data_summary['interval'] or 'Not specified'}",
+            f"// Symbols: {', '.join(data_summary['symbols']) if data_summary['symbols'] else 'Not specified'}",
+            f"// Date range: {data_summary['date_range']}",
             "// ---------------------------------------------------------------------------",
             f"// Profit Factor: {metrics.profit_factor:.2f} ({opt.improvement_pf:+.1f}% vs original)",
             f"// Win Rate: {metrics.win_rate:.1%}",
@@ -356,6 +362,34 @@ class OutputGenerator:
             conditions.append("position trades/longer holds")
         
         return ", ".join(conditions) if conditions else "general market conditions"
+
+    def _get_optimization_data_summary(self) -> Dict[str, Any]:
+        """Summarize symbols/timeframes/date ranges used in optimization."""
+        opt = self.optimization_result
+        symbols = sorted(opt.datasets_used) if opt.datasets_used else []
+        interval = opt.interval or ""
+        min_date = None
+        max_date = None
+        
+        for symbol, timeframes in opt.data_usage_info.items():
+            for timeframe, info in timeframes.items():
+                if not info or not info.date_range:
+                    continue
+                start, end = info.date_range
+                if min_date is None or start < min_date:
+                    min_date = start
+                if max_date is None or end > max_date:
+                    max_date = end
+        
+        date_range = None
+        if min_date and max_date:
+            date_range = f"{min_date.strftime('%Y-%m-%d')} to {max_date.strftime('%Y-%m-%d')}"
+        
+        return {
+            "symbols": symbols,
+            "interval": interval,
+            "date_range": date_range or "Not specified",
+        }
     
     def _update_indicator_name(self, content: str) -> str:
         """Update indicator name to include 'Optimised' prefix."""
@@ -427,6 +461,28 @@ class OutputGenerator:
                 report_lines.append(f"    - {dataset_str}")
         else:
             report_lines.append(f"  Historical datasets:   Not specified")
+        
+        # Optimization data summary
+        data_summary = self._get_optimization_data_summary()
+        report_lines.append("")
+        report_lines.append("  Optimization data:")
+        report_lines.append(f"    Timeframe:          {data_summary['interval'] or 'Not specified'}")
+        report_lines.append(f"    Symbols:            {', '.join(data_summary['symbols']) if data_summary['symbols'] else 'Not specified'}")
+        report_lines.append(f"    Date range:         {data_summary['date_range']}")
+        
+        # Add optimization config details
+        report_lines.append("")
+        report_lines.append("  Optimization config:")
+        report_lines.append(f"    Strategy:            {getattr(opt, 'strategy', 'tpe')}")
+        report_lines.append(f"    Sampler:             {getattr(opt, 'sampler_name', 'tpe')}")
+        report_lines.append(f"    Timeout (sec):       {getattr(opt, 'timeout_seconds', 0)}")
+        report_lines.append(f"    Max trials:          {getattr(opt, 'max_trials', None)}")
+        report_lines.append(f"    Early stop patience: {getattr(opt, 'early_stop_patience', None)}")
+        report_lines.append(f"    Min runtime (sec):   {getattr(opt, 'min_runtime_seconds', 0)}")
+        report_lines.append(f"    Stall timeout (sec): {getattr(opt, 'stall_seconds', None)}")
+        report_lines.append(f"    Rate floor (%/s):    {getattr(opt, 'improvement_rate_floor', 0.0)}")
+        report_lines.append(f"    Rate window:         {getattr(opt, 'improvement_rate_window', 0)}")
+        report_lines.append(f"    Backtester overrides:{getattr(opt, 'backtester_overrides', {})}")
         
         report_lines.extend([
             "",
@@ -1035,8 +1091,14 @@ def generate_outputs(
     
     # Generate output paths
     source_path = Path(source_filename)
-    pine_output = f"optimised_{source_path.stem}.pine"
-    report_output = f"optimised_{source_path.stem}_report.txt"
+    base_dir = Path("optimized_outputs")
+    pine_dir = base_dir / "pine"
+    report_dir = base_dir / "reports"
+    pine_dir.mkdir(parents=True, exist_ok=True)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    
+    pine_output = str(pine_dir / f"optimised_{source_path.stem}.pine")
+    report_output = str(report_dir / f"optimised_{source_path.stem}_report.txt")
     
     # Generate files
     pine_path = generator.generate_optimized_pine(pine_output)

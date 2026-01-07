@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 import optimize_indicator as optimize_module
 from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES, print_available_data
 import argparse
+import json
+import time
 
 
 def get_pine_files(directory: Path = None):
@@ -300,6 +302,143 @@ def calculate_objective_score(metrics) -> float:
     )
 
 
+def _serialize_metrics(metrics):
+    return {
+        "total_trades": metrics.total_trades,
+        "winning_trades": metrics.winning_trades,
+        "losing_trades": metrics.losing_trades,
+        "total_return": metrics.total_return,
+        "avg_return": metrics.avg_return,
+        "win_rate": metrics.win_rate,
+        "profit_factor": metrics.profit_factor,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "avg_holding_bars": metrics.avg_holding_bars,
+        "directional_accuracy": metrics.directional_accuracy,
+        "forecast_horizon": metrics.forecast_horizon,
+        "improvement_over_random": metrics.improvement_over_random,
+        "tail_capture_rate": metrics.tail_capture_rate,
+        "consistency_score": metrics.consistency_score,
+    }
+
+
+def _serialize_per_symbol_metrics(per_symbol_metrics):
+    if not per_symbol_metrics:
+        return {}
+    first_value = next(iter(per_symbol_metrics.values()))
+    result = {}
+    if isinstance(first_value, dict) and 'original' in first_value:
+        for symbol, metrics_pair in per_symbol_metrics.items():
+            result[symbol] = {
+                "original": _serialize_metrics(metrics_pair.get('original')),
+                "optimized": _serialize_metrics(metrics_pair.get('optimized')),
+            }
+    else:
+        for symbol, timeframes in per_symbol_metrics.items():
+            result[symbol] = {}
+            for timeframe, metrics_pair in timeframes.items():
+                result[symbol][timeframe] = {
+                    "original": _serialize_metrics(metrics_pair.get('original')),
+                    "optimized": _serialize_metrics(metrics_pair.get('optimized')),
+                }
+    return result
+
+
+def _serialize_data_usage_info(data_usage_info):
+    if not data_usage_info:
+        return {}
+    serialized = {}
+    for symbol, timeframes in data_usage_info.items():
+        serialized[symbol] = {}
+        for timeframe, info in timeframes.items():
+            serialized[symbol][timeframe] = {
+                "total_bars": info.total_bars,
+                "date_range": [str(info.date_range[0]), str(info.date_range[1])],
+                "n_folds": info.n_folds,
+                "train_ratio": info.train_ratio,
+                "embargo_bars": info.embargo_bars,
+                "folds": info.folds,
+                "total_train_bars": info.total_train_bars,
+                "total_test_bars": info.total_test_bars,
+                "total_embargo_bars": info.total_embargo_bars,
+                "unused_bars": info.unused_bars,
+                "potential_bias_issues": info.potential_bias_issues,
+            }
+    return serialized
+
+
+def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, results: list):
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Build JSON payload
+    payload = {
+        "run": run_info,
+        "indicators": results,
+    }
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    
+    # Build text report
+    lines = []
+    lines.append("=" * 70)
+    lines.append("UNIFIED OPTIMIZATION REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append("RUN CONFIG")
+    lines.append("-" * 70)
+    for key, value in run_info.items():
+        lines.append(f"{key}: {value}")
+    lines.append("")
+    
+    # Aggregate stats
+    objectives = [r["objective_best"] for r in results if r.get("objective_best") is not None]
+    times = [r["optimization_time"] for r in results if r.get("optimization_time") is not None]
+    lines.append("AGGREGATE SUMMARY")
+    lines.append("-" * 70)
+    if objectives:
+        lines.append(f"Indicators: {len(results)}")
+        lines.append(f"Avg objective: {sum(objectives)/len(objectives):.4f}")
+        lines.append(f"Max objective: {max(objectives):.4f}")
+        lines.append(f"Min objective: {min(objectives):.4f}")
+    if times:
+        lines.append(f"Avg optimization time: {sum(times)/len(times):.1f}s")
+        lines.append(f"Total optimization time: {sum(times):.1f}s")
+    lines.append("")
+    
+    # Top and bottom by objective
+    ranked = sorted(results, key=lambda r: r.get("objective_best", 0), reverse=True)
+    lines.append("TOP INDICATORS (BY OBJECTIVE)")
+    lines.append("-" * 70)
+    for row in ranked[:10]:
+        lines.append(f"{row['indicator_name']}: objective={row['objective_best']:.4f} pf={row['best_metrics']['profit_factor']:.2f}")
+    lines.append("")
+    lines.append("BOTTOM INDICATORS (BY OBJECTIVE)")
+    lines.append("-" * 70)
+    for row in ranked[-10:]:
+        lines.append(f"{row['indicator_name']}: objective={row['objective_best']:.4f} pf={row['best_metrics']['profit_factor']:.2f}")
+    lines.append("")
+    
+    # Per-indicator details
+    lines.append("PER-INDICATOR DETAIL")
+    lines.append("-" * 70)
+    for row in results:
+        lines.append("")
+        lines.append(f"{row['indicator_name']} ({row['file_name']})")
+        lines.append(f"  Objective: {row['objective_best']:.4f} (baseline {row['baseline_objective']:.4f})")
+        lines.append(f"  Trials: {row['n_trials']} | Time: {row['optimization_time']:.1f}s")
+        lines.append(f"  Profit Factor: {row['best_metrics']['profit_factor']:.2f} | Win Rate: {row['best_metrics']['win_rate']*100:.1f}%")
+        lines.append(f"  Sharpe: {row['best_metrics']['sharpe_ratio']:.2f} | Drawdown: {row['best_metrics']['max_drawdown']:.1f}%")
+        lines.append(f"  Output Pine: {row['output_pine']}")
+        lines.append(f"  Output Report: {row['output_report']}")
+        lines.append(f"  Strategy: {row['config']['strategy']} | Sampler: {row['config']['sampler']}")
+        lines.append(f"  Timeout(s): {row['config']['timeout_seconds']} | Max trials: {row['config']['max_trials']}")
+        lines.append(f"  Early stop patience: {row['config']['early_stop_patience']}")
+        lines.append(f"  Min runtime(s): {row['config']['min_runtime_seconds']} | Stall(s): {row['config']['stall_seconds']}")
+        lines.append(f"  Rate floor: {row['config']['improvement_rate_floor']} | Rate window: {row['config']['improvement_rate_window']}")
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def choose_indicator_directory() -> Path:
     """Prompt for indicator directory, defaulting to ./pinescripts if present."""
     default_dir = Path.cwd() / "pinescripts"
@@ -463,6 +602,7 @@ def run_batch_optimization(dm: DataManager):
         options['interval'] = '1h'
     
     rankings = []
+    results = []
     
     for i, pine_file in enumerate(pine_files, 1):
         print(f"\n{'='*70}")
@@ -486,6 +626,7 @@ def run_batch_optimization(dm: DataManager):
             sys.argv = original_argv
         
         result = optimize_module.LAST_RESULT
+        outputs = optimize_module.LAST_OUTPUTS
         if result is None:
             continue
         
@@ -501,6 +642,38 @@ def run_batch_optimization(dm: DataManager):
             "max_drawdown": metrics.max_drawdown,
             "improvement_pf": result.improvement_pf,
         })
+        
+        if outputs:
+            results.append({
+                "indicator_name": result.best_metrics and getattr(optimize_module, "LAST_PINE_PATH", pine_file).stem or pine_file.stem,
+                "file_name": pine_file.name,
+                "output_pine": outputs.get("pine_script"),
+                "output_report": outputs.get("report"),
+                "optimization_time": result.optimization_time,
+                "n_trials": result.n_trials,
+                "objective_best": calculate_objective_score(result.best_metrics),
+                "baseline_objective": result.baseline_objective,
+                "best_metrics": _serialize_metrics(result.best_metrics),
+                "original_metrics": _serialize_metrics(result.original_metrics),
+                "original_params": result.original_params,
+                "best_params": result.best_params,
+                "per_symbol_metrics": _serialize_per_symbol_metrics(result.per_symbol_metrics),
+                "data_usage_info": _serialize_data_usage_info(result.data_usage_info),
+                "datasets_used": result.datasets_used,
+                "interval": result.interval,
+                "config": {
+                    "strategy": getattr(result, "strategy", "tpe"),
+                    "sampler": getattr(result, "sampler_name", "tpe"),
+                    "timeout_seconds": getattr(result, "timeout_seconds", 0),
+                    "max_trials": getattr(result, "max_trials", None),
+                    "early_stop_patience": getattr(result, "early_stop_patience", None),
+                    "min_runtime_seconds": getattr(result, "min_runtime_seconds", 0),
+                    "stall_seconds": getattr(result, "stall_seconds", None),
+                    "improvement_rate_floor": getattr(result, "improvement_rate_floor", 0.0),
+                    "improvement_rate_window": getattr(result, "improvement_rate_window", 0),
+                    "backtester_overrides": getattr(result, "backtester_overrides", {}),
+                },
+            })
     
     if not rankings:
         print("\nNo successful optimizations to rank.")
@@ -519,6 +692,23 @@ def run_batch_optimization(dm: DataManager):
             f"{row['win_rate']*100:>5.1f}  {row['directional_accuracy']*100:>6.1f}  "
             f"{row['sharpe_ratio']:>6.2f}  {row['max_drawdown']:>8.2f}  {row['file']}"
         )
+    
+    # Unified summary outputs
+    run_info = {
+        "indicator_directory": str(indicator_dir),
+        "interval": options.get("interval"),
+        "symbols": options.get("symbols", "all available"),
+        "timeout_seconds": options.get("timeout"),
+        "generated_all": generated,
+        "total_indicators": len(pine_files),
+    }
+    summary_dir = Path("optimized_outputs") / "summary"
+    write_unified_report(
+        summary_dir / "unified_optimization_report.txt",
+        summary_dir / "unified_optimization_results.json",
+        run_info,
+        results
+    )
 
 
 def main_menu():
