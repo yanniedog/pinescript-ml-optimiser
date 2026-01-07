@@ -12,6 +12,7 @@ from pathlib import Path
 from pine_parser import ParseResult, Parameter
 from optimizer import OptimizationResult, DataUsageInfo
 from backtester import BacktestMetrics
+from objective import calculate_objective_score
 from typing import Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,27 +43,7 @@ class OutputGenerator:
     
     def _calculate_objective_score(self, metrics: BacktestMetrics) -> float:
         """Calculate objective score using the same formula as optimizer."""
-        if metrics.total_trades < 10:
-            return 0.0
-        
-        # Weighted combination - same as optimizer
-        pf_score = min(metrics.profit_factor, 5.0) / 5.0
-        acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
-        sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
-        win_score = metrics.win_rate
-        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
-        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
-        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
-        
-        return (
-            0.25 * pf_score +
-            0.20 * acc_score +
-            0.15 * sharpe_score +
-            0.10 * win_score +
-            0.15 * tail_score +
-            0.10 * consistency_score +
-            0.05 * drawdown_score
-        )
+        return calculate_objective_score(metrics)
     
     def _interval_to_hours(self, interval: str) -> float:
         """Convert interval string to hours."""

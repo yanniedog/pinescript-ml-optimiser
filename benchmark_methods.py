@@ -6,6 +6,7 @@ from data_manager import DataManager
 from pine_parser import parse_pine_script
 from optimizer import optimize_indicator
 from output_generator import generate_outputs
+from objective import calculate_objective_score as objective_score
 
 
 INDICATOR_DIR = Path("pinescripts")
@@ -21,26 +22,7 @@ METHOD_BUDGET_SECONDS = 120
 
 
 def calculate_objective_score(metrics) -> float:
-    if metrics.total_trades < 10:
-        return 0.0
-
-    pf_score = min(metrics.profit_factor, 5.0) / 5.0
-    acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
-    sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
-    win_score = metrics.win_rate
-    tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
-    consistency_score = max(0.0, min(1.0, metrics.consistency_score))
-    drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
-
-    return (
-        0.25 * pf_score +
-        0.20 * acc_score +
-        0.15 * sharpe_score +
-        0.10 * win_score +
-        0.15 * tail_score +
-        0.10 * consistency_score +
-        0.05 * drawdown_score
-    )
+    return objective_score(metrics)
 
 
 def load_data(dm: DataManager):

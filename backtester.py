@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from pine_translator import IndicatorResult
+from objective import calculate_objective_score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -731,48 +732,11 @@ class WalkForwardBacktester:
         Calculate optimization objective from metrics.
         Higher is better.
         """
-        if metrics.total_trades < self.min_trades_per_fold:
-            return 0.0
-        
-        # Weighted combination of metrics
-        # Profit factor: capped at 5 for stability
-        pf_score = min(metrics.profit_factor, 5.0) / 5.0
-        
-        # Directional accuracy: above 50% is good
-        acc_score = (metrics.directional_accuracy - 0.5) * 2  # Scale to 0-1 for 50-100%
-        acc_score = max(0, min(1, acc_score))
-        
-        # Sharpe ratio: capped at 3 for stability
-        sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
-        
-        # Win rate bonus
-        win_score = metrics.win_rate
-
-        # Extreme move capture (highs/lows)
-        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
-
-        # Consistency across folds
-        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
-
-        # Drawdown penalty (lower drawdown -> higher score)
-        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
-        
-        # Combine with weights
-        objective = (
-            0.25 * pf_score +
-            0.20 * acc_score +
-            0.15 * sharpe_score +
-            0.10 * win_score +
-            0.15 * tail_score +
-            0.10 * consistency_score +
-            0.05 * drawdown_score
+        return calculate_objective_score(
+            metrics,
+            min_trades=self.min_trades_per_fold,
+            min_trades_penalty=50
         )
-        
-        # Penalty for too few trades
-        if metrics.total_trades < 50:
-            objective *= metrics.total_trades / 50
-        
-        return objective
 
 
 def create_backtester(df: pd.DataFrame, **kwargs) -> WalkForwardBacktester:

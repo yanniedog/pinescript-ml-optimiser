@@ -19,6 +19,7 @@ from pathlib import Path
 from pine_parser import ParseResult, Parameter
 from pine_translator import PineTranslator, IndicatorResult
 from backtester import WalkForwardBacktester, BacktestMetrics, WalkForwardFold
+from objective import calculate_objective_score
 from datetime import datetime
 
 # Platform-specific keyboard handling
@@ -735,7 +736,7 @@ class PineOptimizer:
             original_metrics = self._aggregate_metrics(all_original_metrics)
         else:
             original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
-        original_objective = self._calculate_overall_objective(original_metrics)
+        original_objective = self._calculate_avg_objective(original_per_symbol)
         
         self.start_time = time.time()
         self.trial_count = 0
@@ -848,7 +849,7 @@ class PineOptimizer:
             best_metrics_candidate = self._aggregate_metrics(all_optimized_metrics)
         else:
             best_metrics_candidate = self._aggregate_metrics(list(optimized_per_symbol.values()))
-        best_objective = self._calculate_overall_objective(best_metrics_candidate)
+        best_objective = self._calculate_avg_objective(optimized_per_symbol)
         
         # Build per-symbol metrics dict - handle both structures
         per_symbol_metrics = {}
@@ -983,29 +984,33 @@ class PineOptimizer:
         
         return result
     
+    def _calculate_avg_objective(self, per_symbol_metrics: Dict[str, Any]) -> float:
+        """Calculate average objective score using backtester settings."""
+        total_objective = 0.0
+        count = 0
+
+        if self.is_multi_timeframe:
+            for symbol, tf_dict in per_symbol_metrics.items():
+                for timeframe, metrics in tf_dict.items():
+                    key = (symbol, timeframe)
+                    backtester = self.backtesters.get(key)
+                    if backtester is None:
+                        continue
+                    total_objective += backtester.calculate_objective(metrics)
+                    count += 1
+        else:
+            for symbol, metrics in per_symbol_metrics.items():
+                backtester = self.backtesters.get(symbol)
+                if backtester is None:
+                    continue
+                total_objective += backtester.calculate_objective(metrics)
+                count += 1
+
+        return total_objective / count if count > 0 else 0.0
+
     def _calculate_overall_objective(self, metrics: BacktestMetrics) -> float:
         """Calculate overall objective score for comparison."""
-        if metrics.total_trades < 10:
-            return 0.0
-        
-        # Weighted combination - same as backtester
-        pf_score = min(metrics.profit_factor, 5.0) / 5.0
-        acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
-        sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
-        win_score = metrics.win_rate
-        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
-        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
-        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
-        
-        return (
-            0.25 * pf_score +
-            0.20 * acc_score +
-            0.15 * sharpe_score +
-            0.10 * win_score +
-            0.15 * tail_score +
-            0.10 * consistency_score +
-            0.05 * drawdown_score
-        )
+        return calculate_objective_score(metrics)
     
     def _aggregate_metrics(self, all_metrics: List[BacktestMetrics]) -> BacktestMetrics:
         """Aggregate metrics from multiple symbols/timeframes into a single BacktestMetrics."""
@@ -1215,6 +1220,9 @@ def _optimize_multi_fidelity(
     first_key = next(iter(data.keys()))
     subset_data = {first_key: data[first_key]}
 
+    logger.info(
+        f"Multi-fidelity stage 1/2: subset={first_key}, budget={stage1_budget}s"
+    )
     stage1_overrides = {
         "n_folds": 2,
         "embargo_bars": 5,
@@ -1233,6 +1241,9 @@ def _optimize_multi_fidelity(
     stage1_result = stage1_optimizer.optimize()
 
     # Stage 2: full data, seeded with stage 1 best params
+    logger.info(
+        f"Multi-fidelity stage 2/2: full_data={len(data)} symbols, budget={stage2_budget}s"
+    )
     stage2_optimizer = PineOptimizer(
         parse_result,
         data,
