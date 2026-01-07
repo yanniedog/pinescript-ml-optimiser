@@ -306,6 +306,16 @@ class OptimizationResult:
     data_usage_info: Dict[str, Dict[str, DataUsageInfo]] = field(default_factory=dict)  # {symbol: {timeframe: DataUsageInfo}}
     datasets_used: List[str] = field(default_factory=list)  # List of datasets used (symbol names, e.g., ["BTCUSDT", "ETHUSDT"])
     interval: str = ""  # Timeframe/interval used (e.g., "1h", "4h", "1d") - may represent multiple intervals
+    strategy: str = "tpe"
+    sampler_name: str = "tpe"
+    timeout_seconds: int = 0
+    max_trials: Optional[int] = None
+    early_stop_patience: Optional[int] = None
+    min_runtime_seconds: int = 0
+    stall_seconds: Optional[int] = None
+    improvement_rate_floor: float = 0.0
+    improvement_rate_window: int = 0
+    backtester_overrides: Dict[str, Any] = field(default_factory=dict)
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
@@ -936,7 +946,16 @@ class PineOptimizer:
             per_symbol_metrics=per_symbol_metrics,
             timeframes_used=timeframes_used,
             data_usage_info=data_usage_info,
-            datasets_used=datasets_used
+            datasets_used=datasets_used,
+            sampler_name=self.sampler_name,
+            timeout_seconds=self.timeout_seconds,
+            max_trials=self.max_trials,
+            early_stop_patience=self.early_stop_patience,
+            min_runtime_seconds=self.min_runtime_seconds,
+            stall_seconds=self.stall_seconds,
+            improvement_rate_floor=self.improvement_rate_floor,
+            improvement_rate_window=self.improvement_rate_window,
+            backtester_overrides=self.backtester_overrides
         )
         
         # Format total time nicely for logging
@@ -1177,6 +1196,7 @@ def optimize_indicator(
     
     # Set interval in result
     result.interval = interval
+    result.strategy = strategy
     return result
 
 
