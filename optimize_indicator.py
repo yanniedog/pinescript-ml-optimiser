@@ -38,6 +38,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+DEFAULT_OPTIMIZATION_STRATEGY = "multi_fidelity"
+
+LAST_RESULT = None
+LAST_OUTPUTS = None
+LAST_PINE_PATH = None
+
 
 def print_banner():
     """Print application banner."""
@@ -57,6 +63,11 @@ def print_step(step_num: int, total: int, message: str):
 
 def main():
     """Main entry point."""
+    global LAST_RESULT, LAST_OUTPUTS, LAST_PINE_PATH
+    LAST_RESULT = None
+    LAST_OUTPUTS = None
+    LAST_PINE_PATH = None
+
     parser = argparse.ArgumentParser(
         description='Optimize Pine Script indicator parameters using ML',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -131,6 +142,8 @@ Examples:
     if not pine_path.suffix == '.pine':
         print(f"Warning: File does not have .pine extension: {pine_path}")
     
+    LAST_PINE_PATH = pine_path
+
     print_banner()
     print(f"Optimizing: {pine_path.name}")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -284,13 +297,16 @@ Examples:
             data,
             interval=args.interval,  # Pass full interval string (may be comma-separated)
             max_trials=args.max_trials,
-            timeout_seconds=args.timeout
+            timeout_seconds=args.timeout,
+            strategy=DEFAULT_OPTIMIZATION_STRATEGY
         )
         
         # Step 4: Generate Optimized Pine Script
         print_step(4, total_steps, "Generating optimized indicator...")
         
         outputs = generate_outputs(parse_result, optimization_result, str(pine_path))
+        LAST_RESULT = optimization_result
+        LAST_OUTPUTS = outputs
         
         print(f"   [OK] Optimized Pine Script: {outputs['pine_script']}")
         print(f"   [OK] Performance Report: {outputs['report']}")

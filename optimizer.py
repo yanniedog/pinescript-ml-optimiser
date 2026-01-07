@@ -11,6 +11,7 @@ import logging
 import time
 import sys
 import threading
+import re
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -357,7 +358,16 @@ class PineOptimizer:
         n_startup_trials: int = 20,
         pruning_warmup_trials: int = 30,
         min_improvement_threshold: float = 0.1,
-        enable_keyboard_interrupt: bool = True
+        enable_keyboard_interrupt: bool = True,
+        interval: str = "",
+        sampler_name: str = "tpe",
+        early_stop_patience: Optional[int] = None,
+        seed_params: Optional[Dict[str, Any]] = None,
+        backtester_overrides: Optional[Dict[str, Any]] = None,
+        min_runtime_seconds: int = 15,
+        stall_seconds: Optional[int] = None,
+        improvement_rate_floor: float = 0.05,
+        improvement_rate_window: int = 5
     ):
         """
         Initialize optimizer.
@@ -371,6 +381,14 @@ class PineOptimizer:
             pruning_warmup_trials: Trials before pruning starts
             min_improvement_threshold: Minimum improvement to continue
             enable_keyboard_interrupt: Allow Q key to stop optimization
+            sampler_name: Optuna sampler ("tpe" or "random")
+            early_stop_patience: Stop after N trials without improvement
+            seed_params: Initial parameter suggestion to evaluate early
+            backtester_overrides: Overrides for backtester settings
+            min_runtime_seconds: Minimum runtime before early timeout checks
+            stall_seconds: Stop if no improvement for this many seconds
+            improvement_rate_floor: Minimum avg improvement rate to keep running
+            improvement_rate_window: Moving average window for improvement rate
         """
         self.parse_result = parse_result
         self.data = data
@@ -380,10 +398,22 @@ class PineOptimizer:
         self.pruning_warmup_trials = pruning_warmup_trials
         self.min_improvement_threshold = min_improvement_threshold
         self.enable_keyboard_interrupt = enable_keyboard_interrupt
+        self.interval = interval
+        self.sampler_name = sampler_name
+        self.early_stop_patience = early_stop_patience
+        self.seed_params = seed_params
+        self.backtester_overrides = backtester_overrides or {}
+        self.min_runtime_seconds = min_runtime_seconds
+        self.stall_seconds = stall_seconds
+        self.improvement_rate_floor = improvement_rate_floor
+        self.improvement_rate_window = max(1, improvement_rate_window)
         
         # Extract parameter info
         self.parameters = parse_result.parameters
         self.original_params = {p.name: p.default for p in self.parameters}
+        self.use_discrete_signals = bool(
+            self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions
+        )
         
         # Filter to optimizable parameters (exclude display/visual params)
         self.optimizable_params = self._get_optimizable_params()
@@ -406,13 +436,15 @@ class PineOptimizer:
                 for timeframe, df in timeframes_dict.items():
                     key = (symbol, timeframe)
                     self.translators[key] = PineTranslator(parse_result, df)
-                    self.backtesters[key] = WalkForwardBacktester(df)
+                    backtester_kwargs = self._get_backtester_config(timeframe, df)
+                    self.backtesters[key] = WalkForwardBacktester(df, **backtester_kwargs)
                     self.data_frames[key] = df
         else:
             # Single-timeframe structure: {symbol: DataFrame}
             for symbol, df in data.items():
                 self.translators[symbol] = PineTranslator(parse_result, df)
-                self.backtesters[symbol] = WalkForwardBacktester(df)
+                backtester_kwargs = self._get_backtester_config(self.interval, df)
+                self.backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
                 self.data_frames[symbol] = df
         
         # Tracking
@@ -424,6 +456,87 @@ class PineOptimizer:
         self.progress_tracker = OptimizationProgressTracker()
         self.keyboard_monitor = KeyboardMonitor() if enable_keyboard_interrupt else None
         self.user_stopped = False
+        self.last_improvement_trial = None
+        self.last_improvement_time = None
+
+    def _parse_interval_seconds(self, interval: str) -> Optional[int]:
+        """Convert interval string (e.g., 1h, 4h, 1d) to seconds."""
+        if not interval:
+            return None
+        value_match = re.match(r'^(\d+)([mhdw])$', interval.strip().lower())
+        if not value_match:
+            return None
+        value = int(value_match.group(1))
+        unit = value_match.group(2)
+        seconds_per_unit = {
+            'm': 60,
+            'h': 3600,
+            'd': 86400,
+            'w': 604800,
+        }
+        return value * seconds_per_unit[unit]
+
+    def _forecast_horizons_for_interval(self, interval: str, length: int) -> List[int]:
+        """Pick efficient horizon set based on interval granularity."""
+        bar_seconds = self._parse_interval_seconds(interval)
+        if bar_seconds is None:
+            return WalkForwardBacktester.FORECAST_HORIZONS
+
+        # Use a compact horizon set for slow bars to reduce compute.
+        if bar_seconds >= 86400:  # 1d+
+            horizons = [1, 2, 3, 5, 8, 13, 21, 34, 55]
+        elif bar_seconds >= 14400:  # 4h+
+            horizons = [1, 2, 3, 4, 6, 8, 12, 16, 24, 36, 48, 72]
+        else:
+            horizons = WalkForwardBacktester.FORECAST_HORIZONS
+
+        # Guard against horizons longer than available data
+        max_reasonable = max(1, length // 10)
+        return [h for h in horizons if h <= max_reasonable] or [1]
+
+    def _get_backtester_config(self, interval: str, df: pd.DataFrame) -> Dict[str, Any]:
+        """Tune backtester settings for interval and dataset size."""
+        length = len(df)
+        bar_seconds = self._parse_interval_seconds(interval)
+        n_folds = 5
+        embargo_bars = 72
+        min_trades_per_fold = 10
+
+        if bar_seconds is not None:
+            # Keep embargo roughly ~72 hours worth of bars, but avoid over-penalizing slow intervals.
+            embargo_bars = max(3, int((72 * 3600) / bar_seconds))
+
+            # Reduce folds for slower intervals to save compute.
+            if bar_seconds >= 86400 or length < 1500:
+                n_folds = 3
+
+            # Lower the minimum trade count for slow intervals to avoid zero baselines.
+            if bar_seconds >= 86400:
+                min_trades_per_fold = 2
+            elif bar_seconds >= 14400:
+                min_trades_per_fold = 5
+
+        config = {
+            "n_folds": n_folds,
+            "embargo_bars": embargo_bars,
+            "min_trades_per_fold": min_trades_per_fold,
+            "forecast_horizons": self._forecast_horizons_for_interval(interval, length),
+        }
+        if self.backtester_overrides:
+            config.update(self.backtester_overrides)
+        return config
+
+    def _get_improvement_rate_stats(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """Return (avg_rate, moving_avg_rate, peak_rate) from improvement history."""
+        history = self.progress_tracker.improvement_history
+        if not history:
+            return None, None, None
+        avg_rates = [entry[3] for entry in history]
+        avg_rate = sum(avg_rates) / len(avg_rates)
+        window = min(self.improvement_rate_window, len(avg_rates))
+        moving_avg = sum(avg_rates[-window:]) / window
+        peak_rate = max(avg_rates)
+        return avg_rate, moving_avg, peak_rate
     
     def _get_optimizable_params(self) -> List[Parameter]:
         """Filter parameters to only those worth optimizing."""
@@ -488,8 +601,7 @@ class PineOptimizer:
                 indicator_result = translator.run_indicator(params)
                 
                 # Evaluate performance
-                use_discrete = self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions
-                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=bool(use_discrete))
+                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
                 
                 # Calculate objective
                 obj = backtester.calculate_objective(metrics)
@@ -542,12 +654,19 @@ class PineOptimizer:
             
             if improvement_info.get('is_first'):
                 # First trial
+                avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
                 logger.info(
                     f"Trial {self.trial_count}: FIRST = {avg_objective:.4f} "
                     f"({sign}{pct_vs_original:.2f}% vs original)"
                 )
+                if avg_rate is not None and moving_avg is not None:
+                    logger.info(
+                        f"  -> Avg rate: {avg_rate:+.3f}%/s | Moving avg ({self.improvement_rate_window}): "
+                        f"{moving_avg:+.3f}%/s"
+                    )
                 logger.info(f"  -> Config: {config_str}")
             else:
+                avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
                 marginal_rate_pct = improvement_info['marginal_rate_pct']
                 time_since_last = improvement_info['time_since_last_best']
                 
@@ -555,6 +674,11 @@ class PineOptimizer:
                     f"Trial {self.trial_count}: NEW BEST = {avg_objective:.4f} "
                     f"({sign}{pct_vs_original:.2f}% vs original) | {elapsed_str} | rate: {rate_pct:+.3f}%/s"
                 )
+                if avg_rate is not None and moving_avg is not None:
+                    logger.info(
+                        f"  -> Avg rate: {avg_rate:+.3f}%/s | Moving avg ({self.improvement_rate_window}): "
+                        f"{moving_avg:+.3f}%/s"
+                    )
                 logger.info(f"  -> Config: {config_str}")
                 
                 # Warn about diminishing returns (only if we're actually improving)
@@ -570,6 +694,8 @@ class PineOptimizer:
             
             # Also update internal tracking
             self.best_objective = avg_objective
+            self.last_improvement_trial = self.trial_count
+            self.last_improvement_time = time.time()
         
         return avg_objective
     
@@ -589,67 +715,6 @@ class PineOptimizer:
         
         # Evaluate original config FIRST to establish baseline
         logger.info("Evaluating original config as baseline...")
-        original_metrics = self._evaluate_params(self.original_params)
-        original_objective = self._calculate_overall_objective(original_metrics)
-        
-        self.start_time = time.time()
-        self.trial_count = 0
-        self.best_objective = 0.0
-        self.user_stopped = False
-        
-        # Start progress tracking with original config as baseline
-        self.progress_tracker.set_baseline(original_objective, self.original_params)
-        self.progress_tracker.start()
-        
-        # Start keyboard monitoring if enabled
-        if self.keyboard_monitor:
-            self.keyboard_monitor.start()
-        
-        # Create Optuna study with TPE sampler
-        sampler = optuna.samplers.TPESampler(
-            n_startup_trials=self.n_startup_trials,
-            seed=42
-        )
-        
-        pruner = optuna.pruners.MedianPruner(
-            n_startup_trials=self.pruning_warmup_trials,
-            n_warmup_steps=len(self.data) // 2
-        )
-        
-        study = optuna.create_study(
-            direction='maximize',
-            sampler=sampler,
-            pruner=pruner
-        )
-        
-        # Custom callback to check for user stop request
-        def stop_callback(study, trial):
-            if self.keyboard_monitor and self.keyboard_monitor.stop_requested:
-                study.stop()
-        
-        # Run optimization
-        try:
-            study.optimize(
-                self._objective,
-                n_trials=self.max_trials,
-                timeout=self.timeout_seconds,
-                show_progress_bar=False,
-                catch=(Exception,),
-                callbacks=[stop_callback] if self.keyboard_monitor else None
-            )
-        finally:
-            # Stop keyboard monitor
-            if self.keyboard_monitor:
-                self.keyboard_monitor.stop()
-        
-        optimization_time = time.time() - self.start_time
-        
-        # Report if user stopped
-        if self.user_stopped or (self.keyboard_monitor and self.keyboard_monitor.stop_requested):
-            logger.info(f"Optimization stopped by user after {optimization_time:.1f}s ({self.trial_count} trials)")
-            logger.info("Using best parameters found so far...")
-        
-        # Evaluate original params first (per-symbol/timeframe)
         original_per_symbol = self._evaluate_params_per_symbol(self.original_params)
         
         # Aggregate metrics - handle both single and multi-timeframe structures
@@ -662,14 +727,108 @@ class PineOptimizer:
             original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
         original_objective = self._calculate_overall_objective(original_metrics)
         
+        self.start_time = time.time()
+        self.trial_count = 0
+        self.best_objective = 0.0
+        self.user_stopped = False
+        
+        # Start progress tracking with original config as baseline
+        self.progress_tracker.set_baseline(original_objective, self.original_params)
+        self.progress_tracker.start()
+        self.last_improvement_trial = 0
+        self.last_improvement_time = self.start_time
+        if self.stall_seconds is None:
+            self.stall_seconds = max(10, len(self.optimizable_params) * 4)
+        
+        # Start keyboard monitoring if enabled
+        if self.keyboard_monitor:
+            self.keyboard_monitor.start()
+        
+        self.last_improvement_trial = None
+        study = None
+        if self.optimizable_params:
+            # Create Optuna study with requested sampler
+            if self.sampler_name.lower() == "random":
+                sampler = optuna.samplers.RandomSampler(seed=42)
+            else:
+                sampler = optuna.samplers.TPESampler(
+                    n_startup_trials=self.n_startup_trials,
+                    seed=42
+                )
+            
+            pruner = optuna.pruners.MedianPruner(
+                n_startup_trials=self.pruning_warmup_trials,
+                n_warmup_steps=len(self.data) // 2
+            )
+            
+            study = optuna.create_study(
+                direction='maximize',
+                sampler=sampler,
+                pruner=pruner
+            )
+
+            if self.seed_params:
+                study.enqueue_trial(self.seed_params)
+            
+            # Custom callback to check for user stop request
+            def stop_callback(study, trial):
+                if self.keyboard_monitor and self.keyboard_monitor.stop_requested:
+                    study.stop()
+                if self.early_stop_patience is not None and self.last_improvement_trial is not None:
+                    if (trial.number - self.last_improvement_trial) >= self.early_stop_patience:
+                        study.stop()
+                if self.last_improvement_time is not None:
+                    elapsed = time.time() - self.start_time if self.start_time else 0
+                    if elapsed >= self.min_runtime_seconds:
+                        if (time.time() - self.last_improvement_time) >= self.stall_seconds:
+                            avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
+                            if avg_rate is None or peak_rate is None:
+                                study.stop()
+                                return
+                            
+                            threshold = max(self.improvement_rate_floor, 0.2 * peak_rate)
+                            if moving_avg is None or moving_avg < threshold:
+                                study.stop()
+            
+            # Run optimization
+            try:
+                study.optimize(
+                    self._objective,
+                    n_trials=self.max_trials,
+                    timeout=self.timeout_seconds,
+                    show_progress_bar=False,
+                    catch=(Exception,),
+                    callbacks=[stop_callback] if self.keyboard_monitor else None
+                )
+            finally:
+                # Stop keyboard monitor
+                if self.keyboard_monitor:
+                    self.keyboard_monitor.stop()
+        else:
+            logger.info("No optimizable parameters found. Skipping search.")
+            if self.keyboard_monitor:
+                self.keyboard_monitor.stop()
+        
+        optimization_time = time.time() - self.start_time
+        
+        # Report if user stopped
+        if self.user_stopped or (self.keyboard_monitor and self.keyboard_monitor.stop_requested):
+            logger.info(f"Optimization stopped by user after {optimization_time:.1f}s ({self.trial_count} trials)")
+            logger.info("Using best parameters found so far...")
+        
         # Get best params from study
         best_params_candidate = self.original_params.copy()
-        for p in self.optimizable_params:
-            if p.name in study.best_params:
-                best_params_candidate[p.name] = study.best_params[p.name]
+        if study is not None:
+            for p in self.optimizable_params:
+                if p.name in study.best_params:
+                    best_params_candidate[p.name] = study.best_params[p.name]
         
         # Evaluate best params candidate (per-symbol/timeframe)
-        optimized_per_symbol = self._evaluate_params_per_symbol(best_params_candidate)
+        optimized_per_symbol = (
+            self._evaluate_params_per_symbol(best_params_candidate)
+            if study is not None
+            else original_per_symbol
+        )
         
         # Aggregate metrics - handle both single and multi-timeframe structures
         if self.is_multi_timeframe:
@@ -766,7 +925,7 @@ class PineOptimizer:
             original_params=self.original_params,
             best_metrics=best_metrics,
             original_metrics=original_metrics,
-            n_trials=len(study.trials),
+            n_trials=len(study.trials) if study is not None else 0,
             optimization_time=optimization_time,
             improvement_pf=improvement_pf,
             improvement_accuracy=improvement_acc,
@@ -970,8 +1129,7 @@ class PineOptimizer:
             
             try:
                 indicator_result = translator.run_indicator(params)
-                use_discrete = bool(self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions)
-                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=use_discrete)
+                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
                 
                 if self.is_multi_timeframe:
                     symbol, timeframe = key
@@ -1010,11 +1168,60 @@ def optimize_indicator(
     Returns:
         OptimizationResult
     """
-    optimizer = PineOptimizer(parse_result, data, **kwargs)
-    result = optimizer.optimize()
+    strategy = kwargs.pop("strategy", "tpe").lower()
+    if strategy == "multi_fidelity":
+        result = _optimize_multi_fidelity(parse_result, data, interval, **kwargs)
+    else:
+        optimizer = PineOptimizer(parse_result, data, interval=interval, **kwargs)
+        result = optimizer.optimize()
+    
     # Set interval in result
     result.interval = interval
     return result
+
+
+def _optimize_multi_fidelity(
+    parse_result: ParseResult,
+    data: Dict[str, pd.DataFrame],
+    interval: str,
+    **kwargs
+) -> OptimizationResult:
+    """Two-stage optimization: quick subset pass, then full pass seeded by stage 1."""
+    timeout_seconds = kwargs.pop("timeout_seconds", 300)
+    stage1_budget = max(1, timeout_seconds // 2)
+    stage2_budget = max(1, timeout_seconds - stage1_budget)
+
+    # Subset data: first symbol only (or first symbol/timeframe for multi-timeframe)
+    first_key = next(iter(data.keys()))
+    subset_data = {first_key: data[first_key]}
+
+    stage1_overrides = {
+        "n_folds": 2,
+        "embargo_bars": 5,
+        "min_trades_per_fold": 2,
+        "forecast_horizons": [1, 2, 3, 5, 8, 13],
+    }
+
+    stage1_optimizer = PineOptimizer(
+        parse_result,
+        subset_data,
+        interval=interval,
+        timeout_seconds=stage1_budget,
+        backtester_overrides=stage1_overrides,
+        **kwargs
+    )
+    stage1_result = stage1_optimizer.optimize()
+
+    # Stage 2: full data, seeded with stage 1 best params
+    stage2_optimizer = PineOptimizer(
+        parse_result,
+        data,
+        interval=interval,
+        timeout_seconds=stage2_budget,
+        seed_params=stage1_result.best_params,
+        **kwargs
+    )
+    return stage2_optimizer.optimize()
 
 
 if __name__ == "__main__":

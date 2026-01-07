@@ -190,7 +190,7 @@ class PineParser:
             
             # Try input.int
             match = re.search(
-                r'(\w+)\s*=\s*input\.int\s*\(\s*(-?\d+)',
+                r'(\w+)\s*=\s*input\.int\s*\(',
                 line
             )
             if match:
@@ -201,7 +201,7 @@ class PineParser:
             
             # Try input.float
             match = re.search(
-                r'(\w+)\s*=\s*input\.float\s*\(\s*(-?[\d.]+)',
+                r'(\w+)\s*=\s*input\.float\s*\(',
                 line
             )
             if match:
@@ -212,7 +212,7 @@ class PineParser:
             
             # Try input.bool
             match = re.search(
-                r'(\w+)\s*=\s*input\.bool\s*\(\s*(true|false)',
+                r'(\w+)\s*=\s*input\.bool\s*\(',
                 line,
                 re.IGNORECASE
             )
@@ -227,6 +227,8 @@ class PineParser:
         """Parse an input.int() declaration."""
         # Extract default value
         default_match = re.search(r'input\.int\s*\(\s*(-?\d+)', line)
+        if not default_match:
+            default_match = re.search(r'defval\s*=\s*(-?\d+)', line)
         if not default_match:
             return None
         default = int(default_match.group(1))
@@ -253,6 +255,8 @@ class PineParser:
         """Parse an input.float() declaration."""
         default_match = re.search(r'input\.float\s*\(\s*(-?[\d.]+)', line)
         if not default_match:
+            default_match = re.search(r'defval\s*=\s*(-?[\d.]+)', line)
+        if not default_match:
             return None
         default = float(default_match.group(1))
         
@@ -276,6 +280,8 @@ class PineParser:
     def _parse_input_bool(self, line: str, line_num: int, var_name: str) -> Optional[Parameter]:
         """Parse an input.bool() declaration."""
         default_match = re.search(r'input\.bool\s*\(\s*(true|false)', line, re.IGNORECASE)
+        if not default_match:
+            default_match = re.search(r'defval\s*=\s*(true|false)', line, re.IGNORECASE)
         if not default_match:
             return None
         default = default_match.group(1).lower() == 'true'

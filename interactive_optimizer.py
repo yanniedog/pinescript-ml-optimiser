@@ -6,19 +6,20 @@ Includes data management for downloading any crypto symbol at any timeframe.
 
 import sys
 import os
+import runpy
 from pathlib import Path
 
 # Ensure we can import our modules
 sys.path.insert(0, str(Path(__file__).parent))
 
-from optimize_indicator import main as optimize_main
+import optimize_indicator as optimize_module
 from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES, print_available_data
 import argparse
 
 
-def get_pine_files():
-    """Get all .pine files in the current directory, excluding optimized ones."""
-    current_dir = Path.cwd()
+def get_pine_files(directory: Path = None):
+    """Get all .pine files in the directory, excluding optimized ones."""
+    current_dir = directory or Path.cwd()
     pine_files = list(current_dir.glob("*.pine"))
     pine_files = [f for f in pine_files if not f.name.startswith('optimised_')]
     return sorted(pine_files)
@@ -275,6 +276,71 @@ def build_args(pine_file, options):
     return args
 
 
+def calculate_objective_score(metrics) -> float:
+    """Calculate overall objective score for ranking."""
+    if metrics.total_trades < 10:
+        return 0.0
+    
+    pf_score = min(metrics.profit_factor, 5.0) / 5.0
+    acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
+    sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
+    win_score = metrics.win_rate
+    tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
+    consistency_score = max(0.0, min(1.0, metrics.consistency_score))
+    drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
+    
+    return (
+        0.25 * pf_score +
+        0.20 * acc_score +
+        0.15 * sharpe_score +
+        0.10 * win_score +
+        0.15 * tail_score +
+        0.10 * consistency_score +
+        0.05 * drawdown_score
+    )
+
+
+def choose_indicator_directory() -> Path:
+    """Prompt for indicator directory, defaulting to ./pinescripts if present."""
+    default_dir = Path.cwd() / "pinescripts"
+    if default_dir.exists():
+        prompt = "Indicator directory [pinescripts]: "
+        default_value = default_dir
+    else:
+        prompt = "Indicator directory [current]: "
+        default_value = Path.cwd()
+    
+    while True:
+        user_input = input(prompt).strip()
+        if not user_input:
+            return default_value
+        candidate = Path(user_input)
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+        print("  [ERROR] Directory not found. Please enter a valid path.")
+
+
+def maybe_generate_all_indicators():
+    """Optionally generate the full set of indicators using the generator script."""
+    choice = input("\nGenerate all 100 indicators now? [n]: ").strip().lower()
+    if choice not in ['y', 'yes']:
+        return False
+    
+    generator_path = Path(__file__).parent / "create-pinescript-indicators.py"
+    if not generator_path.exists():
+        print(f"\n[ERROR] Indicator generator script not found: {generator_path}")
+        return False
+    
+    print("\nGenerating indicators...")
+    try:
+        runpy.run_path(str(generator_path), run_name="__main__")
+        print("[OK] Indicator generation complete.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to generate indicators: {e}")
+        return False
+
+
 def run_optimization(dm: DataManager):
     """Run the optimization workflow."""
     pine_files = get_pine_files()
@@ -331,7 +397,9 @@ def run_optimization(dm: DataManager):
     original_argv = sys.argv
     try:
         sys.argv = ['interactive_optimizer.py'] + build_args(selected_file, options)
-        optimize_main()
+        optimize_module.main()
+    except SystemExit:
+        print("\n[ERROR] Optimization exited early.")
     except KeyboardInterrupt:
         print("\n\nOptimization interrupted by user.")
     except Exception as e:
@@ -340,6 +408,117 @@ def run_optimization(dm: DataManager):
         traceback.print_exc()
     finally:
         sys.argv = original_argv
+
+
+def run_batch_optimization(dm: DataManager):
+    """Run optimization across all indicators in a directory with ranking."""
+    generated = maybe_generate_all_indicators()
+    
+    if generated:
+        indicator_dir = Path.cwd() / "pinescripts"
+    else:
+        indicator_dir = choose_indicator_directory()
+    
+    pine_files = get_pine_files(indicator_dir)
+    
+    if not pine_files:
+        print(f"\n[ERROR] No Pine Script files found in: {indicator_dir}")
+        return
+    
+    print(f"\nFound {len(pine_files)} Pine Script files in {indicator_dir}")
+    
+    # Ask for timeout
+    options = {}
+    print()
+    while True:
+        timeout_input = input("How many minutes should each optimization run? [5]: ").strip()
+        if not timeout_input:
+            timeout_minutes = 5.0
+            break
+        try:
+            timeout_minutes = float(timeout_input)
+            if timeout_minutes > 0:
+                break
+            else:
+                print("[ERROR] Please enter a positive number")
+        except ValueError:
+            print("[ERROR] Please enter a valid number")
+    
+    options['timeout'] = int(timeout_minutes * 60)
+    options['max_trials'] = None
+    
+    print(f"\nBatch optimization configured:")
+    print(f"  - Time limit per indicator: {timeout_minutes:.1f} minute(s)")
+    print(f"  - Trials: unlimited (will run as many as possible until time limit)")
+    print(f"  - Press Q anytime to stop early and use current best results")
+    
+    customize = input("\nCustomize data settings (timeframe, symbols)? [n]: ").strip().lower()
+    if customize in ['y', 'yes']:
+        extra_options = get_optimization_options(dm)
+        extra_options.pop('timeout', None)
+        extra_options.pop('max_trials', None)
+        options.update(extra_options)
+    else:
+        print("Using defaults: 1h timeframe, all available symbols")
+        options['interval'] = '1h'
+    
+    rankings = []
+    
+    for i, pine_file in enumerate(pine_files, 1):
+        print(f"\n{'='*70}")
+        print(f"Processing {i}/{len(pine_files)}: {pine_file.name}")
+        print("="*70)
+        
+        original_argv = sys.argv
+        try:
+            sys.argv = ['interactive_optimizer.py'] + build_args(pine_file, options)
+            optimize_module.main()
+        except SystemExit:
+            print(f"[ERROR] Optimization exited early for {pine_file.name}.")
+        except KeyboardInterrupt:
+            print("\n\nBatch optimization interrupted by user.")
+            break
+        except Exception as e:
+            print(f"\n[ERROR] Error during optimization of {pine_file.name}: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            sys.argv = original_argv
+        
+        result = optimize_module.LAST_RESULT
+        if result is None:
+            continue
+        
+        metrics = result.best_metrics
+        score = calculate_objective_score(metrics)
+        rankings.append({
+            "file": pine_file.name,
+            "score": score,
+            "profit_factor": metrics.profit_factor,
+            "win_rate": metrics.win_rate,
+            "directional_accuracy": metrics.directional_accuracy,
+            "sharpe_ratio": metrics.sharpe_ratio,
+            "max_drawdown": metrics.max_drawdown,
+            "improvement_pf": result.improvement_pf,
+        })
+    
+    if not rankings:
+        print("\nNo successful optimizations to rank.")
+        return
+    
+    rankings.sort(key=lambda r: r["score"], reverse=True)
+    
+    print("\n" + "="*70)
+    print("  OPTIMIZATION RANKINGS (Best to Worst)")
+    print("="*70)
+    print("  Rank  Score  PF    Win%  DirAcc  Sharpe  Drawdown  Indicator")
+    print("  ----  -----  ----  ----- ------  ------  --------  ---------")
+    for idx, row in enumerate(rankings, 1):
+        print(
+            f"  {idx:>4}  {row['score']:.3f}  {row['profit_factor']:.2f}  "
+            f"{row['win_rate']*100:>5.1f}  {row['directional_accuracy']*100:>6.1f}  "
+            f"{row['sharpe_ratio']:>6.2f}  {row['max_drawdown']:>8.2f}  {row['file']}"
+        )
 
 
 def main_menu():
@@ -357,6 +536,7 @@ def main_menu():
     [1] Optimize an indicator
     [2] Download new data (any crypto symbol, any timeframe)
     [3] View available data
+    [4] Optimize ALL indicators in a directory
     [Q] Quit
 """)
         
@@ -369,6 +549,8 @@ def main_menu():
         elif choice == '3':
             display_data_status(dm)
             input("\n  Press Enter to continue...")
+        elif choice == '4':
+            run_batch_optimization(dm)
         elif choice == 'q':
             print("\nGoodbye!")
             break
