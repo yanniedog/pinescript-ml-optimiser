@@ -4,9 +4,10 @@ import shutil
 
 from data_manager import DataManager
 from pine_parser import parse_pine_script
-from optimizer import optimize_indicator
+from optimizer import optimize_indicator, get_optimizable_params
 from output_generator import generate_outputs
 from objective import calculate_objective_score as objective_score
+from screen_log import enable_screen_log
 
 
 INDICATOR_DIR = Path("pinescripts")
@@ -104,6 +105,7 @@ def run_multi_fidelity(parse_result, pine_path, data, method_cfg):
 
 
 def main():
+    enable_screen_log()
     if not INDICATOR_DIR.exists():
         raise RuntimeError(f"Indicator directory not found: {INDICATOR_DIR}")
 
@@ -155,6 +157,13 @@ def main():
                 raise RuntimeError(f"Indicator not found: {pine_path}")
 
             parse_result = parse_pine_script(str(pine_path))
+            optimizable_params = get_optimizable_params(parse_result.parameters)
+            if len(optimizable_params) < 2:
+                print(
+                    f"[SKIP] {pine_path.name}: only {len(optimizable_params)} optimizable "
+                    f"parameter(s). Requires at least 2 to avoid trivial optimizations."
+                )
+                continue
 
             if method_name == "multi_fidelity":
                 result, outputs, elapsed = run_multi_fidelity(parse_result, pine_path, data, method["cfg"])

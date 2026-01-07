@@ -1,6 +1,10 @@
 import os
 
+from screen_log import enable_screen_log
+
 def generate_pine_scripts():
+    enable_screen_log()
+
     # Create directory
     output_dir = "pinescripts"
     if not os.path.exists(output_dir):
@@ -322,8 +326,23 @@ def generate_pine_scripts():
          "ema1 = ta.ema(close, len)\nema2 = ta.ema(ema1, len)\nema3 = ta.ema(ema2, len)\nt = 3 * ema1 - 3 * ema2 + ema3\nplot(t, 'TEMA', color=color.purple)"]
     ]
 
+    generated = 0
+    skipped = 0
+
+    def count_optimizable(params_list):
+        return sum(1 for p in params_list if p[1] in (0, 1))
+
     for item in indicators:
         filename, title, overlay, params, logic = item
+
+        optimizable_count = count_optimizable(params)
+        if optimizable_count < 2:
+            print(
+                f"[SKIP] {filename}: only {optimizable_count} optimizable parameter(s). "
+                f"Requires at least 2 to avoid trivial optimizations."
+            )
+            skipped += 1
+            continue
         
         # Build header
         content = [
@@ -361,8 +380,13 @@ def generate_pine_scripts():
         filepath = os.path.join(output_dir, f"{filename}.pine")
         with open(filepath, "w") as f:
             f.write("\n".join(content))
-            
-    print(f"Successfully generated {len(indicators)} Pine Script v6 files in '{output_dir}'.")
+
+        generated += 1
+
+    print(
+        f"Successfully generated {generated} Pine Script v6 files in '{output_dir}'. "
+        f"Skipped {skipped} single-parameter indicator(s)."
+    )
 
 if __name__ == "__main__":
     generate_pine_scripts()

@@ -19,6 +19,7 @@ import json
 import time
 
 from objective import calculate_objective_score as objective_score
+from screen_log import enable_screen_log
 
 
 def get_pine_files(directory: Path = None):
@@ -738,6 +739,7 @@ def main_menu():
 
 def main():
     """Main entry point."""
+    enable_screen_log()
     main_menu()
 
 

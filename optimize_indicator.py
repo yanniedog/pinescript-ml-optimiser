@@ -28,8 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data_manager import DataManager, SYMBOLS
 from pine_parser import parse_pine_script
-from optimizer import optimize_indicator
+from optimizer import optimize_indicator, get_optimizable_params
 from output_generator import generate_outputs
+from screen_log import enable_screen_log
 
 # Configure logging
 logging.basicConfig(
@@ -67,6 +68,8 @@ def main():
     LAST_RESULT = None
     LAST_OUTPUTS = None
     LAST_PINE_PATH = None
+
+    enable_screen_log()
 
     parser = argparse.ArgumentParser(
         description='Optimize Pine Script indicator parameters using ML',
@@ -280,6 +283,17 @@ Examples:
             print(f"   Buy signals: {signal_info.buy_conditions}")
         if signal_info.sell_conditions:
             print(f"   Sell signals: {signal_info.sell_conditions}")
+
+        optimizable_params = get_optimizable_params(parse_result.parameters)
+        if len(optimizable_params) < 2:
+            reason = (
+                f"Skipping optimization: only {len(optimizable_params)} optimizable "
+                f"parameter(s) found. This workflow requires at least 2 to avoid "
+                f"trivial or unstable optimizations."
+            )
+            logger.info(reason)
+            print(f"\n[SKIP] {reason}")
+            return
         
         # Step 3: Run Optimization
         trials_str = "unlimited" if args.max_trials is None else str(args.max_trials)
