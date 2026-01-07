@@ -114,6 +114,7 @@ class WalkForwardBacktester:
     FORECAST_HORIZONS = [1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 30, 36, 42, 48, 60, 72, 84, 96, 120, 144, 168]
     EXTREME_RETURN_PERCENTILE = 0.8
     SIGNAL_STRENGTH_PERCENTILE = 0.75
+    DIRECTIONAL_SIGNAL_THRESHOLD = 0.3
     
     def __init__(
         self,
@@ -139,12 +140,16 @@ class WalkForwardBacktester:
         self.embargo_bars = embargo_bars
         self.train_ratio = train_ratio
         self.min_trades_per_fold = min_trades_per_fold
-        self.forecast_horizons = forecast_horizons or self.FORECAST_HORIZONS
         
         self.close = df['close'].values
         self.high = df['high'].values
         self.low = df['low'].values
         self.length = len(df)
+
+        horizon_source = forecast_horizons or self.FORECAST_HORIZONS
+        self.forecast_horizons = [h for h in horizon_source if 1 <= h < self.length]
+        if not self.forecast_horizons and self.length > 1:
+            self.forecast_horizons = [1]
         
         # Pre-calculate future returns for different horizons
         self._future_returns = {}
@@ -168,22 +173,33 @@ class WalkForwardBacktester:
         """Create walk-forward validation folds."""
         folds = []
         
-        # Calculate fold sizes
-        fold_size = self.length // self.n_folds
-        train_size = int(fold_size * self.train_ratio)
-        test_size = fold_size - train_size - self.embargo_bars
-        
-        if test_size < 100:
-            # Adjust if test size is too small
-            test_size = 100
-            train_size = fold_size - test_size - self.embargo_bars
-        
+        if self.n_folds <= 0 or self.length <= 0:
+            return folds
+
+        # Calculate fold sizes with remainder in the final fold
+        base_fold_size = self.length // self.n_folds
+
         for i in range(self.n_folds):
-            start = i * fold_size
+            start = i * base_fold_size
+            fold_end = self.length if i == self.n_folds - 1 else start + base_fold_size
+            fold_length = fold_end - start
+
+            if fold_length <= self.embargo_bars:
+                continue
+
+            train_size = int(fold_length * self.train_ratio)
+            test_size = fold_length - train_size - self.embargo_bars
+
+            if test_size < 100:
+                test_size = min(100, fold_length - self.embargo_bars)
+                train_size = fold_length - test_size - self.embargo_bars
+                if train_size <= 0 or test_size <= 0:
+                    continue
+
             train_start = start
             train_end = start + train_size
             test_start = train_end + self.embargo_bars
-            test_end = min(start + fold_size, self.length)
+            test_end = fold_end
             
             if test_end <= test_start:
                 continue
@@ -216,6 +232,9 @@ class WalkForwardBacktester:
         Returns:
             Aggregated metrics across all folds
         """
+        if not self.forecast_horizons or not self.folds:
+            return BacktestMetrics()
+
         # Aggregate metrics across folds - each fold selects its own optimal horizon
         all_trades = []
         fold_metrics = []
@@ -361,7 +380,10 @@ class WalkForwardBacktester:
         Returns:
             Optimal forecast horizon in bars
         """
-        best_horizon = self.forecast_horizons[0] if self.forecast_horizons else 24  # Default
+        if not self.forecast_horizons:
+            return 1
+
+        best_horizon = self.forecast_horizons[0]
         best_accuracy = 0.0
         
         # Determine data range: use training data from fold if provided
@@ -433,40 +455,45 @@ class WalkForwardBacktester:
             start_idx: Optional start index to restrict calculation (default: 0)
             end_idx: Optional end index to restrict calculation (default: end of data)
         """
-        future_returns = self._future_returns[horizon]
+        future_returns = self._future_returns.get(horizon)
+        if future_returns is None:
+            return 0.5
         
         # Apply data range restrictions if provided
         if start_idx is None:
             start_idx = 0
         if end_idx is None:
             end_idx = len(future_returns)
+
+        # Prevent lookahead by ensuring the horizon stays within the allowed window
+        effective_end_idx = min(end_idx, len(future_returns)) - horizon
         
         # Ensure indices are within bounds
         start_idx = max(0, min(start_idx, len(future_returns)))
-        end_idx = max(start_idx, min(end_idx, len(future_returns)))
+        effective_end_idx = max(start_idx, min(effective_end_idx, len(future_returns)))
         
         # VALIDATION: Ensure we have valid data range
-        if end_idx <= start_idx:
+        if effective_end_idx <= start_idx:
             logger.warning(
-                f"Invalid data range for directional accuracy: start={start_idx}, end={end_idx}. "
+                f"Invalid data range for directional accuracy: start={start_idx}, end={effective_end_idx}. "
                 f"Returning default accuracy."
             )
             return 0.5
         
         # VALIDATION: Log when using restricted range (training data only)
-        if start_idx > 0 or end_idx < len(future_returns):
+        if start_idx > 0 or effective_end_idx < len(future_returns):
             logger.debug(
                 f"Calculating directional accuracy on restricted range: "
-                f"bars {start_idx} to {end_idx} (total data: {len(future_returns)})"
+                f"bars {start_idx} to {effective_end_idx} (total data: {len(future_returns)})"
             )
         
         # Slice arrays to the specified range
-        future_returns_slice = future_returns[start_idx:end_idx]
+        future_returns_slice = future_returns[start_idx:effective_end_idx]
         
         if use_discrete_signals:
             # Use buy/sell signals
-            buy_signals = indicator_result.buy_signals[start_idx:end_idx]
-            sell_signals = indicator_result.sell_signals[start_idx:end_idx]
+            buy_signals = indicator_result.buy_signals[start_idx:effective_end_idx]
+            sell_signals = indicator_result.sell_signals[start_idx:effective_end_idx]
             
             # Buy signal should predict positive returns
             buy_correct = np.sum((buy_signals) & (future_returns_slice > 0) & ~np.isnan(future_returns_slice))
@@ -481,15 +508,17 @@ class WalkForwardBacktester:
             
         else:
             # Use directional signal
-            signal = indicator_result.combined_signal[start_idx:end_idx]
+            signal = indicator_result.combined_signal[start_idx:effective_end_idx]
             
+            threshold = self.DIRECTIONAL_SIGNAL_THRESHOLD
+
             # Positive signal should predict positive returns
-            pos_correct = np.sum((signal > 0) & (future_returns_slice > 0) & ~np.isnan(future_returns_slice))
-            pos_total = np.sum((signal > 0) & ~np.isnan(future_returns_slice))
+            pos_correct = np.sum((signal > threshold) & (future_returns_slice > 0) & ~np.isnan(future_returns_slice))
+            pos_total = np.sum((signal > threshold) & ~np.isnan(future_returns_slice))
             
             # Negative signal should predict negative returns
-            neg_correct = np.sum((signal < 0) & (future_returns_slice < 0) & ~np.isnan(future_returns_slice))
-            neg_total = np.sum((signal < 0) & ~np.isnan(future_returns_slice))
+            neg_correct = np.sum((signal < -threshold) & (future_returns_slice < 0) & ~np.isnan(future_returns_slice))
+            neg_total = np.sum((signal < -threshold) & ~np.isnan(future_returns_slice))
             
             total_correct = pos_correct + neg_correct
             total = pos_total + neg_total
@@ -508,7 +537,10 @@ class WalkForwardBacktester:
 
         Thresholds are derived from training data only to avoid lookahead bias.
         """
-        train_returns = self._future_returns[horizon][fold.train_start:fold.train_end]
+        train_end = min(fold.train_end, self.length) - horizon
+        if train_end <= fold.train_start:
+            return 0.0
+        train_returns = self._future_returns[horizon][fold.train_start:train_end]
         train_returns = train_returns[~np.isnan(train_returns)]
 
         if len(train_returns) < 50:
@@ -535,7 +567,7 @@ class WalkForwardBacktester:
             buy_sigs = indicator_result.buy_signals[fold.test_start:effective_end]
             sell_sigs = indicator_result.sell_signals[fold.test_start:effective_end]
         else:
-            train_signal = indicator_result.combined_signal[fold.train_start:fold.train_end]
+            train_signal = indicator_result.combined_signal[fold.train_start:train_end]
             train_signal = train_signal[~np.isnan(train_signal)]
             if len(train_signal) < 50:
                 return 0.0
@@ -624,7 +656,7 @@ class WalkForwardBacktester:
             prev_signal[0] = 0
             
             # Enter on signal crossing threshold
-            threshold = 0.3
+            threshold = self.DIRECTIONAL_SIGNAL_THRESHOLD
             
             for i in range(len(signal)):
                 bar = test_start + i
@@ -694,8 +726,8 @@ class WalkForwardBacktester:
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
         else:
             sig = indicator_result.combined_signal[test_start:effective_end]
-            # Use consistent threshold (0.1) for both correct and total_sigs
-            threshold = 0.1
+            # Use consistent threshold for both correct and total_sigs
+            threshold = self.DIRECTIONAL_SIGNAL_THRESHOLD
             correct = np.sum(((sig > threshold) & (test_returns > 0) & valid_mask) | 
                            ((sig < -threshold) & (test_returns < 0) & valid_mask))
             total_sigs = np.sum(((sig > threshold) | (sig < -threshold)) & valid_mask)
