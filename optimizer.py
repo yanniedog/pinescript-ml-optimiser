@@ -17,7 +17,8 @@ from pathlib import Path
 
 from pine_parser import ParseResult, Parameter
 from pine_translator import PineTranslator, IndicatorResult
-from backtester import WalkForwardBacktester, BacktestMetrics
+from backtester import WalkForwardBacktester, BacktestMetrics, WalkForwardFold
+from datetime import datetime
 
 # Platform-specific keyboard handling
 if sys.platform == 'win32':
@@ -269,6 +270,22 @@ class OptimizationProgressTracker:
 
 
 @dataclass
+class DataUsageInfo:
+    """Information about how historical data was used in walk-forward validation."""
+    total_bars: int
+    date_range: Tuple[datetime, datetime]
+    n_folds: int
+    train_ratio: float
+    embargo_bars: int
+    folds: List[Dict[str, Any]]  # List of fold details
+    total_train_bars: int
+    total_test_bars: int
+    total_embargo_bars: int
+    unused_bars: int
+    potential_bias_issues: List[str] = field(default_factory=list)
+
+
+@dataclass
 class OptimizationResult:
     """Result of parameter optimization."""
     best_params: Dict[str, Any]
@@ -283,9 +300,11 @@ class OptimizationResult:
     study: optuna.Study = None
     improvement_history: List[dict] = field(default_factory=list)  # Detailed history with params
     baseline_objective: float = 0.0  # Original config's objective score
-    per_symbol_metrics: Dict[str, Dict[str, BacktestMetrics]] = field(default_factory=dict)  # {symbol: {'original': metrics, 'optimized': metrics}}
+    per_symbol_metrics: Dict[str, Dict[str, BacktestMetrics]] = field(default_factory=dict)  # {symbol: {'original': metrics, 'optimized': metrics}} OR {symbol: {timeframe: {'original': metrics, 'optimized': metrics}}}
+    timeframes_used: Dict[str, List[str]] = field(default_factory=dict)  # {symbol: [timeframe1, timeframe2, ...]}
+    data_usage_info: Dict[str, Dict[str, DataUsageInfo]] = field(default_factory=dict)  # {symbol: {timeframe: DataUsageInfo}}
     datasets_used: List[str] = field(default_factory=list)  # List of datasets used (symbol names, e.g., ["BTCUSDT", "ETHUSDT"])
-    interval: str = ""  # Timeframe/interval used (e.g., "1h", "4h", "1d")
+    interval: str = ""  # Timeframe/interval used (e.g., "1h", "4h", "1d") - may represent multiple intervals
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
@@ -332,7 +351,7 @@ class PineOptimizer:
     def __init__(
         self,
         parse_result: ParseResult,
-        data: Dict[str, pd.DataFrame],
+        data: Dict[str, pd.DataFrame],  # Can be {symbol: DataFrame} or {symbol: {timeframe: DataFrame}}
         max_trials: Optional[int] = None,  # None = unlimited trials (use timeout)
         timeout_seconds: int = 300,  # 5 minutes default
         n_startup_trials: int = 20,
@@ -345,7 +364,7 @@ class PineOptimizer:
         
         Args:
             parse_result: Parsed Pine Script information
-            data: Dict of symbol -> DataFrame with OHLCV data
+            data: Dict of symbol -> DataFrame OR symbol -> {timeframe -> DataFrame} with OHLCV data
             max_trials: Maximum optimization trials (None = unlimited, use timeout)
             timeout_seconds: Maximum time for optimization
             n_startup_trials: Random trials before TPE kicks in
@@ -369,13 +388,32 @@ class PineOptimizer:
         # Filter to optimizable parameters (exclude display/visual params)
         self.optimizable_params = self._get_optimizable_params()
         
-        # Create translators and backtesters for each symbol
-        self.translators = {}
-        self.backtesters = {}
+        # Detect if data is multi-timeframe structure
+        self.is_multi_timeframe = False
+        if data:
+            first_value = next(iter(data.values()))
+            if isinstance(first_value, dict):
+                self.is_multi_timeframe = True
         
-        for symbol, df in data.items():
-            self.translators[symbol] = PineTranslator(parse_result, df)
-            self.backtesters[symbol] = WalkForwardBacktester(df)
+        # Create translators and backtesters
+        self.translators = {}  # {symbol: translator} or {(symbol, timeframe): translator}
+        self.backtesters = {}  # {symbol: backtester} or {(symbol, timeframe): backtester}
+        self.data_frames = {}  # {symbol: df} or {(symbol, timeframe): df}
+        
+        if self.is_multi_timeframe:
+            # Multi-timeframe structure: {symbol: {timeframe: DataFrame}}
+            for symbol, timeframes_dict in data.items():
+                for timeframe, df in timeframes_dict.items():
+                    key = (symbol, timeframe)
+                    self.translators[key] = PineTranslator(parse_result, df)
+                    self.backtesters[key] = WalkForwardBacktester(df)
+                    self.data_frames[key] = df
+        else:
+            # Single-timeframe structure: {symbol: DataFrame}
+            for symbol, df in data.items():
+                self.translators[symbol] = PineTranslator(parse_result, df)
+                self.backtesters[symbol] = WalkForwardBacktester(df)
+                self.data_frames[symbol] = df
         
         # Tracking
         self.best_objective = 0.0
@@ -437,13 +475,13 @@ class PineOptimizer:
         for p in self.optimizable_params:
             params[p.name] = self._suggest_param(trial, p)
         
-        # Evaluate across all symbols
+        # Evaluate across all symbols/timeframes
         total_objective = 0.0
         symbol_count = 0
         
-        for symbol in self.translators:
-            translator = self.translators[symbol]
-            backtester = self.backtesters[symbol]
+        for key in self.translators:
+            translator = self.translators[key]
+            backtester = self.backtesters[key]
             
             try:
                 # Run indicator with trial params
@@ -460,7 +498,7 @@ class PineOptimizer:
                 symbol_count += 1
                 
             except Exception as e:
-                logger.debug(f"Trial failed for {symbol}: {e}")
+                logger.debug(f"Trial failed for {key}: {e}")
                 continue
         
         # Early pruning check - report once at the end
@@ -611,9 +649,17 @@ class PineOptimizer:
             logger.info(f"Optimization stopped by user after {optimization_time:.1f}s ({self.trial_count} trials)")
             logger.info("Using best parameters found so far...")
         
-        # Evaluate original params first (per-symbol)
+        # Evaluate original params first (per-symbol/timeframe)
         original_per_symbol = self._evaluate_params_per_symbol(self.original_params)
-        original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
+        
+        # Aggregate metrics - handle both single and multi-timeframe structures
+        if self.is_multi_timeframe:
+            all_original_metrics = []
+            for symbol_dict in original_per_symbol.values():
+                all_original_metrics.extend(symbol_dict.values())
+            original_metrics = self._aggregate_metrics(all_original_metrics)
+        else:
+            original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
         original_objective = self._calculate_overall_objective(original_metrics)
         
         # Get best params from study
@@ -622,18 +668,63 @@ class PineOptimizer:
             if p.name in study.best_params:
                 best_params_candidate[p.name] = study.best_params[p.name]
         
-        # Evaluate best params candidate (per-symbol)
+        # Evaluate best params candidate (per-symbol/timeframe)
         optimized_per_symbol = self._evaluate_params_per_symbol(best_params_candidate)
-        best_metrics_candidate = self._aggregate_metrics(list(optimized_per_symbol.values()))
+        
+        # Aggregate metrics - handle both single and multi-timeframe structures
+        if self.is_multi_timeframe:
+            all_optimized_metrics = []
+            for symbol_dict in optimized_per_symbol.values():
+                all_optimized_metrics.extend(symbol_dict.values())
+            best_metrics_candidate = self._aggregate_metrics(all_optimized_metrics)
+        else:
+            best_metrics_candidate = self._aggregate_metrics(list(optimized_per_symbol.values()))
         best_objective = self._calculate_overall_objective(best_metrics_candidate)
         
-        # Build per-symbol metrics dict
+        # Build per-symbol metrics dict - handle both structures
         per_symbol_metrics = {}
-        for symbol in self.translators:
-            per_symbol_metrics[symbol] = {
-                'original': original_per_symbol.get(symbol, BacktestMetrics()),
-                'optimized': optimized_per_symbol.get(symbol, BacktestMetrics())
-            }
+        timeframes_used = {}
+        data_usage_info = {}
+        
+        if self.is_multi_timeframe:
+            # Multi-timeframe structure: {symbol: {timeframe: {'original': metrics, 'optimized': metrics}}}
+            for symbol in original_per_symbol:
+                per_symbol_metrics[symbol] = {}
+                timeframes_used[symbol] = []
+                data_usage_info[symbol] = {}
+                
+                for timeframe in original_per_symbol[symbol]:
+                    per_symbol_metrics[symbol][timeframe] = {
+                        'original': original_per_symbol[symbol].get(timeframe, BacktestMetrics()),
+                        'optimized': optimized_per_symbol[symbol].get(timeframe, BacktestMetrics())
+                    }
+                    timeframes_used[symbol].append(timeframe)
+                    
+                    # Extract data usage info
+                    key = (symbol, timeframe)
+                    if key in self.backtesters and key in self.data_frames:
+                        data_usage_info[symbol][timeframe] = self._extract_data_usage_info(
+                            self.backtesters[key],
+                            self.data_frames[key]
+                        )
+        else:
+            # Single-timeframe structure: {symbol: {'original': metrics, 'optimized': metrics}}
+            for symbol in original_per_symbol:
+                per_symbol_metrics[symbol] = {
+                    'original': original_per_symbol.get(symbol, BacktestMetrics()),
+                    'optimized': optimized_per_symbol.get(symbol, BacktestMetrics())
+                }
+                
+                # Extract data usage info
+                if symbol in self.backtesters and symbol in self.data_frames:
+                    # For single timeframe, we still need to track which timeframe was used
+                    # This will be set from the interval parameter
+                    data_usage_info[symbol] = {
+                        '': self._extract_data_usage_info(
+                            self.backtesters[symbol],
+                            self.data_frames[symbol]
+                        )
+                    }
         
         # Only use optimized params if they're actually better
         if best_objective > original_objective:
@@ -644,8 +735,13 @@ class PineOptimizer:
             best_params = self.original_params.copy()
             best_metrics = original_metrics
             # If keeping original, set optimized = original in per-symbol
-            for symbol in per_symbol_metrics:
-                per_symbol_metrics[symbol]['optimized'] = per_symbol_metrics[symbol]['original']
+            if self.is_multi_timeframe:
+                for symbol in per_symbol_metrics:
+                    for timeframe in per_symbol_metrics[symbol]:
+                        per_symbol_metrics[symbol][timeframe]['optimized'] = per_symbol_metrics[symbol][timeframe]['original']
+            else:
+                for symbol in per_symbol_metrics:
+                    per_symbol_metrics[symbol]['optimized'] = per_symbol_metrics[symbol]['original']
             logger.info(f"Original params were optimal. Keeping original configuration.")
         
         # Calculate improvements
@@ -660,7 +756,10 @@ class PineOptimizer:
             improvement_acc = 0
         
         # Get list of datasets used (symbols)
-        datasets_used = sorted(list(self.data.keys()))
+        if self.is_multi_timeframe:
+            datasets_used = sorted(list(self.data.keys()))
+        else:
+            datasets_used = sorted(list(self.data.keys()))
         
         result = OptimizationResult(
             best_params=best_params,
@@ -676,6 +775,8 @@ class PineOptimizer:
             improvement_history=self.progress_tracker.get_detailed_history(),
             baseline_objective=self.progress_tracker.baseline_objective or 0.0,
             per_symbol_metrics=per_symbol_metrics,
+            timeframes_used=timeframes_used,
+            data_usage_info=data_usage_info,
             datasets_used=datasets_used
         )
         
@@ -729,43 +830,158 @@ class PineOptimizer:
         )
     
     def _aggregate_metrics(self, all_metrics: List[BacktestMetrics]) -> BacktestMetrics:
-        """Aggregate metrics from multiple symbols into a single BacktestMetrics."""
+        """Aggregate metrics from multiple symbols/timeframes into a single BacktestMetrics."""
         if not all_metrics:
             return BacktestMetrics()
         
+        # Filter out empty metrics
+        valid_metrics = [m for m in all_metrics if m.total_trades > 0]
+        if not valid_metrics:
+            return BacktestMetrics()
+        
         return BacktestMetrics(
-            total_trades=sum(m.total_trades for m in all_metrics),
-            winning_trades=sum(m.winning_trades for m in all_metrics),
-            losing_trades=sum(m.losing_trades for m in all_metrics),
-            total_return=np.mean([m.total_return for m in all_metrics]),
-            avg_return=np.mean([m.avg_return for m in all_metrics]),
-            win_rate=np.mean([m.win_rate for m in all_metrics]),
-            profit_factor=np.mean([m.profit_factor for m in all_metrics]),
-            sharpe_ratio=np.mean([m.sharpe_ratio for m in all_metrics]),
-            max_drawdown=np.max([m.max_drawdown for m in all_metrics]),
-            avg_holding_bars=np.mean([m.avg_holding_bars for m in all_metrics]),
-            directional_accuracy=np.mean([m.directional_accuracy for m in all_metrics]),
-            forecast_horizon=int(np.median([m.forecast_horizon for m in all_metrics])),
-            improvement_over_random=np.mean([m.improvement_over_random for m in all_metrics]),
-            tail_capture_rate=np.mean([m.tail_capture_rate for m in all_metrics]),
-            consistency_score=np.mean([m.consistency_score for m in all_metrics])
+            total_trades=sum(m.total_trades for m in valid_metrics),
+            winning_trades=sum(m.winning_trades for m in valid_metrics),
+            losing_trades=sum(m.losing_trades for m in valid_metrics),
+            total_return=np.mean([m.total_return for m in valid_metrics]),
+            avg_return=np.mean([m.avg_return for m in valid_metrics]),
+            win_rate=np.mean([m.win_rate for m in valid_metrics]),
+            profit_factor=np.mean([m.profit_factor for m in valid_metrics]),
+            sharpe_ratio=np.mean([m.sharpe_ratio for m in valid_metrics]),
+            max_drawdown=np.max([m.max_drawdown for m in valid_metrics]),
+            avg_holding_bars=np.mean([m.avg_holding_bars for m in valid_metrics]),
+            directional_accuracy=np.mean([m.directional_accuracy for m in valid_metrics]),
+            forecast_horizon=int(np.median([m.forecast_horizon for m in valid_metrics])),
+            improvement_over_random=np.mean([m.improvement_over_random for m in valid_metrics]),
+            tail_capture_rate=np.mean([m.tail_capture_rate for m in valid_metrics]),
+            consistency_score=np.mean([m.consistency_score for m in valid_metrics])
         )
+    
+    def _extract_data_usage_info(self, backtester: WalkForwardBacktester, df: pd.DataFrame) -> DataUsageInfo:
+        """Extract data usage information from a backtester."""
+        total_bars = len(df)
+        date_range = (df['timestamp'].iloc[0], df['timestamp'].iloc[-1])
+        
+        folds_detail = []
+        total_train_bars = 0
+        total_test_bars = 0
+        total_embargo_bars = 0
+        
+        for i, fold in enumerate(backtester.folds):
+            train_bars = fold.train_end - fold.train_start
+            test_bars = fold.test_end - fold.test_start
+            embargo_bars = fold.embargo_bars
+            
+            train_start_date = df['timestamp'].iloc[fold.train_start] if fold.train_start < len(df) else None
+            train_end_date = df['timestamp'].iloc[fold.train_end - 1] if fold.train_end > 0 and fold.train_end <= len(df) else None
+            test_start_date = df['timestamp'].iloc[fold.test_start] if fold.test_start < len(df) else None
+            test_end_date = df['timestamp'].iloc[fold.test_end - 1] if fold.test_end > 0 and fold.test_end <= len(df) else None
+            
+            folds_detail.append({
+                'fold_num': i + 1,
+                'train_start': fold.train_start,
+                'train_end': fold.train_end,
+                'test_start': fold.test_start,
+                'test_end': fold.test_end,
+                'train_bars': train_bars,
+                'test_bars': test_bars,
+                'embargo_bars': embargo_bars,
+                'train_start_date': train_start_date,
+                'train_end_date': train_end_date,
+                'test_start_date': test_start_date,
+                'test_end_date': test_end_date
+            })
+            
+            total_train_bars += train_bars
+            total_test_bars += test_bars
+            total_embargo_bars += embargo_bars
+        
+        # Calculate unused bars
+        used_bars = total_train_bars + total_test_bars + total_embargo_bars
+        unused_bars = max(0, total_bars - used_bars)
+        
+        # Analyze for bias issues
+        bias_issues = self._analyze_bias_issues(backtester, total_bars, total_train_bars, total_test_bars, total_embargo_bars, unused_bars)
+        
+        return DataUsageInfo(
+            total_bars=total_bars,
+            date_range=date_range,
+            n_folds=len(backtester.folds),
+            train_ratio=backtester.train_ratio,
+            embargo_bars=backtester.embargo_bars,
+            folds=folds_detail,
+            total_train_bars=total_train_bars,
+            total_test_bars=total_test_bars,
+            total_embargo_bars=total_embargo_bars,
+            unused_bars=unused_bars,
+            potential_bias_issues=bias_issues
+        )
+    
+    def _analyze_bias_issues(self, backtester: WalkForwardBacktester, total_bars: int, 
+                            total_train_bars: int, total_test_bars: int, 
+                            total_embargo_bars: int, unused_bars: int) -> List[str]:
+        """Analyze for potential bias issues in walk-forward validation."""
+        issues = []
+        
+        # Check for overlapping test sets
+        test_ranges = [(f.test_start, f.test_end) for f in backtester.folds]
+        for i, (start1, end1) in enumerate(test_ranges):
+            for j, (start2, end2) in enumerate(test_ranges):
+                if i != j:
+                    # Check for overlap
+                    if not (end1 <= start2 or end2 <= start1):
+                        issues.append(f"Overlapping test sets detected: Fold {i+1} and Fold {j+1}")
+        
+        # Check embargo adequacy (should be at least 2-3x forecast horizon)
+        median_horizon = 24  # Default, will be updated if available
+        if backtester.folds:
+            # Estimate from typical horizons
+            if backtester.embargo_bars < median_horizon * 2:
+                issues.append(f"Embargo period ({backtester.embargo_bars} bars) may be insufficient (recommend at least {median_horizon * 2} bars)")
+        
+        # Check for unused data
+        unused_pct = (unused_bars / total_bars * 100) if total_bars > 0 else 0
+        if unused_pct > 10:
+            issues.append(f"Warning: {unused_pct:.1f}% of data unused ({unused_bars} bars at end of dataset)")
+        
+        # Check test set size
+        test_pct = (total_test_bars / total_bars * 100) if total_bars > 0 else 0
+        if test_pct < 5:
+            issues.append(f"Warning: Test set size ({test_pct:.1f}%) may be small for reliable statistics")
+        
+        # Check for data leakage risk (embargo too small relative to forecast horizon)
+        if backtester.embargo_bars < 24:  # Less than 1 day at 1h
+            issues.append(f"Warning: Embargo period ({backtester.embargo_bars} bars) is very short, risk of data leakage")
+        
+        # Check train/test ratio
+        train_pct = (total_train_bars / total_bars * 100) if total_bars > 0 else 0
+        if train_pct < 40:
+            issues.append(f"Warning: Training data ({train_pct:.1f}%) is less than 40%, may lead to overfitting")
+        
+        return issues
     
     def _evaluate_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
         """Evaluate a parameter set and return per-symbol metrics."""
         symbol_metrics = {}
         
-        for symbol in self.translators:
-            translator = self.translators[symbol]
-            backtester = self.backtesters[symbol]
+        for key in self.translators:
+            translator = self.translators[key]
+            backtester = self.backtesters[key]
             
             try:
                 indicator_result = translator.run_indicator(params)
                 use_discrete = bool(self.parse_result.signal_info.buy_conditions or self.parse_result.signal_info.sell_conditions)
                 metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=use_discrete)
-                symbol_metrics[symbol] = metrics
+                
+                if self.is_multi_timeframe:
+                    symbol, timeframe = key
+                    if symbol not in symbol_metrics:
+                        symbol_metrics[symbol] = {}
+                    symbol_metrics[symbol][timeframe] = metrics
+                else:
+                    symbol_metrics[key] = metrics
             except Exception as e:
-                logger.debug(f"Evaluation failed for {symbol}: {e}")
+                logger.debug(f"Evaluation failed for {key}: {e}")
                 continue
         
         return symbol_metrics
