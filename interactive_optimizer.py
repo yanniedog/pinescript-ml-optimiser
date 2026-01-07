@@ -19,6 +19,7 @@ import json
 import time
 
 from objective import calculate_objective_score as objective_score
+from screen_log import enable_screen_log
 
 
 def get_pine_files(directory: Path = None):
@@ -532,6 +533,11 @@ def run_optimization(dm: DataManager):
         sys.argv = original_argv
 
 
+def sort_rankings(rankings: list) -> list:
+    """Return a copy of the rankings sorted by score descending."""
+    return sorted(rankings, key=lambda r: r.get("score", 0), reverse=True)
+
+
 def run_batch_optimization(dm: DataManager):
     """Run optimization across all indicators in a directory with ranking."""
     generated = maybe_generate_all_indicators()
@@ -662,7 +668,7 @@ def run_batch_optimization(dm: DataManager):
         print("\nNo successful optimizations to rank.")
         return
     
-    rankings.sort(key=lambda r: r["score"], reverse=True)
+    rankings = sort_rankings(rankings)
     
     print("\n" + "="*70)
     print("  OPTIMIZATION RANKINGS (Best to Worst)")
@@ -733,6 +739,7 @@ def main_menu():
 
 def main():
     """Main entry point."""
+    enable_screen_log()
     main_menu()
 
 
