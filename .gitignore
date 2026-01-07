@@ -4,3 +4,4 @@ __pycache__
 *.pine
 !MACD_demo_pinescript.pine
 !requirements.txt
+*.log
