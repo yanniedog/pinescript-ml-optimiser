@@ -36,6 +36,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def get_optimizable_params(parameters: List[Parameter]) -> List[Parameter]:
+    """Filter parameters to only those worth optimizing."""
+    skip_keywords = ['show', 'display', 'color', 'style', 'size', 'line']
+    optimizable = []
+    for p in parameters:
+        name_lower = p.name.lower()
+        title_lower = p.title.lower()
+
+        # Skip visual/display parameters
+        if any(kw in name_lower or kw in title_lower for kw in skip_keywords):
+            continue
+
+        # Skip bool parameters that are likely display toggles
+        if p.param_type == 'bool' and any(kw in name_lower or kw in title_lower for kw in skip_keywords):
+            continue
+
+        optimizable.append(p)
+
+    logger.info(f"Found {len(optimizable)} optimizable parameters out of {len(parameters)}")
+    return optimizable
+
+
 class KeyboardMonitor:
     """Monitor for 'Q' keyboard input to allow early stopping with confirmation."""
     
@@ -551,25 +573,7 @@ class PineOptimizer:
     
     def _get_optimizable_params(self) -> List[Parameter]:
         """Filter parameters to only those worth optimizing."""
-        skip_keywords = ['show', 'display', 'color', 'style', 'size', 'line']
-        
-        optimizable = []
-        for p in self.parameters:
-            name_lower = p.name.lower()
-            title_lower = p.title.lower()
-            
-            # Skip visual/display parameters
-            if any(kw in name_lower or kw in title_lower for kw in skip_keywords):
-                continue
-            
-            # Skip bool parameters that are likely display toggles
-            if p.param_type == 'bool' and any(kw in name_lower or kw in title_lower for kw in skip_keywords):
-                continue
-            
-            optimizable.append(p)
-        
-        logger.info(f"Found {len(optimizable)} optimizable parameters out of {len(self.parameters)}")
-        return optimizable
+        return get_optimizable_params(self.parameters)
     
     def _suggest_param(self, trial: optuna.Trial, param: Parameter) -> Any:
         """Suggest a value for a parameter using Optuna."""

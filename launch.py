@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from screen_log import enable_screen_log
 
 def install_requirements():
     """Install required packages from requirements.txt."""
@@ -36,6 +37,8 @@ def install_requirements():
 
 def main():
     """Main launcher entry point."""
+    enable_screen_log()
+
     # Install requirements first
     if not install_requirements():
         input("\nPress Enter to exit...")
