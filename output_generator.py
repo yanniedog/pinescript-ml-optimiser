@@ -150,7 +150,10 @@ class OutputGenerator:
             f"// Profit Factor: {metrics.profit_factor:.2f} ({opt.improvement_pf:+.1f}% vs original)",
             f"// Win Rate: {metrics.win_rate:.1%}",
             f"// Directional Accuracy: {metrics.directional_accuracy:.1%}",
+            f"// Extreme Move Capture: {metrics.tail_capture_rate:.1%}",
+            f"// Consistency Score: {metrics.consistency_score:.2f}",
             f"// Sharpe Ratio: {metrics.sharpe_ratio:.2f}",
+            f"// Max Drawdown: {metrics.max_drawdown:.1f}%",
             f"// Improvement over Random: {metrics.improvement_over_random:+.1f}%",
             "// ---------------------------------------------------------------------------",
             f"// OPTIMAL FORECAST HORIZON: {metrics.forecast_horizon} hours",
@@ -289,6 +292,8 @@ class OutputGenerator:
             ('Profit Factor', orig_metrics.profit_factor, best_metrics.profit_factor, '.2f'),
             ('Win Rate', orig_metrics.win_rate * 100, best_metrics.win_rate * 100, '.1f%'),
             ('Directional Accuracy', orig_metrics.directional_accuracy * 100, best_metrics.directional_accuracy * 100, '.1f%'),
+            ('Extreme Move Capture', orig_metrics.tail_capture_rate * 100, best_metrics.tail_capture_rate * 100, '.1f%'),
+            ('Consistency Score', orig_metrics.consistency_score, best_metrics.consistency_score, '.2f'),
             ('Sharpe Ratio', orig_metrics.sharpe_ratio, best_metrics.sharpe_ratio, '.2f'),
             ('Total Trades', orig_metrics.total_trades, best_metrics.total_trades, 'd'),
             ('Avg Return/Trade', orig_metrics.avg_return, best_metrics.avg_return, '.2f%'),
@@ -479,6 +484,16 @@ class OutputGenerator:
             "    Why it matters: Shows if the indicator has genuine predictive power",
             "                    vs just getting lucky. Doesn't account for move size.",
             "",
+            "  EXTREME MOVE CAPTURE",
+            "    What it measures: Balance of recall/precision for major up/down moves",
+            "    Good value: > 35% (higher means fewer misses and fewer false signals)",
+            "    Why it matters: Targets significant highs/lows without flooding signals.",
+            "",
+            "  CONSISTENCY SCORE",
+            "    What it measures: Stability of performance across walk-forward folds",
+            "    Good value: > 0.60 (lower means results are erratic across regimes)",
+            "    Why it matters: Reliable signals should work in multiple market phases.",
+            "",
             "  SHARPE RATIO",
             "    What it measures: Risk-adjusted return (return / volatility)",
             "    Good value: > 1.0 (> 2.0 = excellent)",
@@ -486,10 +501,13 @@ class OutputGenerator:
             "                    consistent returns with less volatility/drawdowns.",
             "",
             "  OPTIMIZATION WEIGHTS USED:",
-            "    * Profit Factor:       35% (primary - are we making money?)",
-            "    * Directional Accuracy: 30% (does the indicator actually predict?)",
-            "    * Sharpe Ratio:         20% (is it consistent/low risk?)",
-            "    * Win Rate:             15% (psychological tradability)",
+            "    * Profit Factor:        25% (primary - are we making money?)",
+            "    * Directional Accuracy: 20% (does the indicator actually predict?)",
+            "    * Sharpe Ratio:         15% (is it consistent/low risk?)",
+            "    * Win Rate:             10% (psychological tradability)",
+            "    * Extreme Move Capture: 15% (detects major highs/lows)",
+            "    * Consistency Score:    10% (stability across folds)",
+            "    * Drawdown Control:      5% (avoid deep equity dips)",
             "",
             "-" * 70,
             "OPTIMAL FORECAST HORIZON",
@@ -622,6 +640,8 @@ class OutputGenerator:
         print(f"Peak Forecast Timeframe: {metrics.forecast_horizon} hours")
         print(f"Performance vs Original: {opt.improvement_pf:+.1f}% profit factor improvement")
         print(f"Performance vs Random:   {metrics.improvement_over_random:+.1f}% improvement")
+        print(f"Extreme Move Capture:    {metrics.tail_capture_rate:.1%}")
+        print(f"Consistency Score:       {metrics.consistency_score:.2f}")
         print(f"Expected Profitability:  Best during {self._get_optimal_conditions()}")
         print(f"                         Optimal forecast horizon: ~{metrics.forecast_horizon} hours")
         print()
@@ -730,4 +750,3 @@ if __name__ == "__main__":
     generator = OutputGenerator(parse_result, opt_result)
     report = generator.generate_report()
     print(report)
-
