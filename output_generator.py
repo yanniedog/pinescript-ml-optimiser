@@ -10,7 +10,9 @@ from typing import Dict, Any, List
 from pathlib import Path
 
 from pine_parser import ParseResult, Parameter
-from optimizer import OptimizationResult
+from optimizer import OptimizationResult, DataUsageInfo
+from backtester import BacktestMetrics
+from typing import Tuple
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -37,6 +39,155 @@ class OutputGenerator:
             else:
                 return f"{value:.2f}"
         return str(value)
+    
+    def _calculate_objective_score(self, metrics: BacktestMetrics) -> float:
+        """Calculate objective score using the same formula as optimizer."""
+        if metrics.total_trades < 10:
+            return 0.0
+        
+        # Weighted combination - same as optimizer
+        pf_score = min(metrics.profit_factor, 5.0) / 5.0
+        acc_score = max(0, min(1, (metrics.directional_accuracy - 0.5) * 2))
+        sharpe_score = min(max(metrics.sharpe_ratio, 0), 3.0) / 3.0
+        win_score = metrics.win_rate
+        tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
+        consistency_score = max(0.0, min(1.0, metrics.consistency_score))
+        drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
+        
+        return (
+            0.25 * pf_score +
+            0.20 * acc_score +
+            0.15 * sharpe_score +
+            0.10 * win_score +
+            0.15 * tail_score +
+            0.10 * consistency_score +
+            0.05 * drawdown_score
+        )
+    
+    def _interval_to_hours(self, interval: str) -> float:
+        """Convert interval string to hours."""
+        interval_map = {
+            "1m": 1/60, "3m": 3/60, "5m": 5/60, "15m": 15/60, "30m": 30/60,
+            "1h": 1, "2h": 2, "4h": 4, "6h": 6, "8h": 8, "12h": 12,
+            "1d": 24, "3d": 72,
+            "1w": 168,
+            "1M": 720  # Approximate
+        }
+        return interval_map.get(interval.lower(), 1.0)  # Default to 1 hour
+    
+    def _format_timeframe_duration(self, horizon_bars: int, interval: str) -> str:
+        """Convert horizon in bars to time duration."""
+        hours = horizon_bars * self._interval_to_hours(interval)
+        
+        if hours < 1:
+            minutes = int(hours * 60)
+            return f"{horizon_bars} bars ({minutes} minutes)"
+        elif hours < 24:
+            return f"{horizon_bars} bars ({hours:.1f} hours)"
+        else:
+            days = hours / 24
+            if days < 7:
+                return f"{horizon_bars} bars ({days:.1f} days)"
+            else:
+                weeks = days / 7
+                return f"{horizon_bars} bars ({weeks:.1f} weeks)"
+    
+    def _format_date_range(self, start: datetime, end: datetime) -> str:
+        """Format date range for display."""
+        return f"{start.strftime('%Y-%m-%d %H:%M:%S')} to {end.strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    def _calculate_bar_percentage(self, used: int, total: int) -> float:
+        """Calculate percentage of bars used."""
+        return (used / total * 100) if total > 0 else 0.0
+    
+    def _get_symbol_rankings(self, opt: OptimizationResult, metric_type: str = 'objective') -> List[Tuple[str, float, float, float]]:
+        """Calculate rankings for symbols based on optimized metric."""
+        rankings = []
+        
+        # Check if multi-timeframe structure
+        is_multi_tf = False
+        if opt.per_symbol_metrics:
+            first_value = next(iter(opt.per_symbol_metrics.values()))
+            if isinstance(first_value, dict) and first_value:
+                first_nested = next(iter(first_value.values()))
+                if isinstance(first_nested, dict) and 'original' in first_nested:
+                    is_multi_tf = True
+        
+        if is_multi_tf:
+            # Multi-timeframe: aggregate per symbol
+            for symbol, timeframes_dict in opt.per_symbol_metrics.items():
+                # Aggregate metrics across timeframes for this symbol
+                all_metrics = []
+                for timeframe, metrics_dict in timeframes_dict.items():
+                    all_metrics.append(metrics_dict.get('optimized', BacktestMetrics()))
+                
+                if all_metrics:
+                    # Aggregate original metrics too
+                    all_orig_metrics = []
+                    for timeframe, metrics_dict in timeframes_dict.items():
+                        all_orig_metrics.append(metrics_dict.get('original', BacktestMetrics()))
+                    
+                    # Simple average for now
+                    avg_opt_metrics = BacktestMetrics(
+                        profit_factor=sum(m.profit_factor for m in all_metrics) / len(all_metrics),
+                        win_rate=sum(m.win_rate for m in all_metrics) / len(all_metrics),
+                        directional_accuracy=sum(m.directional_accuracy for m in all_metrics) / len(all_metrics),
+                        sharpe_ratio=sum(m.sharpe_ratio for m in all_metrics) / len(all_metrics),
+                        total_trades=sum(m.total_trades for m in all_metrics)
+                    )
+                    
+                    avg_orig_metrics = BacktestMetrics(
+                        profit_factor=sum(m.profit_factor for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
+                        win_rate=sum(m.win_rate for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
+                        directional_accuracy=sum(m.directional_accuracy for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
+                        sharpe_ratio=sum(m.sharpe_ratio for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
+                        total_trades=sum(m.total_trades for m in all_orig_metrics) if all_orig_metrics else 0
+                    )
+                    
+                    if metric_type == 'objective':
+                        orig_score = self._calculate_objective_score(avg_orig_metrics)
+                        opt_score = self._calculate_objective_score(avg_opt_metrics)
+                    elif metric_type == 'profit_factor':
+                        orig_score = avg_orig_metrics.profit_factor
+                        opt_score = avg_opt_metrics.profit_factor
+                    elif metric_type == 'win_rate':
+                        orig_score = avg_orig_metrics.win_rate * 100
+                        opt_score = avg_opt_metrics.win_rate * 100
+                    elif metric_type == 'directional_accuracy':
+                        orig_score = avg_orig_metrics.directional_accuracy * 100
+                        opt_score = avg_opt_metrics.directional_accuracy * 100
+                    else:
+                        continue
+                    
+                    change = ((opt_score - orig_score) / orig_score * 100) if orig_score > 0 else 0
+                    rankings.append((symbol, orig_score, opt_score, change))
+        else:
+            # Single-timeframe structure
+            for symbol, metrics_dict in opt.per_symbol_metrics.items():
+                orig_metrics = metrics_dict.get('original', BacktestMetrics())
+                opt_metrics = metrics_dict.get('optimized', BacktestMetrics())
+                
+                if metric_type == 'objective':
+                    orig_score = self._calculate_objective_score(orig_metrics)
+                    opt_score = self._calculate_objective_score(opt_metrics)
+                elif metric_type == 'profit_factor':
+                    orig_score = orig_metrics.profit_factor
+                    opt_score = opt_metrics.profit_factor
+                elif metric_type == 'win_rate':
+                    orig_score = orig_metrics.win_rate * 100
+                    opt_score = opt_metrics.win_rate * 100
+                elif metric_type == 'directional_accuracy':
+                    orig_score = orig_metrics.directional_accuracy * 100
+                    opt_score = opt_metrics.directional_accuracy * 100
+                else:
+                    continue
+                
+                change = ((opt_score - orig_score) / orig_score * 100) if orig_score > 0 else 0
+                rankings.append((symbol, orig_score, opt_score, change))
+        
+        # Sort by optimized score (descending)
+        rankings.sort(key=lambda x: x[2], reverse=True)
+        return rankings
     
     def generate_optimized_pine(self, output_path: str = None) -> str:
         """
@@ -325,6 +476,19 @@ class OutputGenerator:
             
             report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
         
+        # Add Overall Performance by Symbol table (ranked)
+        if opt.per_symbol_metrics:
+            rankings = self._get_symbol_rankings(opt, 'objective')
+            if rankings:
+                report_lines.extend([
+                    "",
+                    "  Overall Performance by Symbol (Ranked):",
+                    f"  {'Rank':<6} {'Symbol':<12} {'Original':>12} {'Optimized':>12} {'Change':>12}",
+                    f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12}",
+                ])
+                for rank, (symbol, orig_score, opt_score, change) in enumerate(rankings, 1):
+                    report_lines.append(f"  {rank:<6} {symbol:<12} {orig_score:>12.4f} {opt_score:>12.4f} {change:>+11.1f}%")
+        
         # Add per-symbol performance comparison table
         if opt.per_symbol_metrics:
             report_lines.extend([
@@ -333,49 +497,39 @@ class OutputGenerator:
                 "PER-SYMBOL PERFORMANCE",
                 "-" * 70,
                 "",
-                "  Profit Factor by Symbol:",
-                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
-                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+                "  Profit Factor by Symbol (Ranked):",
+                f"  {'Rank':<6} {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*6} {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
             ])
             
-            for symbol in sorted(opt.per_symbol_metrics.keys()):
-                sym_data = opt.per_symbol_metrics[symbol]
-                orig_pf = sym_data['original'].profit_factor
-                opt_pf = sym_data['optimized'].profit_factor
-                if orig_pf > 0:
-                    change = (opt_pf - orig_pf) / orig_pf * 100
-                    change_str = f"{change:+.1f}%"
-                else:
-                    change_str = "N/A"
-                report_lines.append(f"  {symbol:<12} {orig_pf:>10.2f} {opt_pf:>10.2f} {change_str:>10}")
+            rankings = self._get_symbol_rankings(opt, 'profit_factor')
+            for rank, (symbol, orig_pf, opt_pf, change) in enumerate(rankings, 1):
+                change_str = f"{change:+.1f}%" if orig_pf > 0 else "N/A"
+                report_lines.append(f"  {rank:<6} {symbol:<12} {orig_pf:>10.2f} {opt_pf:>10.2f} {change_str:>10}")
             
             report_lines.extend([
                 "",
-                "  Win Rate by Symbol:",
-                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
-                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+                "  Win Rate by Symbol (Ranked):",
+                f"  {'Rank':<6} {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*6} {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
             ])
             
-            for symbol in sorted(opt.per_symbol_metrics.keys()):
-                sym_data = opt.per_symbol_metrics[symbol]
-                orig_wr = sym_data['original'].win_rate * 100
-                opt_wr = sym_data['optimized'].win_rate * 100
-                change = opt_wr - orig_wr
-                report_lines.append(f"  {symbol:<12} {orig_wr:>9.1f}% {opt_wr:>9.1f}% {change:>+9.1f}pp")
+            rankings = self._get_symbol_rankings(opt, 'win_rate')
+            for rank, (symbol, orig_wr, opt_wr, change) in enumerate(rankings, 1):
+                change_pp = opt_wr - orig_wr
+                report_lines.append(f"  {rank:<6} {symbol:<12} {orig_wr:>9.1f}% {opt_wr:>9.1f}% {change_pp:>+9.1f}pp")
             
             report_lines.extend([
                 "",
-                "  Directional Accuracy by Symbol:",
-                f"  {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
-                f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
+                "  Directional Accuracy by Symbol (Ranked):",
+                f"  {'Rank':<6} {'Symbol':<12} {'Original':>10} {'Optimized':>10} {'Change':>10}",
+                f"  {'-'*6} {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
             ])
             
-            for symbol in sorted(opt.per_symbol_metrics.keys()):
-                sym_data = opt.per_symbol_metrics[symbol]
-                orig_da = sym_data['original'].directional_accuracy * 100
-                opt_da = sym_data['optimized'].directional_accuracy * 100
-                change = opt_da - orig_da
-                report_lines.append(f"  {symbol:<12} {orig_da:>9.1f}% {opt_da:>9.1f}% {change:>+9.1f}pp")
+            rankings = self._get_symbol_rankings(opt, 'directional_accuracy')
+            for rank, (symbol, orig_da, opt_da, change) in enumerate(rankings, 1):
+                change_pp = opt_da - orig_da
+                report_lines.append(f"  {rank:<6} {symbol:<12} {orig_da:>9.1f}% {opt_da:>9.1f}% {change_pp:>+9.1f}pp")
             
             report_lines.extend([
                 "",
@@ -384,10 +538,37 @@ class OutputGenerator:
                 f"  {'-'*12} {'-'*10} {'-'*10} {'-'*10}",
             ])
             
-            for symbol in sorted(opt.per_symbol_metrics.keys()):
-                sym_data = opt.per_symbol_metrics[symbol]
-                orig_trades = sym_data['original'].total_trades
-                opt_trades = sym_data['optimized'].total_trades
+            # For trades, we'll sort by optimized trades (descending)
+            trades_data = []
+            
+            # Check if multi-timeframe structure
+            is_multi_tf = False
+            if opt.per_symbol_metrics:
+                first_value = next(iter(opt.per_symbol_metrics.values()))
+                if isinstance(first_value, dict) and first_value:
+                    first_nested = next(iter(first_value.values()))
+                    if isinstance(first_nested, dict) and 'original' in first_nested:
+                        is_multi_tf = True
+            
+            if is_multi_tf:
+                # Multi-timeframe: aggregate trades across timeframes
+                for symbol in opt.per_symbol_metrics:
+                    total_orig = 0
+                    total_opt = 0
+                    for timeframe, metrics_dict in opt.per_symbol_metrics[symbol].items():
+                        total_orig += metrics_dict['original'].total_trades
+                        total_opt += metrics_dict['optimized'].total_trades
+                    trades_data.append((symbol, total_orig, total_opt))
+            else:
+                # Single-timeframe structure
+                for symbol in opt.per_symbol_metrics:
+                    sym_data = opt.per_symbol_metrics[symbol]
+                    orig_trades = sym_data['original'].total_trades
+                    opt_trades = sym_data['optimized'].total_trades
+                    trades_data.append((symbol, orig_trades, opt_trades))
+            
+            trades_data.sort(key=lambda x: x[2], reverse=True)
+            for symbol, orig_trades, opt_trades in trades_data:
                 if orig_trades > 0:
                     change = (opt_trades - orig_trades) / orig_trades * 100
                     change_str = f"{change:+.1f}%"
@@ -395,19 +576,184 @@ class OutputGenerator:
                     change_str = "N/A"
                 report_lines.append(f"  {symbol:<12} {orig_trades:>10} {opt_trades:>10} {change_str:>10}")
         
+        # Add Optimal Forecast Horizon by Symbol section
+        if opt.per_symbol_metrics:
+            report_lines.extend([
+                "",
+                "-" * 70,
+                "OPTIMAL FORECAST HORIZON BY SYMBOL",
+                "-" * 70,
+                "",
+            ])
+            
+            # Check if multi-timeframe structure
+            is_multi_tf = False
+            if opt.per_symbol_metrics:
+                first_value = next(iter(opt.per_symbol_metrics.values()))
+                if isinstance(first_value, dict) and first_value:
+                    first_nested = next(iter(first_value.values()))
+                    if isinstance(first_nested, dict) and 'original' in first_nested:
+                        is_multi_tf = True
+            
+            if is_multi_tf:
+                # Multi-timeframe structure
+                report_lines.extend([
+                    f"  {'Symbol':<12} {'Timeframe':<12} {'Horizon (bars)':>16} {'Horizon (time)':>20}",
+                    f"  {'-'*12} {'-'*12} {'-'*16} {'-'*20}",
+                ])
+                for symbol in sorted(opt.per_symbol_metrics.keys()):
+                    for timeframe in sorted(opt.per_symbol_metrics[symbol].keys()):
+                        metrics = opt.per_symbol_metrics[symbol][timeframe]['optimized']
+                        horizon_bars = metrics.forecast_horizon
+                        horizon_time = self._format_timeframe_duration(horizon_bars, timeframe)
+                        report_lines.append(f"  {symbol:<12} {timeframe:<12} {horizon_bars:>16} {horizon_time:>20}")
+            else:
+                # Single-timeframe structure
+                report_lines.extend([
+                    f"  {'Symbol':<12} {'Horizon (bars)':>16} {'Horizon (time)':>20}",
+                    f"  {'-'*12} {'-'*16} {'-'*20}",
+                ])
+                interval = opt.interval if opt.interval else "1h"
+                for symbol in sorted(opt.per_symbol_metrics.keys()):
+                    metrics = opt.per_symbol_metrics[symbol]['optimized']
+                    horizon_bars = metrics.forecast_horizon
+                    horizon_time = self._format_timeframe_duration(horizon_bars, interval)
+                    report_lines.append(f"  {symbol:<12} {horizon_bars:>16} {horizon_time:>20}")
+        
+        # Add Multi-Timeframe Performance Comparison section (if applicable)
+        if opt.per_symbol_metrics and opt.timeframes_used:
+            has_multi_tf = any(len(tfs) > 1 for tfs in opt.timeframes_used.values())
+            if has_multi_tf:
+                report_lines.extend([
+                    "",
+                    "-" * 70,
+                    "MULTI-TIMEFRAME PERFORMANCE COMPARISON",
+                    "-" * 70,
+                    "",
+                    f"  {'Symbol':<12} {'Timeframe':<12} {'Original':>12} {'Optimized':>12} {'Change':>12} {'Optimal Horizon':>20}",
+                    f"  {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*20}",
+                ])
+                for symbol in sorted(opt.per_symbol_metrics.keys()):
+                    if symbol in opt.timeframes_used and len(opt.timeframes_used[symbol]) > 1:
+                        for timeframe in sorted(opt.timeframes_used[symbol]):
+                            if timeframe in opt.per_symbol_metrics[symbol]:
+                                metrics_dict = opt.per_symbol_metrics[symbol][timeframe]
+                                orig_metrics = metrics_dict['original']
+                                opt_metrics = metrics_dict['optimized']
+                                orig_obj = self._calculate_objective_score(orig_metrics)
+                                opt_obj = self._calculate_objective_score(opt_metrics)
+                                change = ((opt_obj - orig_obj) / orig_obj * 100) if orig_obj > 0 else 0
+                                horizon_time = self._format_timeframe_duration(opt_metrics.forecast_horizon, timeframe)
+                                report_lines.append(f"  {symbol:<12} {timeframe:<12} {orig_obj:>12.4f} {opt_obj:>12.4f} {change:>+11.1f}% {horizon_time:>20}")
+        
+        # Add Historical Data Usage Assessment section
+        if opt.data_usage_info:
+            report_lines.extend([
+                "",
+                "-" * 70,
+                "HISTORICAL DATA USAGE ASSESSMENT",
+                "-" * 70,
+                "",
+                "  Summary by Dataset:",
+                f"  {'Symbol':<12} {'Timeframe':<12} {'Total Bars':>12} {'Date Range':<25} {'Train %':>10} {'Test %':>10} {'Embargo %':>12} {'Unused %':>10}",
+                f"  {'-'*12} {'-'*12} {'-'*12} {'-'*25} {'-'*10} {'-'*10} {'-'*12} {'-'*10}",
+            ])
+            
+            for symbol in sorted(opt.data_usage_info.keys()):
+                for timeframe in sorted(opt.data_usage_info[symbol].keys()):
+                    usage = opt.data_usage_info[symbol][timeframe]
+                    date_range_str = f"{usage.date_range[0].strftime('%Y-%m-%d')} to {usage.date_range[1].strftime('%Y-%m-%d')}"
+                    train_pct = self._calculate_bar_percentage(usage.total_train_bars, usage.total_bars)
+                    test_pct = self._calculate_bar_percentage(usage.total_test_bars, usage.total_bars)
+                    embargo_pct = self._calculate_bar_percentage(usage.total_embargo_bars, usage.total_bars)
+                    unused_pct = self._calculate_bar_percentage(usage.unused_bars, usage.total_bars)
+                    tf_display = timeframe if timeframe else opt.interval
+                    report_lines.append(f"  {symbol:<12} {tf_display:<12} {usage.total_bars:>12,} {date_range_str:<25} {train_pct:>9.1f}% {test_pct:>9.1f}% {embargo_pct:>11.1f}% {unused_pct:>9.1f}%")
+            
+            # Detailed breakdown per dataset
+            for symbol in sorted(opt.data_usage_info.keys()):
+                for timeframe in sorted(opt.data_usage_info[symbol].keys()):
+                    usage = opt.data_usage_info[symbol][timeframe]
+                    tf_display = timeframe if timeframe else opt.interval
+                    report_lines.extend([
+                        "",
+                        f"  Detailed Breakdown: {symbol} @ {tf_display}",
+                        f"    Total bars: {usage.total_bars:,}",
+                        f"    Date range: {self._format_date_range(usage.date_range[0], usage.date_range[1])}",
+                        f"    Walk-forward folds: {usage.n_folds}",
+                        f"    Train ratio: {usage.train_ratio:.1%}",
+                        f"    Embargo period: {usage.embargo_bars} bars",
+                        "",
+                        "    Fold Details:",
+                        f"    {'Fold':<6} {'Train Range (bars)':<20} {'Train Range (dates)':<35} {'Test Range (bars)':<20} {'Test Range (dates)':<35} {'Embargo':<10} {'Train %':<10} {'Test %':<10}",
+                        f"    {'-'*6} {'-'*20} {'-'*35} {'-'*20} {'-'*35} {'-'*10} {'-'*10} {'-'*10}",
+                    ])
+                    
+                    for fold in usage.folds:
+                        train_range = f"{fold['train_start']}-{fold['train_end']-1}"
+                        test_range = f"{fold['test_start']}-{fold['test_end']-1}"
+                        train_date_range = f"{fold['train_start_date'].strftime('%Y-%m-%d')} to {fold['train_end_date'].strftime('%Y-%m-%d')}" if fold['train_start_date'] and fold['train_end_date'] else "N/A"
+                        test_date_range = f"{fold['test_start_date'].strftime('%Y-%m-%d')} to {fold['test_end_date'].strftime('%Y-%m-%d')}" if fold['test_start_date'] and fold['test_end_date'] else "N/A"
+                        train_pct = self._calculate_bar_percentage(fold['train_bars'], usage.total_bars)
+                        test_pct = self._calculate_bar_percentage(fold['test_bars'], usage.total_bars)
+                        report_lines.append(f"    {fold['fold_num']:<6} {train_range:<20} {train_date_range:<35} {test_range:<20} {test_date_range:<35} {fold['embargo_bars']:<10} {train_pct:<9.1f}% {test_pct:<9.1f}%")
+                    
+                    # Baseline parameter configuration
+                    report_lines.extend([
+                        "",
+                        "    Baseline (Default) Parameter Configuration:",
+                        "    (Parameters used for original/unchanged indicator evaluation)",
+                    ])
+                    
+                    baseline_params = []
+                    for param_name in sorted(opt.original_params.keys()):
+                        param_value = opt.original_params[param_name]
+                        baseline_params.append(f"      {param_name}: {self._format_value(param_value)}")
+                    
+                    if baseline_params:
+                        report_lines.extend(baseline_params)
+                    else:
+                        report_lines.append("      (No parameters found)")
+                    
+                    # Bias analysis
+                    report_lines.extend([
+                        "",
+                        "    Bias Analysis:",
+                    ])
+                    
+                    if not usage.potential_bias_issues:
+                        report_lines.append("    ✓ No overlapping test sets detected")
+                        report_lines.append("    ✓ Embargo period is adequate")
+                        report_lines.append("    ✓ No data leakage detected between folds")
+                    else:
+                        for issue in usage.potential_bias_issues:
+                            if issue.startswith("Warning:"):
+                                report_lines.append(f"    ⚠ {issue}")
+                            elif issue.startswith("Overlapping"):
+                                report_lines.append(f"    ✗ {issue}")
+                            else:
+                                report_lines.append(f"    ⚠ {issue}")
+        
         # Add improvement history section
         report_lines.extend([
             "",
             "-" * 70,
-            "OPTIMIZATION PROGRESS (New Bests Found)",
+            "OPTIMIZATION PROGRESS (Improvements Over Baseline)",
             "-" * 70,
             "",
             f"  Baseline (original config) objective: {opt.baseline_objective:.4f}",
             "",
         ])
         
+        # Filter to only show actual improvements over baseline
+        actual_improvements = []
         if opt.improvement_history:
-            for i, entry in enumerate(opt.improvement_history, 1):
+            for entry in opt.improvement_history:
+                if entry['objective'] >= opt.baseline_objective:
+                    actual_improvements.append(entry)
+        
+        if actual_improvements:
+            for i, entry in enumerate(actual_improvements, 1):
                 elapsed = entry['elapsed_seconds']
                 obj = entry['objective']
                 pct = entry['pct_vs_original']
@@ -438,9 +784,9 @@ class OutputGenerator:
                 report_lines.append("")
             
             # Summary of improvement trajectory
-            if len(opt.improvement_history) >= 2:
-                first_entry = opt.improvement_history[0]
-                last_entry = opt.improvement_history[-1]
+            if len(actual_improvements) >= 2:
+                first_entry = actual_improvements[0]
+                last_entry = actual_improvements[-1]
                 
                 first_rate = first_entry['avg_rate_pct_per_sec']
                 last_rate = last_entry['avg_rate_pct_per_sec']
@@ -453,6 +799,10 @@ class OutputGenerator:
                     slowdown = (1 - last_rate / first_rate) * 100
                     if slowdown > 0:
                         report_lines.append(f"    Rate slowdown: {slowdown:.1f}% (diminishing returns observed)")
+        else:
+            report_lines.append("  No improvements over baseline were found during optimization.")
+            report_lines.append("  All trials performed worse than the original configuration.")
+            report_lines.append("")
                     else:
                         report_lines.append(f"    Rate acceleration: {-slowdown:.1f}% (improving efficiency)")
                 report_lines.append("")

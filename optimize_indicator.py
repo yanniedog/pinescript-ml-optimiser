@@ -100,7 +100,7 @@ Examples:
         '--interval',
         type=str,
         default='1h',
-        help='Timeframe/interval (e.g., 1h, 4h, 1d). Default: 1h'
+        help='Timeframe/interval (e.g., 1h, 4h, 1d) or comma-separated list (e.g., 1h,4h,1d). Default: 1h'
     )
     parser.add_argument(
         '--force-download',
@@ -137,7 +137,39 @@ Examples:
     
     # Initialize data manager
     dm = DataManager()
-    interval = args.interval
+    
+    # Parse intervals (support comma-separated)
+    intervals_input = args.interval.split(',')
+    intervals = [i.strip() for i in intervals_input]
+    
+    # Ask user if they want to use multiple timeframes for the same symbol
+    if len(intervals) > 1:
+        print("\n" + "-" * 70)
+        print("  MULTI-TIMEFRAME OPTION DETECTED")
+        print("-" * 70)
+        print(f"  You specified {len(intervals)} timeframes: {', '.join(intervals)}")
+        print("\n  Options:")
+        print("    1. Use multiple timeframes for the same symbol (recommended for comparison)")
+        print("       Example: BTCUSDT @ 1h, BTCUSDT @ 4h, BTCUSDT @ 1d")
+        print("    2. Use single timeframe (use first interval only)")
+        print(f"       Example: All symbols @ {intervals[0]} only")
+        print()
+        
+        while True:
+            choice = input("  Choose option (1 or 2) [1]: ").strip()
+            if not choice:
+                choice = "1"
+            if choice in ['1', '2']:
+                break
+            print("  [ERROR] Please enter 1 or 2")
+        
+        if choice == '2':
+            # Use only first interval
+            intervals = [intervals[0]]
+            print(f"  Using single timeframe: {intervals[0]}")
+        else:
+            print(f"  Using multiple timeframes: {', '.join(intervals)}")
+            print("  Note: Each symbol will be evaluated at each timeframe separately")
     
     # Determine symbols to use
     if args.symbols:
@@ -145,8 +177,15 @@ Examples:
         # Ensure USDT suffix
         symbols = [s if s.endswith('USDT') else s + 'USDT' for s in symbols]
     else:
-        # Use all available symbols for this interval
-        symbols = dm.get_available_symbols(interval)
+        # Use all available symbols for the first interval (or union of all if multiple)
+        if len(intervals) == 1:
+            symbols = dm.get_available_symbols(intervals[0])
+        else:
+            # Union of symbols across all intervals
+            all_symbols = set()
+            for interval in intervals:
+                all_symbols.update(dm.get_available_symbols(interval))
+            symbols = sorted(list(all_symbols))
         if not symbols:
             # Fall back to defaults if no data exists
             symbols = SYMBOLS
@@ -155,30 +194,55 @@ Examples:
     
     try:
         # Step 1: Load/Download Historical Data
-        print_step(1, total_steps, f"Loading historical data ({len(symbols)} symbols @ {interval})...")
+        if len(intervals) == 1:
+            print_step(1, total_steps, f"Loading historical data ({len(symbols)} symbols @ {intervals[0]})...")
+        else:
+            print_step(1, total_steps, f"Loading historical data ({len(symbols)} symbols @ {len(intervals)} timeframes: {', '.join(intervals)})...")
         
         # Check which symbols need downloading
-        missing = [s for s in symbols if not dm.symbol_exists(s, interval)]
-        if missing or args.force_download:
-            print(f"   Downloading: {missing if missing else 'all (forced)'}")
-            for symbol in (symbols if args.force_download else missing):
-                try:
-                    dm.download_symbol(symbol, interval, force=args.force_download)
-                except Exception as e:
-                    print(f"   [WARN] Failed to download {symbol}: {e}")
-        
-        # Load all data
-        data = {}
+        missing = {}
         for symbol in symbols:
-            if dm.symbol_exists(symbol, interval):
-                try:
-                    data[symbol] = dm.load_symbol(symbol, interval)
-                    print(f"   [OK] {symbol}: {len(data[symbol]):,} candles")
-                except Exception as e:
-                    print(f"   [WARN] Failed to load {symbol}: {e}")
+            for interval in intervals:
+                if not dm.symbol_exists(symbol, interval):
+                    if symbol not in missing:
+                        missing[symbol] = []
+                    missing[symbol].append(interval)
+        
+        if missing or args.force_download:
+            print(f"   Downloading: {len(missing)} symbols" if missing else "   Downloading: all (forced)")
+            for symbol in (symbols if args.force_download else list(missing.keys())):
+                for interval in (intervals if args.force_download else missing.get(symbol, [])):
+                    try:
+                        dm.download_symbol(symbol, interval, force=args.force_download)
+                    except Exception as e:
+                        print(f"   [WARN] Failed to download {symbol} @ {interval}: {e}")
+        
+        # Load all data - support multi-timeframe structure
+        if len(intervals) == 1:
+            # Single timeframe: {symbol: DataFrame}
+            data = {}
+            for symbol in symbols:
+                if dm.symbol_exists(symbol, intervals[0]):
+                    try:
+                        data[symbol] = dm.load_symbol(symbol, intervals[0])
+                        print(f"   [OK] {symbol} @ {intervals[0]}: {len(data[symbol]):,} candles")
+                    except Exception as e:
+                        print(f"   [WARN] Failed to load {symbol}: {e}")
+        else:
+            # Multi-timeframe: {symbol: {timeframe: DataFrame}}
+            data = {}
+            for symbol in symbols:
+                data[symbol] = {}
+                for interval in intervals:
+                    if dm.symbol_exists(symbol, interval):
+                        try:
+                            data[symbol][interval] = dm.load_symbol(symbol, interval)
+                            print(f"   [OK] {symbol} @ {interval}: {len(data[symbol][interval]):,} candles")
+                        except Exception as e:
+                            print(f"   [WARN] Failed to load {symbol} @ {interval}: {e}")
         
         if not data:
-            print(f"Error: No historical data available for interval '{interval}'.")
+            print(f"Error: No historical data available for interval(s) '{args.interval}'.")
             print(f"       Run the interactive mode to download data first.")
             sys.exit(1)
         
@@ -218,7 +282,7 @@ Examples:
         optimization_result = optimize_indicator(
             parse_result,
             data,
-            interval=interval,
+            interval=args.interval,  # Pass full interval string (may be comma-separated)
             max_trials=args.max_trials,
             timeout_seconds=args.timeout
         )
