@@ -751,38 +751,38 @@ class OutputGenerator:
             for entry in opt.improvement_history:
                 if entry['objective'] >= opt.baseline_objective:
                     actual_improvements.append(entry)
-        
-        if actual_improvements:
-            for i, entry in enumerate(actual_improvements, 1):
-                elapsed = entry['elapsed_seconds']
-                obj = entry['objective']
-                pct = entry['pct_vs_original']
-                avg_rate = entry['avg_rate_pct_per_sec']
-                marginal_rate = entry['marginal_rate_pct_per_sec']
-                params = entry['params']
-                
-                sign = "+" if pct >= 0 else ""
-                report_lines.append(f"  [{i}] @ {elapsed:.1f}s: objective={obj:.4f} ({sign}{pct:.2f}% vs original)")
-                report_lines.append(f"      Avg rate: {avg_rate:+.3f}%/sec | Marginal rate: {marginal_rate:.3f}%/sec")
-                
-                # Show changed params (vs original)
-                changed_params = []
-                for pname, pval in params.items():
-                    orig_val = opt.original_params.get(pname)
-                    if orig_val != pval:
-                        changed_params.append(f"{pname}={self._format_value(pval)}")
-                
-                if changed_params:
-                    # Split into multiple lines if too long
-                    param_str = ", ".join(changed_params)
-                    if len(param_str) > 55:
-                        report_lines.append(f"      Config changes:")
-                        for cp in changed_params:
-                            report_lines.append(f"        - {cp}")
-                    else:
-                        report_lines.append(f"      Config: {param_str}")
-                report_lines.append("")
             
+            if actual_improvements:
+                for i, entry in enumerate(actual_improvements, 1):
+                    elapsed = entry['elapsed_seconds']
+                    obj = entry['objective']
+                    pct = entry['pct_vs_original']
+                    avg_rate = entry['avg_rate_pct_per_sec']
+                    marginal_rate = entry['marginal_rate_pct_per_sec']
+                    params = entry['params']
+                    
+                    sign = "+" if pct >= 0 else ""
+                    report_lines.append(f"  [{i}] @ {elapsed:.1f}s: objective={obj:.4f} ({sign}{pct:.2f}% vs original)")
+                    report_lines.append(f"      Avg rate: {avg_rate:+.3f}%/sec | Marginal rate: {marginal_rate:.3f}%/sec")
+                    
+                    # Show changed params (vs original)
+                    changed_params = []
+                    for pname, pval in params.items():
+                        orig_val = opt.original_params.get(pname)
+                        if orig_val != pval:
+                            changed_params.append(f"{pname}={self._format_value(pval)}")
+                    
+                    if changed_params:
+                        # Split into multiple lines if too long
+                        param_str = ", ".join(changed_params)
+                        if len(param_str) > 55:
+                            report_lines.append(f"      Config changes:")
+                            for cp in changed_params:
+                                report_lines.append(f"        - {cp}")
+                        else:
+                            report_lines.append(f"      Config: {param_str}")
+                    report_lines.append("")
+                
             # Summary of improvement trajectory
             if len(actual_improvements) >= 2:
                 first_entry = actual_improvements[0]
@@ -799,12 +799,20 @@ class OutputGenerator:
                     slowdown = (1 - last_rate / first_rate) * 100
                     if slowdown > 0:
                         report_lines.append(f"    Rate slowdown: {slowdown:.1f}% (diminishing returns observed)")
-        else:
-            report_lines.append("  No improvements over baseline were found during optimization.")
-            report_lines.append("  All trials performed worse than the original configuration.")
-            report_lines.append("")
                     else:
                         report_lines.append(f"    Rate acceleration: {-slowdown:.1f}% (improving efficiency)")
+                # Report average and moving-average improvement rates
+                avg_rates = [e['avg_rate_pct_per_sec'] for e in actual_improvements]
+                if avg_rates:
+                    avg_rate = sum(avg_rates) / len(avg_rates)
+                    window = 5 if len(avg_rates) >= 5 else len(avg_rates)
+                    moving_avg = sum(avg_rates[-window:]) / window
+                    report_lines.append(f"    Avg improvement rate: {avg_rate:+.3f}%/sec (vs baseline)")
+                    report_lines.append(f"    Moving avg ({window}): {moving_avg:+.3f}%/sec")
+                report_lines.append("")
+            else:
+                report_lines.append("  No improvements over baseline were found during optimization.")
+                report_lines.append("  All trials performed worse than the original configuration.")
                 report_lines.append("")
         else:
             report_lines.append("  No improvements found during optimization.")

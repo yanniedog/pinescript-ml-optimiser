@@ -120,7 +120,8 @@ class WalkForwardBacktester:
         n_folds: int = 5,
         embargo_bars: int = 72,
         train_ratio: float = 0.6,
-        min_trades_per_fold: int = 10
+        min_trades_per_fold: int = 10,
+        forecast_horizons: Optional[List[int]] = None
     ):
         """
         Initialize backtester.
@@ -137,6 +138,7 @@ class WalkForwardBacktester:
         self.embargo_bars = embargo_bars
         self.train_ratio = train_ratio
         self.min_trades_per_fold = min_trades_per_fold
+        self.forecast_horizons = forecast_horizons or self.FORECAST_HORIZONS
         
         self.close = df['close'].values
         self.high = df['high'].values
@@ -145,7 +147,7 @@ class WalkForwardBacktester:
         
         # Pre-calculate future returns for different horizons
         self._future_returns = {}
-        for h in self.FORECAST_HORIZONS:
+        for h in self.forecast_horizons:
             self._future_returns[h] = self._calculate_future_returns(h)
         
         # Create folds
@@ -358,7 +360,7 @@ class WalkForwardBacktester:
         Returns:
             Optimal forecast horizon in bars
         """
-        best_horizon = 24  # Default
+        best_horizon = self.forecast_horizons[0] if self.forecast_horizons else 24  # Default
         best_accuracy = 0.0
         
         # Determine data range: use training data from fold if provided
@@ -397,7 +399,7 @@ class WalkForwardBacktester:
             start_idx = None
             end_idx = None
         
-        for horizon in self.FORECAST_HORIZONS:
+        for horizon in self.forecast_horizons:
             accuracy = self._calculate_directional_accuracy(
                 indicator_result,
                 horizon,
