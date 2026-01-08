@@ -293,6 +293,18 @@ class OutputGenerator:
             f"// Sharpe Ratio: {metrics.sharpe_ratio:.2f}",
             f"// Max Drawdown: {metrics.max_drawdown:.1f}%",
             f"// Improvement over Random: {metrics.improvement_over_random:+.1f}%",
+        ]
+
+        if opt.holdout_metrics is not None and opt.holdout_original_metrics is not None:
+            header_lines.extend([
+                "// ---------------------------------------------------------------------------",
+                "// LOCKBOX (OUT-OF-SAMPLE) RESULTS:",
+                f"//   Profit Factor: {opt.holdout_original_metrics.profit_factor:.2f} -> {opt.holdout_metrics.profit_factor:.2f}",
+                f"//   Win Rate: {opt.holdout_original_metrics.win_rate:.1%} -> {opt.holdout_metrics.win_rate:.1%}",
+                f"//   Directional Accuracy: {opt.holdout_original_metrics.directional_accuracy:.1%} -> {opt.holdout_metrics.directional_accuracy:.1%}",
+            ])
+
+        header_lines.extend([
             "// ---------------------------------------------------------------------------",
             f"// OPTIMAL FORECAST HORIZON: {metrics.forecast_horizon} hours",
             f"// ",
@@ -300,7 +312,7 @@ class OutputGenerator:
             f"// EXPECTED PROFITABILITY: Best results with ~{metrics.forecast_horizon}h forecast horizon",
             "// ---------------------------------------------------------------------------",
             "// PARAMETER CHANGES:",
-        ]
+        ])
         
         # Add parameter changes
         for name, new_val in opt.best_params.items():
@@ -464,6 +476,9 @@ class OutputGenerator:
         report_lines.append(f"    Rate floor (%/s):    {getattr(opt, 'improvement_rate_floor', 0.0)}")
         report_lines.append(f"    Rate window:         {getattr(opt, 'improvement_rate_window', 0)}")
         report_lines.append(f"    Backtester overrides:{getattr(opt, 'backtester_overrides', {})}")
+        if getattr(opt, "holdout_ratio", 0.0) > 0:
+            report_lines.append(f"    Holdout ratio:       {opt.holdout_ratio:.0%}")
+            report_lines.append(f"    Holdout gap bars:    {getattr(opt, 'holdout_gap_bars', 0)}")
         
         report_lines.extend([
             "",
@@ -512,6 +527,54 @@ class OutputGenerator:
                     change_str = "N/A"
             
             report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
+
+        if opt.holdout_metrics is not None and opt.holdout_original_metrics is not None:
+            report_lines.extend([
+                "",
+                "-" * 70,
+                "LOCKBOX (OUT-OF-SAMPLE) PERFORMANCE",
+                "-" * 70,
+                "",
+                f"  {'Metric':<25} {'Original':>12} {'Optimized':>12} {'Change':>12}",
+                f"  {'-'*25} {'-'*12} {'-'*12} {'-'*12}",
+            ])
+
+            holdout_metrics_to_compare = [
+                ('Profit Factor', opt.holdout_original_metrics.profit_factor, opt.holdout_metrics.profit_factor, '.2f'),
+                ('Win Rate', opt.holdout_original_metrics.win_rate * 100, opt.holdout_metrics.win_rate * 100, '.1f%'),
+                ('Directional Accuracy', opt.holdout_original_metrics.directional_accuracy * 100, opt.holdout_metrics.directional_accuracy * 100, '.1f%'),
+                ('Extreme Move Capture', opt.holdout_original_metrics.tail_capture_rate * 100, opt.holdout_metrics.tail_capture_rate * 100, '.1f%'),
+                ('Consistency Score', opt.holdout_original_metrics.consistency_score, opt.holdout_metrics.consistency_score, '.2f'),
+                ('Sharpe Ratio', opt.holdout_original_metrics.sharpe_ratio, opt.holdout_metrics.sharpe_ratio, '.2f'),
+                ('Total Trades', opt.holdout_original_metrics.total_trades, opt.holdout_metrics.total_trades, 'd'),
+                ('Avg Return/Trade', opt.holdout_original_metrics.avg_return, opt.holdout_metrics.avg_return, '.2f%'),
+                ('Max Drawdown', opt.holdout_original_metrics.max_drawdown, opt.holdout_metrics.max_drawdown, '.1f%'),
+            ]
+
+            for name, orig, best, fmt in holdout_metrics_to_compare:
+                if 'd' in fmt:
+                    orig_str = f"{int(orig)}"
+                    best_str = f"{int(best)}"
+                    if orig > 0:
+                        change = (best - orig) / orig * 100
+                        change_str = f"{change:+.1f}%"
+                    else:
+                        change_str = "N/A"
+                elif '%' in fmt:
+                    orig_str = f"{orig:.1f}%"
+                    best_str = f"{best:.1f}%"
+                    change = best - orig
+                    change_str = f"{change:+.1f}pp"
+                else:
+                    orig_str = f"{orig:.2f}"
+                    best_str = f"{best:.2f}"
+                    if orig > 0:
+                        change = (best - orig) / orig * 100
+                        change_str = f"{change:+.1f}%"
+                    else:
+                        change_str = "N/A"
+
+                report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
         
         # Add Overall Performance by Symbol table (ranked)
         if opt.per_symbol_metrics:

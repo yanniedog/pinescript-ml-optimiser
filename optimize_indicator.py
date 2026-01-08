@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_OPTIMIZATION_STRATEGY = "multi_fidelity"
+DEFAULT_OPTIMIZATION_STRATEGY = "tpe"
 
 LAST_RESULT = None
 LAST_OUTPUTS = None
@@ -126,6 +126,18 @@ Examples:
         action='store_true',
         help='Enable verbose logging'
     )
+    parser.add_argument(
+        '--holdout-ratio',
+        type=float,
+        default=0.2,
+        help='Fraction of data reserved for lockbox evaluation (0 disables). Default: 0.2'
+    )
+    parser.add_argument(
+        '--holdout-gap-bars',
+        type=int,
+        default=None,
+        help='Purge gap between optimization and holdout in bars (default: auto)'
+    )
     
     args = parser.parse_args()
     
@@ -135,6 +147,10 @@ Examples:
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.holdout_ratio < 0 or args.holdout_ratio >= 0.9:
+        print("Error: --holdout-ratio must be between 0 and 0.9.")
+        sys.exit(1)
     
     # Validate input file
     pine_path = Path(args.pine_script)
@@ -301,6 +317,7 @@ Examples:
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
         print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency + Drawdown")
+        print(f"   Lockbox holdout: {args.holdout_ratio:.0%} (gap: {args.holdout_gap_bars if args.holdout_gap_bars is not None else 'auto'} bars)")
         print()
         print(f"   [TIP] Press Q at any time to stop and use current best results")
         print(f"         Watch improvement rate - diminishing returns suggest stopping early")
@@ -312,7 +329,9 @@ Examples:
             interval=args.interval,  # Pass full interval string (may be comma-separated)
             max_trials=args.max_trials,
             timeout_seconds=args.timeout,
-            strategy=DEFAULT_OPTIMIZATION_STRATEGY
+            strategy=DEFAULT_OPTIMIZATION_STRATEGY,
+            holdout_ratio=args.holdout_ratio,
+            holdout_gap_bars=args.holdout_gap_bars
         )
         
         # Step 4: Generate Optimized Pine Script
@@ -355,6 +374,15 @@ Examples:
 |                                                                      |
 +======================================================================+
         """)
+
+        if optimization_result.holdout_metrics is not None and optimization_result.holdout_original_metrics is not None:
+            holdout_best = optimization_result.holdout_metrics
+            holdout_orig = optimization_result.holdout_original_metrics
+            print("LOCKBOX (OUT-OF-SAMPLE) RESULTS")
+            print(f"  Profit Factor:       {holdout_orig.profit_factor:.2f} -> {holdout_best.profit_factor:.2f}")
+            print(f"  Win Rate:            {holdout_orig.win_rate*100:>5.1f}% -> {holdout_best.win_rate*100:>5.1f}%")
+            print(f"  Directional Accuracy:{holdout_orig.directional_accuracy*100:>5.1f}% -> {holdout_best.directional_accuracy*100:>5.1f}%")
+            print()
         
         def format_val(v):
             if isinstance(v, float):

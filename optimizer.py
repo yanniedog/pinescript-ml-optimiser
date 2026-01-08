@@ -484,6 +484,12 @@ class OptimizationResult:
     improvement_rate_floor: float = 0.0
     improvement_rate_window: int = 0
     backtester_overrides: Dict[str, Any] = field(default_factory=dict)
+    holdout_ratio: float = 0.0
+    holdout_gap_bars: int = 0
+    holdout_metrics: Optional[BacktestMetrics] = None
+    holdout_original_metrics: Optional[BacktestMetrics] = None
+    holdout_per_symbol_metrics: Dict[str, Dict[str, BacktestMetrics]] = field(default_factory=dict)
+    holdout_data_usage_info: Dict[str, Dict[str, DataUsageInfo]] = field(default_factory=dict)
     
     def get_summary(self) -> str:
         """Generate human-readable summary."""
@@ -516,6 +522,21 @@ class OptimizationResult:
             interval_str = f" @ {self.interval}" if self.interval else ""
             lines.append(f"")
             lines.append(f"Historical Datasets Used: {', '.join(sorted(self.datasets_used))}{interval_str}")
+        if self.holdout_metrics is not None and self.holdout_original_metrics is not None:
+            lines.append("")
+            lines.append("Lockbox (OOS) Performance:")
+            lines.append(
+                f"  Profit Factor:  {self.holdout_original_metrics.profit_factor:.2f} -> "
+                f"{self.holdout_metrics.profit_factor:.2f}"
+            )
+            lines.append(
+                f"  Win Rate:       {self.holdout_original_metrics.win_rate:.1%} -> "
+                f"{self.holdout_metrics.win_rate:.1%}"
+            )
+            lines.append(
+                f"  Dir. Accuracy:  {self.holdout_original_metrics.directional_accuracy:.1%} -> "
+                f"{self.holdout_metrics.directional_accuracy:.1%}"
+            )
         return "\n".join(lines)
 
 
@@ -545,7 +566,9 @@ class PineOptimizer:
         min_runtime_seconds: int = 15,
         stall_seconds: Optional[int] = None,
         improvement_rate_floor: float = 0.05,
-        improvement_rate_window: int = 5
+        improvement_rate_window: int = 5,
+        holdout_ratio: float = 0.2,
+        holdout_gap_bars: Optional[int] = None
     ):
         """
         Initialize optimizer.
@@ -567,6 +590,8 @@ class PineOptimizer:
             stall_seconds: Stop if no improvement for this many seconds
             improvement_rate_floor: Minimum avg improvement rate to keep running
             improvement_rate_window: Moving average window for improvement rate
+            holdout_ratio: Fraction of data reserved for lockbox evaluation (0 disables)
+            holdout_gap_bars: Purge bars between optimization and holdout (None = auto)
         """
         self.parse_result = parse_result
         self.data = data
@@ -585,6 +610,14 @@ class PineOptimizer:
         self.stall_seconds = stall_seconds
         self.improvement_rate_floor = improvement_rate_floor
         self.improvement_rate_window = max(1, improvement_rate_window)
+        self.holdout_ratio = max(0.0, min(0.95, holdout_ratio))
+        self.holdout_gap_bars = holdout_gap_bars
+        self.holdout_enabled = False
+        self.holdout_gap_bars_effective = 0
+        self.holdout_data = {}
+        self.holdout_translators = {}
+        self.holdout_backtesters = {}
+        self.holdout_data_frames = {}
         self.indicator_name = parse_result.indicator_name or "Indicator"
         self.realtime_plotter = get_realtime_plotter()
         
@@ -597,14 +630,26 @@ class PineOptimizer:
         
         # Filter to optimizable parameters (exclude display/visual params)
         self.optimizable_params = self._get_optimizable_params()
-        
+
         # Detect if data is multi-timeframe structure
         self.is_multi_timeframe = False
-        if data:
-            first_value = next(iter(data.values()))
+        if self.data:
+            first_value = next(iter(self.data.values()))
             if isinstance(first_value, dict):
                 self.is_multi_timeframe = True
-        
+
+        # Split data for holdout if enabled
+        if self.holdout_ratio > 0:
+            train_data, holdout_data, gap_bars = self._split_data_for_holdout(self.data)
+            self.data = train_data
+            if holdout_data:
+                self.holdout_enabled = True
+                self.holdout_data = holdout_data
+                self.holdout_gap_bars_effective = gap_bars
+            else:
+                self.holdout_ratio = 0.0
+                self.holdout_gap_bars_effective = 0
+
         # Create translators and backtesters
         self.translators = {}  # {symbol: translator} or {(symbol, timeframe): translator}
         self.backtesters = {}  # {symbol: backtester} or {(symbol, timeframe): backtester}
@@ -612,7 +657,7 @@ class PineOptimizer:
         
         if self.is_multi_timeframe:
             # Multi-timeframe structure: {symbol: {timeframe: DataFrame}}
-            for symbol, timeframes_dict in data.items():
+            for symbol, timeframes_dict in self.data.items():
                 for timeframe, df in timeframes_dict.items():
                     key = (symbol, timeframe)
                     self.translators[key] = PineTranslator(parse_result, df)
@@ -621,11 +666,28 @@ class PineOptimizer:
                     self.data_frames[key] = df
         else:
             # Single-timeframe structure: {symbol: DataFrame}
-            for symbol, df in data.items():
+            for symbol, df in self.data.items():
                 self.translators[symbol] = PineTranslator(parse_result, df)
                 backtester_kwargs = self._get_backtester_config(self.interval, df)
                 self.backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
                 self.data_frames[symbol] = df
+
+        # Create holdout translators/backtesters if holdout is enabled
+        if self.holdout_enabled:
+            if self.is_multi_timeframe:
+                for symbol, timeframes_dict in self.holdout_data.items():
+                    for timeframe, df in timeframes_dict.items():
+                        key = (symbol, timeframe)
+                        self.holdout_translators[key] = PineTranslator(parse_result, df)
+                        backtester_kwargs = self._get_backtester_config(timeframe, df)
+                        self.holdout_backtesters[key] = WalkForwardBacktester(df, **backtester_kwargs)
+                        self.holdout_data_frames[key] = df
+            else:
+                for symbol, df in self.holdout_data.items():
+                    self.holdout_translators[symbol] = PineTranslator(parse_result, df)
+                    backtester_kwargs = self._get_backtester_config(self.interval, df)
+                    self.holdout_backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
+                    self.holdout_data_frames[symbol] = df
         
         # Tracking
         self.best_objective = 0.0
@@ -706,6 +768,78 @@ class PineOptimizer:
         if self.backtester_overrides:
             config.update(self.backtester_overrides)
         return config
+
+    def _compute_holdout_gap_bars(self, interval: str, df: pd.DataFrame) -> int:
+        """Compute a purge gap between optimization and holdout to avoid leakage."""
+        if self.holdout_gap_bars is not None:
+            return max(0, int(self.holdout_gap_bars))
+        config = self._get_backtester_config(interval, df)
+        horizons = config.get("forecast_horizons") or WalkForwardBacktester.FORECAST_HORIZONS
+        max_horizon = max(horizons) if horizons else 1
+        return max(int(config.get("embargo_bars", 0)), int(max_horizon))
+
+    def _split_data_for_holdout(
+        self,
+        data: Dict[str, pd.DataFrame]
+    ) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame], int]:
+        """Split data into optimization and holdout sets with a purge gap."""
+        if self.holdout_ratio <= 0:
+            return data, {}, 0
+
+        train_data: Dict[str, Any] = {}
+        holdout_data: Dict[str, Any] = {}
+        max_gap_bars = 0
+
+        def split_df(label: str, interval: str, df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.DataFrame], int]:
+            gap = self._compute_holdout_gap_bars(interval, df)
+            total = len(df)
+            holdout_bars = int(total * self.holdout_ratio)
+            min_holdout_bars = max(200, gap)
+            min_train_bars = max(200, gap * 2)
+
+            if holdout_bars < min_holdout_bars:
+                logger.warning(
+                    f"Holdout disabled for {label}: "
+                    f"{holdout_bars} holdout bars < minimum {min_holdout_bars}."
+                )
+                return df, None, gap
+
+            train_end = total - holdout_bars - gap
+            if train_end < min_train_bars:
+                logger.warning(
+                    f"Holdout disabled for {label}: "
+                    f"{train_end} training bars < minimum {min_train_bars} after gap={gap}."
+                )
+                return df, None, gap
+
+            holdout_start = train_end + gap
+            if holdout_start >= total:
+                logger.warning(
+                    f"Holdout disabled for {label}: holdout start {holdout_start} exceeds data length {total}."
+                )
+                return df, None, gap
+
+            return df.iloc[:train_end].copy(), df.iloc[holdout_start:].copy(), gap
+
+        if self.is_multi_timeframe:
+            for symbol, timeframes in data.items():
+                for timeframe, df in timeframes.items():
+                    label = f"{symbol}@{timeframe}"
+                    train_df, holdout_df, gap = split_df(label, timeframe, df)
+                    max_gap_bars = max(max_gap_bars, gap)
+                    train_data.setdefault(symbol, {})[timeframe] = train_df
+                    if holdout_df is not None and len(holdout_df) > 0:
+                        holdout_data.setdefault(symbol, {})[timeframe] = holdout_df
+        else:
+            for symbol, df in data.items():
+                label = symbol
+                train_df, holdout_df, gap = split_df(label, self.interval, df)
+                max_gap_bars = max(max_gap_bars, gap)
+                train_data[symbol] = train_df
+                if holdout_df is not None and len(holdout_df) > 0:
+                    holdout_data[symbol] = holdout_df
+
+        return train_data, holdout_data, max_gap_bars
 
     def _get_improvement_rate_stats(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """Return (avg_rate, moving_avg_rate, peak_rate) from improvement history."""
@@ -1073,6 +1207,66 @@ class PineOptimizer:
                 for symbol in per_symbol_metrics:
                     per_symbol_metrics[symbol]['optimized'] = per_symbol_metrics[symbol]['original']
             logger.info(f"Original params were optimal. Keeping original configuration.")
+
+        # Evaluate lockbox holdout performance if enabled
+        holdout_metrics = None
+        holdout_original_metrics = None
+        holdout_per_symbol_metrics = {}
+        holdout_data_usage_info = {}
+
+        if self.holdout_enabled and self.holdout_translators:
+            logger.info("Evaluating lockbox holdout performance...")
+            holdout_original_per_symbol = self._evaluate_holdout_params_per_symbol(self.original_params)
+
+            if self.is_multi_timeframe:
+                all_holdout_original = []
+                for symbol_dict in holdout_original_per_symbol.values():
+                    all_holdout_original.extend(symbol_dict.values())
+                holdout_original_metrics = self._aggregate_metrics(all_holdout_original)
+            else:
+                holdout_original_metrics = self._aggregate_metrics(list(holdout_original_per_symbol.values()))
+
+            if best_params == self.original_params:
+                holdout_best_per_symbol = holdout_original_per_symbol
+                holdout_metrics = holdout_original_metrics
+            else:
+                holdout_best_per_symbol = self._evaluate_holdout_params_per_symbol(best_params)
+                if self.is_multi_timeframe:
+                    all_holdout_best = []
+                    for symbol_dict in holdout_best_per_symbol.values():
+                        all_holdout_best.extend(symbol_dict.values())
+                    holdout_metrics = self._aggregate_metrics(all_holdout_best)
+                else:
+                    holdout_metrics = self._aggregate_metrics(list(holdout_best_per_symbol.values()))
+
+            if self.is_multi_timeframe:
+                for symbol in holdout_original_per_symbol:
+                    holdout_per_symbol_metrics[symbol] = {}
+                    holdout_data_usage_info[symbol] = {}
+                    for timeframe in holdout_original_per_symbol[symbol]:
+                        holdout_per_symbol_metrics[symbol][timeframe] = {
+                            'original': holdout_original_per_symbol[symbol].get(timeframe, BacktestMetrics()),
+                            'optimized': holdout_best_per_symbol.get(symbol, {}).get(timeframe, BacktestMetrics())
+                        }
+                        key = (symbol, timeframe)
+                        if key in self.holdout_backtesters and key in self.holdout_data_frames:
+                            holdout_data_usage_info[symbol][timeframe] = self._extract_data_usage_info(
+                                self.holdout_backtesters[key],
+                                self.holdout_data_frames[key]
+                            )
+            else:
+                for symbol in holdout_original_per_symbol:
+                    holdout_per_symbol_metrics[symbol] = {
+                        'original': holdout_original_per_symbol.get(symbol, BacktestMetrics()),
+                        'optimized': holdout_best_per_symbol.get(symbol, BacktestMetrics())
+                    }
+                    if symbol in self.holdout_backtesters and symbol in self.holdout_data_frames:
+                        holdout_data_usage_info[symbol] = {
+                            '': self._extract_data_usage_info(
+                                self.holdout_backtesters[symbol],
+                                self.holdout_data_frames[symbol]
+                            )
+                        }
         
         # Calculate improvements
         if original_metrics.profit_factor > 0:
@@ -1116,7 +1310,13 @@ class PineOptimizer:
             stall_seconds=self.stall_seconds,
             improvement_rate_floor=self.improvement_rate_floor,
             improvement_rate_window=self.improvement_rate_window,
-            backtester_overrides=self.backtester_overrides
+            backtester_overrides=self.backtester_overrides,
+            holdout_ratio=self.holdout_ratio,
+            holdout_gap_bars=self.holdout_gap_bars_effective,
+            holdout_metrics=holdout_metrics,
+            holdout_original_metrics=holdout_original_metrics,
+            holdout_per_symbol_metrics=holdout_per_symbol_metrics,
+            holdout_data_usage_info=holdout_data_usage_info
         )
         
         # Format total time nicely for logging
@@ -1303,18 +1503,23 @@ class PineOptimizer:
         
         return issues
     
-    def _evaluate_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
-        """Evaluate a parameter set and return per-symbol metrics."""
-        symbol_metrics = {}
-        
-        for key in self.translators:
-            translator = self.translators[key]
-            backtester = self.backtesters[key]
-            
+    def _evaluate_params_per_symbol_for(
+        self,
+        params: Dict[str, Any],
+        translators: Dict[Any, PineTranslator],
+        backtesters: Dict[Any, WalkForwardBacktester]
+    ) -> Dict[str, BacktestMetrics]:
+        """Evaluate a parameter set and return per-symbol metrics for a given dataset."""
+        symbol_metrics: Dict[str, Any] = {}
+
+        for key in translators:
+            translator = translators[key]
+            backtester = backtesters[key]
+
             try:
                 indicator_result = translator.run_indicator(params)
                 metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
-                
+
                 if self.is_multi_timeframe:
                     symbol, timeframe = key
                     if symbol not in symbol_metrics:
@@ -1325,8 +1530,16 @@ class PineOptimizer:
             except Exception as e:
                 logger.debug(f"Evaluation failed for {key}: {e}")
                 continue
-        
+
         return symbol_metrics
+
+    def _evaluate_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
+        """Evaluate a parameter set and return per-symbol metrics."""
+        return self._evaluate_params_per_symbol_for(params, self.translators, self.backtesters)
+
+    def _evaluate_holdout_params_per_symbol(self, params: Dict[str, Any]) -> Dict[str, BacktestMetrics]:
+        """Evaluate a parameter set on the holdout dataset."""
+        return self._evaluate_params_per_symbol_for(params, self.holdout_translators, self.holdout_backtesters)
     
     def _evaluate_params(self, params: Dict[str, Any]) -> BacktestMetrics:
         """Evaluate a parameter set across all symbols."""

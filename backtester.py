@@ -342,6 +342,30 @@ class WalkForwardBacktester:
         acc_score = score(acc_values)
 
         return float(np.mean([pf_score, acc_score]))
+
+    def _get_train_range_for_horizon(
+        self,
+        fold: WalkForwardFold,
+        horizon: int
+    ) -> Optional[Tuple[int, int]]:
+        """Return a safe training range that avoids label leakage into embargo/test."""
+        start_idx = fold.train_start
+        boundary = min(fold.train_end, fold.test_start)
+        if fold.train_end > fold.test_start:
+            logger.warning(
+                f"Fold training end ({fold.train_end}) exceeds test start ({fold.test_start}). "
+                f"Truncating to prevent lookahead bias."
+            )
+        effective_end = boundary - horizon
+
+        if start_idx < 0 or effective_end <= start_idx:
+            logger.warning(
+                f"Insufficient training range after horizon trim: "
+                f"start={start_idx}, end={effective_end}, horizon={horizon}."
+            )
+            return None
+
+        return start_idx, effective_end
     
     def _find_optimal_horizon(
         self,
@@ -363,34 +387,8 @@ class WalkForwardBacktester:
         """
         best_horizon = self.forecast_horizons[0] if self.forecast_horizons else 24  # Default
         best_accuracy = 0.0
-        
-        # Determine data range: use training data from fold if provided
-        if fold is not None:
-            start_idx = fold.train_start
-            end_idx = fold.train_end
-            # CRITICAL VALIDATION: Ensure we don't use test data or embargo period
-            # The training period must end before the test period starts
-            if end_idx > fold.test_start:
-                logger.warning(
-                    f"Fold training end ({end_idx}) exceeds test start ({fold.test_start}). "
-                    f"Truncating to prevent lookahead bias."
-                )
-                end_idx = fold.test_start
-            
-            # Additional validation: ensure indices are valid
-            if start_idx < 0 or end_idx <= start_idx:
-                logger.error(
-                    f"Invalid fold training range: start={start_idx}, end={end_idx}. "
-                    f"Using default horizon."
-                )
-                return 24  # Return default on invalid range
-            
-            # Log that we're using only training data
-            logger.debug(
-                f"Selecting optimal horizon using training data only: "
-                f"bars {start_idx} to {end_idx} (fold test starts at {fold.test_start})"
-            )
-        else:
+
+        if fold is None:
             # No fold provided - use all data (backwards compatibility)
             # WARNING: This can cause lookahead bias if test data is included
             logger.warning(
@@ -399,8 +397,13 @@ class WalkForwardBacktester:
             )
             start_idx = None
             end_idx = None
-        
+
         for horizon in self.forecast_horizons:
+            if fold is not None:
+                train_range = self._get_train_range_for_horizon(fold, horizon)
+                if train_range is None:
+                    continue
+                start_idx, end_idx = train_range
             accuracy = self._calculate_directional_accuracy(
                 indicator_result,
                 horizon,
@@ -411,7 +414,7 @@ class WalkForwardBacktester:
             if accuracy > best_accuracy:
                 best_accuracy = accuracy
                 best_horizon = horizon
-        
+
         return best_horizon
     
     def _calculate_directional_accuracy(
@@ -508,7 +511,11 @@ class WalkForwardBacktester:
 
         Thresholds are derived from training data only to avoid lookahead bias.
         """
-        train_returns = self._future_returns[horizon][fold.train_start:fold.train_end]
+        train_range = self._get_train_range_for_horizon(fold, horizon)
+        if train_range is None:
+            return 0.0
+        train_start, train_end = train_range
+        train_returns = self._future_returns[horizon][train_start:train_end]
         train_returns = train_returns[~np.isnan(train_returns)]
 
         if len(train_returns) < 50:
@@ -535,7 +542,7 @@ class WalkForwardBacktester:
             buy_sigs = indicator_result.buy_signals[fold.test_start:effective_end]
             sell_sigs = indicator_result.sell_signals[fold.test_start:effective_end]
         else:
-            train_signal = indicator_result.combined_signal[fold.train_start:fold.train_end]
+            train_signal = indicator_result.combined_signal[train_start:train_end]
             train_signal = train_signal[~np.isnan(train_signal)]
             if len(train_signal) < 50:
                 return 0.0

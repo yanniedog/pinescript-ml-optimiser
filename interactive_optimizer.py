@@ -688,6 +688,8 @@ def run_batch_optimization(dm: DataManager):
                     "improvement_rate_floor": getattr(result, "improvement_rate_floor", 0.0),
                     "improvement_rate_window": getattr(result, "improvement_rate_window", 0),
                     "backtester_overrides": getattr(result, "backtester_overrides", {}),
+                    "holdout_ratio": getattr(result, "holdout_ratio", 0.0),
+                    "holdout_gap_bars": getattr(result, "holdout_gap_bars", 0),
                 },
             })
     

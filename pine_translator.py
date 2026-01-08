@@ -257,6 +257,16 @@ class PineTranslator:
         else:
             # Generic indicator - use signal detection
             return self._run_generic_indicator()
+
+    @staticmethod
+    def _normalize_signal_causal(values: np.ndarray) -> np.ndarray:
+        """Causally normalize a signal using an expanding max of absolute values."""
+        abs_vals = np.abs(values)
+        abs_vals = np.nan_to_num(abs_vals, nan=0.0, posinf=0.0, neginf=0.0)
+        running_max = np.maximum.accumulate(abs_vals)
+        running_max = np.where(running_max > 0, running_max, 1.0)
+        normalized = values / running_max
+        return np.clip(normalized, -1.0, 1.0)
     
     def _run_mfv_indicator(self) -> IndicatorResult:
         """
@@ -327,12 +337,8 @@ class PineTranslator:
         buy_signals = ta.crossover(combined_mfv, np.zeros_like(combined_mfv))
         sell_signals = ta.crossunder(combined_mfv, np.zeros_like(combined_mfv))
         
-        # Normalize combined signal to -1 to 1
-        max_val = np.nanmax(np.abs(combined_mfv))
-        if max_val > 0:
-            combined_signal = combined_mfv / max_val
-        else:
-            combined_signal = np.zeros_like(combined_mfv)
+        # Normalize combined signal to -1 to 1 using causal scaling
+        combined_signal = self._normalize_signal_causal(combined_mfv)
         
         return IndicatorResult(
             main_values=combined_mfv,
@@ -536,12 +542,8 @@ class PineTranslator:
             buy_signals = ta.crossover(main_values, zero_line)
             sell_signals = ta.crossunder(main_values, zero_line)
         
-        # Normalize
-        max_val = np.nanmax(np.abs(main_values))
-        if max_val > 0:
-            combined_signal = np.clip(main_values / max_val, -1, 1)
-        else:
-            combined_signal = np.zeros(self.length)
+        # Normalize using causal scaling (avoids global lookahead)
+        combined_signal = self._normalize_signal_causal(main_values)
         
         return IndicatorResult(
             main_values=main_values,
@@ -601,4 +603,3 @@ if __name__ == "__main__":
         print(f"Sell signals: {np.sum(indicator_result.sell_signals)}")
     else:
         print("Usage: python pine_translator.py <pine_script_file>")
-
