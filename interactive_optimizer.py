@@ -617,50 +617,91 @@ def run_batch_optimization(dm: DataManager):
         print("\n[ERROR] No indicators eligible for optimization.")
         return
     
-    # Ask for timeout
+    # Ask for time budget
     options = {}
-    print()
-    while True:
-        timeout_input = input("Total minutes to split across all indicators? [5]: ").strip()
-        if not timeout_input:
-            timeout_minutes = 5.0
-            break
-        try:
-            timeout_minutes = float(timeout_input)
-            if timeout_minutes > 0:
-                break
-            else:
-                print("[ERROR] Please enter a positive number")
-        except ValueError:
-            print("[ERROR] Please enter a valid number")
-    
-    total_seconds = int(timeout_minutes * 60)
     min_per_indicator_seconds = 60
-    max_indicators = max(1, total_seconds // min_per_indicator_seconds)
-    if max_indicators < len(eligible_files):
-        print(
-            f"\n[INFO] Time budget allows {max_indicators} indicator(s) at "
-            f"{min_per_indicator_seconds}s each. Limiting run to first "
-            f"{max_indicators} indicators."
-        )
-        eligible_files = eligible_files[:max_indicators]
+    print()
+    print("Time budget mode:")
+    print("  [1] Total minutes split across all indicators")
+    print("  [2] Minutes per indicator (each indicator gets full time)")
+    while True:
+        budget_input = input("  Choose option [1]: ").strip()
+        if not budget_input:
+            budget_input = "1"
+        if budget_input in ["1", "2"]:
+            break
+        print("[ERROR] Please enter 1 or 2")
 
-    base_seconds = total_seconds // len(eligible_files)
-    extra_seconds = total_seconds % len(eligible_files)
-    per_indicator_budgets = [
-        base_seconds + (1 if i < extra_seconds else 0)
-        for i in range(len(eligible_files))
-    ]
+    budget_mode = "total" if budget_input == "1" else "per_indicator"
+    timeout_minutes = 0.0
+    per_indicator_minutes = 0.0
+    per_indicator_seconds = None
+
+    if budget_mode == "total":
+        while True:
+            timeout_input = input("Total minutes to split across all indicators? [5]: ").strip()
+            if not timeout_input:
+                timeout_minutes = 5.0
+                break
+            try:
+                timeout_minutes = float(timeout_input)
+                if timeout_minutes > 0:
+                    break
+                else:
+                    print("[ERROR] Please enter a positive number")
+            except ValueError:
+                print("[ERROR] Please enter a valid number")
+        
+        total_seconds = int(timeout_minutes * 60)
+        max_indicators = max(1, total_seconds // min_per_indicator_seconds)
+        if max_indicators < len(eligible_files):
+            print(
+                f"\n[INFO] Time budget allows {max_indicators} indicator(s) at "
+                f"{min_per_indicator_seconds}s each. Limiting run to first "
+                f"{max_indicators} indicators."
+            )
+            eligible_files = eligible_files[:max_indicators]
+
+        base_seconds = total_seconds // len(eligible_files)
+        extra_seconds = total_seconds % len(eligible_files)
+        per_indicator_budgets = [
+            base_seconds + (1 if i < extra_seconds else 0)
+            for i in range(len(eligible_files))
+        ]
+    else:
+        while True:
+            per_indicator_input = input("Minutes per indicator? [5]: ").strip()
+            if not per_indicator_input:
+                per_indicator_minutes = 5.0
+                break
+            try:
+                per_indicator_minutes = float(per_indicator_input)
+                if per_indicator_minutes > 0:
+                    break
+                else:
+                    print("[ERROR] Please enter a positive number")
+            except ValueError:
+                print("[ERROR] Please enter a valid number")
+
+        per_indicator_seconds = int(per_indicator_minutes * 60)
+        total_seconds = per_indicator_seconds * len(eligible_files)
+        per_indicator_budgets = [per_indicator_seconds] * len(eligible_files)
+
     options['timeout'] = per_indicator_budgets[0] if per_indicator_budgets else total_seconds
     options['max_trials'] = None
     
     print(f"\nBatch optimization configured:")
-    print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
+    print(f"  - Budget mode: {budget_mode.replace('_', ' ')}")
     print(f"  - Indicators: {len(eligible_files)}")
-    print(
-        f"  - Time per indicator: {min(per_indicator_budgets)/60:.2f}–"
-        f"{max(per_indicator_budgets)/60:.2f} minute(s)"
-    )
+    if budget_mode == "total":
+        print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
+        print(
+            f"  - Time per indicator: {min(per_indicator_budgets)/60:.2f}–"
+            f"{max(per_indicator_budgets)/60:.2f} minute(s)"
+        )
+    else:
+        print(f"  - Time per indicator: {per_indicator_minutes:.1f} minute(s)")
+        print(f"  - Total time (all indicators): {total_seconds/60:.1f} minute(s)")
     print(f"  - Trials: unlimited (will run as many as possible until time limit)")
     print(f"  - Early stop: disabled (uses full timeout per indicator)")
     print(f"  - Press Q anytime to stop early and use current best results")
@@ -780,10 +821,12 @@ def run_batch_optimization(dm: DataManager):
         "indicator_directory": str(indicator_dir),
         "interval": options.get("interval"),
         "symbols": options.get("symbols", "all available"),
+        "budget_mode": budget_mode,
         "total_timeout_seconds": total_seconds,
         "timeout_seconds_per_indicator_min": min(per_indicator_budgets) if per_indicator_budgets else 0,
         "timeout_seconds_per_indicator_max": max(per_indicator_budgets) if per_indicator_budgets else 0,
         "min_per_indicator_seconds": min_per_indicator_seconds,
+        "per_indicator_seconds": per_indicator_seconds,
         "generated_all": generated,
         "total_indicators": len(pine_files),
         "eligible_indicators": len(eligible_files),

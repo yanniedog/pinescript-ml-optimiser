@@ -5,3 +5,4 @@ __pycache__
 !MACD_demo_pinescript.pine
 !requirements.txt
 *.log
+backup
