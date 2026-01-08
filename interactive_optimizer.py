@@ -306,6 +306,33 @@ def _serialize_metrics(metrics):
     }
 
 
+def _json_safe_value(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _serialize_fold_details(folds):
+    if not folds:
+        return []
+    serialized = []
+    for fold in folds:
+        serialized.append({k: _json_safe_value(v) for k, v in fold.items()})
+    return serialized
+
+
 def _serialize_per_symbol_metrics(per_symbol_metrics):
     if not per_symbol_metrics:
         return {}
@@ -336,16 +363,16 @@ def _serialize_data_usage_info(data_usage_info):
         serialized[symbol] = {}
         for timeframe, info in timeframes.items():
             serialized[symbol][timeframe] = {
-                "total_bars": info.total_bars,
-                "date_range": [str(info.date_range[0]), str(info.date_range[1])],
-                "n_folds": info.n_folds,
-                "train_ratio": info.train_ratio,
-                "embargo_bars": info.embargo_bars,
-                "folds": info.folds,
-                "total_train_bars": info.total_train_bars,
-                "total_test_bars": info.total_test_bars,
-                "total_embargo_bars": info.total_embargo_bars,
-                "unused_bars": info.unused_bars,
+                "total_bars": _json_safe_value(info.total_bars),
+                "date_range": [_json_safe_value(info.date_range[0]), _json_safe_value(info.date_range[1])],
+                "n_folds": _json_safe_value(info.n_folds),
+                "train_ratio": _json_safe_value(info.train_ratio),
+                "embargo_bars": _json_safe_value(info.embargo_bars),
+                "folds": _serialize_fold_details(info.folds),
+                "total_train_bars": _json_safe_value(info.total_train_bars),
+                "total_test_bars": _json_safe_value(info.total_test_bars),
+                "total_embargo_bars": _json_safe_value(info.total_embargo_bars),
+                "unused_bars": _json_safe_value(info.unused_bars),
                 "potential_bias_issues": info.potential_bias_issues,
             }
     return serialized
@@ -360,7 +387,7 @@ def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, re
         "run": run_info,
         "indicators": results,
     }
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    json_path.write_text(json.dumps(payload, indent=2, default=_json_safe_value), encoding="utf-8")
     
     # Build text report
     lines = []
