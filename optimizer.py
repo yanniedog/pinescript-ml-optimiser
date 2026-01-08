@@ -158,9 +158,9 @@ class RealtimeBestPlotter:
             self._colors = list(cm.tab20.colors)
             self._plt.ion()
             self._fig, self._ax = self._plt.subplots()
-            self._ax.set_title("Best Objective Over Time")
+            self._ax.set_title("Best Objective Improvement vs Baseline")
             self._ax.set_xlabel("Elapsed time (s)")
-            self._ax.set_ylabel("Objective")
+            self._ax.set_ylabel("Objective Delta (best - baseline)")
             self._ax.grid(True, alpha=0.3)
             self._fig.tight_layout()
             self._fig.show()
@@ -224,7 +224,7 @@ class RealtimeBestPlotter:
                 marker='x',
                 markersize=6,
                 alpha=0.7,
-                label=f"{indicator_name} baseline",
+                label=f"{indicator_name} baseline (0)",
                 color=color
             )
             self._baseline_markers[indicator_name] = baseline
@@ -232,7 +232,7 @@ class RealtimeBestPlotter:
 
         series = self._series.get(indicator_name)
         elapsed = series["x"][-1] if series and series["x"] else 0.0
-        baseline.set_data([elapsed], [objective])
+        baseline.set_data([elapsed], [0.0])
         self._fig.canvas.draw_idle()
         self._fig.canvas.flush_events()
 
@@ -255,9 +255,11 @@ class RealtimeBestPlotter:
             return
         self._best_objectives[indicator_name] = objective
 
+        baseline_value = self._baseline_values.get(indicator_name)
+        delta = objective - baseline_value if baseline_value is not None else objective
         series = self._series.setdefault(indicator_name, {"x": [], "y": []})
         series["x"].append(elapsed)
-        series["y"].append(objective)
+        series["y"].append(delta)
 
         line = self._lines.get(indicator_name)
         if line is None:
@@ -275,10 +277,9 @@ class RealtimeBestPlotter:
             self._ax.legend(loc="best", fontsize=8)
 
         line.set_data(series["x"], series["y"])
-        baseline_value = self._baseline_values.get(indicator_name)
         baseline = self._baseline_markers.get(indicator_name)
-        if baseline_value is not None and baseline is not None:
-            baseline.set_data([elapsed], [baseline_value])
+        if baseline is not None:
+            baseline.set_data([elapsed], [0.0])
         self._ax.relim()
         self._ax.autoscale_view()
         self._fig.canvas.draw_idle()
@@ -667,6 +668,7 @@ class PineOptimizer:
         self.user_stopped = False
         self.last_improvement_trial = None
         self.last_improvement_time = None
+        self._plot_initialized = False
 
     def _parse_interval_seconds(self, interval: str) -> Optional[int]:
         """Convert interval string (e.g., 1h, 4h, 1d) to seconds."""
@@ -825,6 +827,10 @@ class PineOptimizer:
             baseline = improvement_info['baseline_objective']
 
             if self.realtime_plotter:
+                if not self._plot_initialized:
+                    self.realtime_plotter.start_indicator(self.indicator_name)
+                    self.realtime_plotter.set_baseline(self.indicator_name, baseline)
+                    self._plot_initialized = True
                 self.realtime_plotter.update(self.indicator_name, avg_objective)
             
             # Format sign for improvement vs original
@@ -929,9 +935,7 @@ class PineOptimizer:
         # Start progress tracking with original config as baseline
         self.progress_tracker.set_baseline(original_objective, self.original_params)
         self.progress_tracker.start()
-        if self.realtime_plotter:
-            self.realtime_plotter.start_indicator(self.indicator_name)
-            self.realtime_plotter.set_baseline(self.indicator_name, original_objective)
+        self._plot_initialized = False
         self.last_improvement_trial = 0
         self.last_improvement_time = self.start_time
         if self.stall_seconds is None:
