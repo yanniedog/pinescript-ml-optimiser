@@ -133,9 +133,13 @@ class RealtimeBestPlotter:
         self._ax = None
         self._lines = {}
         self._series = {}
+        self._indicator_colors = {}
+        self._baseline_values = {}
+        self._baseline_markers = {}
         self._colors = []
         self._color_index = 0
-        self._start_time = None
+        self._start_times = {}
+        self._best_objectives = {}
 
     def _ensure_ready(self) -> bool:
         if self._init_attempted:
@@ -161,7 +165,6 @@ class RealtimeBestPlotter:
             self._fig.tight_layout()
             self._fig.show()
             self._fig.canvas.draw()
-            self._start_time = time.time()
             self._enabled = True
             return True
         except Exception as exc:
@@ -169,14 +172,88 @@ class RealtimeBestPlotter:
             self._enabled = False
             return False
 
+    def _get_indicator_color(self, indicator_name: str):
+        color = self._indicator_colors.get(indicator_name)
+        if color is not None:
+            return color
+        if not self._colors:
+            color = (0.2, 0.2, 0.2)
+        else:
+            color = self._colors[self._color_index % len(self._colors)]
+            self._color_index += 1
+        self._indicator_colors[indicator_name] = color
+        return color
+
+    def start_indicator(self, indicator_name: str) -> None:
+        if not self._ensure_ready():
+            return
+        now = time.time()
+        self._start_times[indicator_name] = now
+        self._best_objectives.pop(indicator_name, None)
+        self._baseline_values.pop(indicator_name, None)
+
+        series = self._series.get(indicator_name)
+        if series:
+            series["x"].clear()
+            series["y"].clear()
+            line = self._lines.get(indicator_name)
+            if line is not None:
+                line.set_data([], [])
+            baseline = self._baseline_markers.get(indicator_name)
+            if baseline is not None:
+                baseline.set_data([], [])
+            self._ax.relim()
+            self._ax.autoscale_view()
+            self._fig.canvas.draw_idle()
+            self._fig.canvas.flush_events()
+
+    def set_baseline(self, indicator_name: str, objective: float) -> None:
+        if not self._ensure_ready():
+            return
+        if not np.isfinite(objective):
+            return
+
+        self._baseline_values[indicator_name] = objective
+        baseline = self._baseline_markers.get(indicator_name)
+        if baseline is None:
+            color = self._get_indicator_color(indicator_name)
+            (baseline,) = self._ax.plot(
+                [],
+                [],
+                linestyle='None',
+                marker='x',
+                markersize=6,
+                alpha=0.7,
+                label=f"{indicator_name} baseline",
+                color=color
+            )
+            self._baseline_markers[indicator_name] = baseline
+            self._ax.legend(loc="best", fontsize=8)
+
+        series = self._series.get(indicator_name)
+        elapsed = series["x"][-1] if series and series["x"] else 0.0
+        baseline.set_data([elapsed], [objective])
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+
     def update(self, indicator_name: str, objective: float) -> None:
         if not self._ensure_ready():
             return
 
         now = time.time()
-        if self._start_time is None:
-            self._start_time = now
-        elapsed = now - self._start_time
+        start_time = self._start_times.get(indicator_name)
+        if start_time is None:
+            start_time = now
+            self._start_times[indicator_name] = start_time
+        elapsed = now - start_time
+
+        if not np.isfinite(objective):
+            return
+
+        best_objective = self._best_objectives.get(indicator_name)
+        if best_objective is not None and objective <= best_objective:
+            return
+        self._best_objectives[indicator_name] = objective
 
         series = self._series.setdefault(indicator_name, {"x": [], "y": []})
         series["x"].append(elapsed)
@@ -184,10 +261,7 @@ class RealtimeBestPlotter:
 
         line = self._lines.get(indicator_name)
         if line is None:
-            if not self._colors:
-                self._colors = [(0.2, 0.2, 0.2)]
-            color = self._colors[self._color_index % len(self._colors)]
-            self._color_index += 1
+            color = self._get_indicator_color(indicator_name)
             (line,) = self._ax.plot(
                 [],
                 [],
@@ -201,6 +275,10 @@ class RealtimeBestPlotter:
             self._ax.legend(loc="best", fontsize=8)
 
         line.set_data(series["x"], series["y"])
+        baseline_value = self._baseline_values.get(indicator_name)
+        baseline = self._baseline_markers.get(indicator_name)
+        if baseline_value is not None and baseline is not None:
+            baseline.set_data([elapsed], [baseline_value])
         self._ax.relim()
         self._ax.autoscale_view()
         self._fig.canvas.draw_idle()
@@ -851,6 +929,9 @@ class PineOptimizer:
         # Start progress tracking with original config as baseline
         self.progress_tracker.set_baseline(original_objective, self.original_params)
         self.progress_tracker.start()
+        if self.realtime_plotter:
+            self.realtime_plotter.start_indicator(self.indicator_name)
+            self.realtime_plotter.set_baseline(self.indicator_name, original_objective)
         self.last_improvement_trial = 0
         self.last_improvement_time = self.start_time
         if self.stall_seconds is None:
