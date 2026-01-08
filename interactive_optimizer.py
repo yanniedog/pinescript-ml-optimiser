@@ -14,6 +14,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import optimize_indicator as optimize_module
 from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES, print_available_data
+from pine_parser import parse_pine_script
+from optimizer import get_optimizable_params
 import argparse
 import json
 import time
@@ -579,14 +581,38 @@ def run_batch_optimization(dm: DataManager):
     if not pine_files:
         print(f"\n[ERROR] No Pine Script files found in: {indicator_dir}")
         return
-    
+
+    eligible_files = []
+    ineligible = []
+    for pine_file in pine_files:
+        try:
+            parse_result = parse_pine_script(str(pine_file))
+            optimizable_params = get_optimizable_params(parse_result.parameters)
+            if len(optimizable_params) >= 2:
+                eligible_files.append(pine_file)
+            else:
+                ineligible.append((pine_file.name, len(optimizable_params)))
+        except Exception as exc:
+            ineligible.append((pine_file.name, f"parse error: {exc}"))
+
     print(f"\nFound {len(pine_files)} Pine Script files in {indicator_dir}")
+    print(f"Eligible for optimization: {len(eligible_files)}")
+    if ineligible:
+        print(f"Skipped (insufficient params or parse errors): {len(ineligible)}")
+        for name, reason in ineligible[:10]:
+            print(f"  - {name}: {reason}")
+        if len(ineligible) > 10:
+            print(f"  ... and {len(ineligible) - 10} more")
+
+    if not eligible_files:
+        print("\n[ERROR] No indicators eligible for optimization.")
+        return
     
     # Ask for timeout
     options = {}
     print()
     while True:
-        timeout_input = input("How many minutes should each optimization run? [5]: ").strip()
+        timeout_input = input("Total minutes to split across all indicators? [5]: ").strip()
         if not timeout_input:
             timeout_minutes = 5.0
             break
@@ -599,11 +625,15 @@ def run_batch_optimization(dm: DataManager):
         except ValueError:
             print("[ERROR] Please enter a valid number")
     
-    options['timeout'] = int(timeout_minutes * 60)
+    total_seconds = int(timeout_minutes * 60)
+    per_indicator_seconds = max(1, total_seconds // len(eligible_files))
+    options['timeout'] = per_indicator_seconds
     options['max_trials'] = None
     
     print(f"\nBatch optimization configured:")
-    print(f"  - Time limit per indicator: {timeout_minutes:.1f} minute(s)")
+    print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
+    print(f"  - Indicators: {len(eligible_files)}")
+    print(f"  - Time per indicator: {per_indicator_seconds/60:.2f} minute(s)")
     print(f"  - Trials: unlimited (will run as many as possible until time limit)")
     print(f"  - Press Q anytime to stop early and use current best results")
     
@@ -620,9 +650,9 @@ def run_batch_optimization(dm: DataManager):
     rankings = []
     results = []
     
-    for i, pine_file in enumerate(pine_files, 1):
+    for i, pine_file in enumerate(eligible_files, 1):
         print(f"\n{'='*70}")
-        print(f"Processing {i}/{len(pine_files)}: {pine_file.name}")
+        print(f"Processing {i}/{len(eligible_files)}: {pine_file.name}")
         print("="*70)
         
         original_argv = sys.argv
@@ -716,9 +746,11 @@ def run_batch_optimization(dm: DataManager):
         "indicator_directory": str(indicator_dir),
         "interval": options.get("interval"),
         "symbols": options.get("symbols", "all available"),
-        "timeout_seconds": options.get("timeout"),
+        "total_timeout_seconds": total_seconds,
+        "timeout_seconds_per_indicator": options.get("timeout"),
         "generated_all": generated,
         "total_indicators": len(pine_files),
+        "eligible_indicators": len(eligible_files),
     }
     summary_dir = Path("optimized_outputs") / "summary"
     write_unified_report(
