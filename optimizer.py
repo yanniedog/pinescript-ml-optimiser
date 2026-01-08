@@ -135,7 +135,6 @@ class RealtimeBestPlotter:
         self._series = {}
         self._indicator_colors = {}
         self._baseline_values = {}
-        self._baseline_markers = {}
         self._colors = []
         self._color_index = 0
         self._start_times = {}
@@ -199,42 +198,16 @@ class RealtimeBestPlotter:
             line = self._lines.get(indicator_name)
             if line is not None:
                 line.set_data([], [])
-            baseline = self._baseline_markers.get(indicator_name)
-            if baseline is not None:
-                baseline.set_data([], [])
             self._ax.relim()
             self._ax.autoscale_view()
             self._fig.canvas.draw_idle()
             self._fig.canvas.flush_events()
 
     def set_baseline(self, indicator_name: str, objective: float) -> None:
-        if not self._ensure_ready():
-            return
         if not np.isfinite(objective):
             return
 
         self._baseline_values[indicator_name] = objective
-        baseline = self._baseline_markers.get(indicator_name)
-        if baseline is None:
-            color = self._get_indicator_color(indicator_name)
-            (baseline,) = self._ax.plot(
-                [],
-                [],
-                linestyle='None',
-                marker='x',
-                markersize=6,
-                alpha=0.7,
-                label=f"{indicator_name} baseline (0)",
-                color=color
-            )
-            self._baseline_markers[indicator_name] = baseline
-            self._ax.legend(loc="best", fontsize=8)
-
-        series = self._series.get(indicator_name)
-        elapsed = series["x"][-1] if series and series["x"] else 0.0
-        baseline.set_data([elapsed], [0.0])
-        self._fig.canvas.draw_idle()
-        self._fig.canvas.flush_events()
 
     def update(self, indicator_name: str, objective: float) -> None:
         if not self._ensure_ready():
@@ -277,9 +250,6 @@ class RealtimeBestPlotter:
             self._ax.legend(loc="best", fontsize=8)
 
         line.set_data(series["x"], series["y"])
-        baseline = self._baseline_markers.get(indicator_name)
-        if baseline is not None:
-            baseline.set_data([elapsed], [0.0])
         self._ax.relim()
         self._ax.autoscale_view()
         self._fig.canvas.draw_idle()
