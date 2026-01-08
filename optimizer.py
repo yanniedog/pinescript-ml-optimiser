@@ -122,6 +122,102 @@ class KeyboardMonitor:
                 pass
 
 
+class RealtimeBestPlotter:
+    """Realtime plot of best objective improvements."""
+
+    def __init__(self):
+        self._init_attempted = False
+        self._enabled = False
+        self._plt = None
+        self._fig = None
+        self._ax = None
+        self._lines = {}
+        self._series = {}
+        self._colors = []
+        self._color_index = 0
+        self._start_time = None
+
+    def _ensure_ready(self) -> bool:
+        if self._init_attempted:
+            return self._enabled
+        self._init_attempted = True
+        try:
+            import matplotlib.pyplot as plt
+            from matplotlib import cm
+        except Exception as exc:
+            logger.info("Realtime plot disabled (matplotlib not available): %s", exc)
+            self._enabled = False
+            return False
+
+        try:
+            self._plt = plt
+            self._colors = list(cm.tab20.colors)
+            self._plt.ion()
+            self._fig, self._ax = self._plt.subplots()
+            self._ax.set_title("Best Objective Over Time")
+            self._ax.set_xlabel("Elapsed time (s)")
+            self._ax.set_ylabel("Objective")
+            self._ax.grid(True, alpha=0.3)
+            self._fig.tight_layout()
+            self._fig.show()
+            self._fig.canvas.draw()
+            self._start_time = time.time()
+            self._enabled = True
+            return True
+        except Exception as exc:
+            logger.info("Realtime plot disabled (matplotlib backend error): %s", exc)
+            self._enabled = False
+            return False
+
+    def update(self, indicator_name: str, objective: float) -> None:
+        if not self._ensure_ready():
+            return
+
+        now = time.time()
+        if self._start_time is None:
+            self._start_time = now
+        elapsed = now - self._start_time
+
+        series = self._series.setdefault(indicator_name, {"x": [], "y": []})
+        series["x"].append(elapsed)
+        series["y"].append(objective)
+
+        line = self._lines.get(indicator_name)
+        if line is None:
+            if not self._colors:
+                self._colors = [(0.2, 0.2, 0.2)]
+            color = self._colors[self._color_index % len(self._colors)]
+            self._color_index += 1
+            (line,) = self._ax.plot(
+                [],
+                [],
+                marker='o',
+                linewidth=1.5,
+                markersize=4,
+                label=indicator_name,
+                color=color
+            )
+            self._lines[indicator_name] = line
+            self._ax.legend(loc="best", fontsize=8)
+
+        line.set_data(series["x"], series["y"])
+        self._ax.relim()
+        self._ax.autoscale_view()
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        self._plt.pause(0.001)
+
+
+_REALTIME_PLOTTER = None
+
+
+def get_realtime_plotter() -> RealtimeBestPlotter:
+    global _REALTIME_PLOTTER
+    if _REALTIME_PLOTTER is None:
+        _REALTIME_PLOTTER = RealtimeBestPlotter()
+    return _REALTIME_PLOTTER
+
+
 class OptimizationProgressTracker:
     """Track and report progressive improvement during optimization.
     
@@ -440,6 +536,8 @@ class PineOptimizer:
         self.stall_seconds = stall_seconds
         self.improvement_rate_floor = improvement_rate_floor
         self.improvement_rate_window = max(1, improvement_rate_window)
+        self.indicator_name = parse_result.indicator_name or "Indicator"
+        self.realtime_plotter = get_realtime_plotter()
         
         # Extract parameter info
         self.parameters = parse_result.parameters
@@ -647,6 +745,9 @@ class PineOptimizer:
             pct_vs_original = improvement_info['pct_improvement_total']
             rate_pct = improvement_info['improvement_rate_pct']
             baseline = improvement_info['baseline_objective']
+
+            if self.realtime_plotter:
+                self.realtime_plotter.update(self.indicator_name, avg_objective)
             
             # Format sign for improvement vs original
             sign = "+" if pct_vs_original >= 0 else ""
