@@ -267,7 +267,16 @@ def build_args(pine_file, options):
     
     if 'timeout' in options:
         args.extend(['--timeout', str(options['timeout'])])
-    
+
+    if 'min_runtime_seconds' in options and options['min_runtime_seconds'] is not None:
+        args.extend(['--min-runtime-seconds', str(options['min_runtime_seconds'])])
+
+    if 'stall_seconds' in options and options['stall_seconds'] is not None:
+        args.extend(['--stall-seconds', str(options['stall_seconds'])])
+
+    if 'improvement_rate_floor' in options and options['improvement_rate_floor'] is not None:
+        args.extend(['--improvement-rate-floor', str(options['improvement_rate_floor'])])
+
     if 'symbols' in options:
         args.extend(['--symbols', options['symbols']])
     
@@ -626,15 +635,34 @@ def run_batch_optimization(dm: DataManager):
             print("[ERROR] Please enter a valid number")
     
     total_seconds = int(timeout_minutes * 60)
-    per_indicator_seconds = max(1, total_seconds // len(eligible_files))
-    options['timeout'] = per_indicator_seconds
+    min_per_indicator_seconds = 60
+    max_indicators = max(1, total_seconds // min_per_indicator_seconds)
+    if max_indicators < len(eligible_files):
+        print(
+            f"\n[INFO] Time budget allows {max_indicators} indicator(s) at "
+            f"{min_per_indicator_seconds}s each. Limiting run to first "
+            f"{max_indicators} indicators."
+        )
+        eligible_files = eligible_files[:max_indicators]
+
+    base_seconds = total_seconds // len(eligible_files)
+    extra_seconds = total_seconds % len(eligible_files)
+    per_indicator_budgets = [
+        base_seconds + (1 if i < extra_seconds else 0)
+        for i in range(len(eligible_files))
+    ]
+    options['timeout'] = per_indicator_budgets[0] if per_indicator_budgets else total_seconds
     options['max_trials'] = None
     
     print(f"\nBatch optimization configured:")
     print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
     print(f"  - Indicators: {len(eligible_files)}")
-    print(f"  - Time per indicator: {per_indicator_seconds/60:.2f} minute(s)")
+    print(
+        f"  - Time per indicator: {min(per_indicator_budgets)/60:.2f}–"
+        f"{max(per_indicator_budgets)/60:.2f} minute(s)"
+    )
     print(f"  - Trials: unlimited (will run as many as possible until time limit)")
+    print(f"  - Early stop: disabled (uses full timeout per indicator)")
     print(f"  - Press Q anytime to stop early and use current best results")
     
     customize = input("\nCustomize data settings (timeframe, symbols)? [n]: ").strip().lower()
@@ -654,6 +682,12 @@ def run_batch_optimization(dm: DataManager):
         print(f"\n{'='*70}")
         print(f"Processing {i}/{len(eligible_files)}: {pine_file.name}")
         print("="*70)
+
+        indicator_timeout = per_indicator_budgets[i - 1]
+        options['timeout'] = indicator_timeout
+        options['min_runtime_seconds'] = indicator_timeout
+        options['stall_seconds'] = indicator_timeout + 1
+        options['improvement_rate_floor'] = 0.0
         
         original_argv = sys.argv
         try:
@@ -747,7 +781,9 @@ def run_batch_optimization(dm: DataManager):
         "interval": options.get("interval"),
         "symbols": options.get("symbols", "all available"),
         "total_timeout_seconds": total_seconds,
-        "timeout_seconds_per_indicator": options.get("timeout"),
+        "timeout_seconds_per_indicator_min": min(per_indicator_budgets) if per_indicator_budgets else 0,
+        "timeout_seconds_per_indicator_max": max(per_indicator_budgets) if per_indicator_budgets else 0,
+        "min_per_indicator_seconds": min_per_indicator_seconds,
         "generated_all": generated,
         "total_indicators": len(pine_files),
         "eligible_indicators": len(eligible_files),

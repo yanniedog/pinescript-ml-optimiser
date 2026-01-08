@@ -127,6 +127,24 @@ Examples:
         help='Enable verbose logging'
     )
     parser.add_argument(
+        '--min-runtime-seconds',
+        type=int,
+        default=None,
+        help='Minimum runtime before early-stop checks (default: optimizer setting)'
+    )
+    parser.add_argument(
+        '--stall-seconds',
+        type=int,
+        default=None,
+        help='Stop if no improvement for this many seconds (default: optimizer setting)'
+    )
+    parser.add_argument(
+        '--improvement-rate-floor',
+        type=float,
+        default=None,
+        help='Minimum improvement rate to continue (default: optimizer setting)'
+    )
+    parser.add_argument(
         '--holdout-ratio',
         type=float,
         default=0.2,
@@ -323,6 +341,14 @@ Examples:
         print(f"         Watch improvement rate - diminishing returns suggest stopping early")
         print()
         
+        optimizer_kwargs = {}
+        if args.min_runtime_seconds is not None:
+            optimizer_kwargs['min_runtime_seconds'] = args.min_runtime_seconds
+        if args.stall_seconds is not None:
+            optimizer_kwargs['stall_seconds'] = args.stall_seconds
+        if args.improvement_rate_floor is not None:
+            optimizer_kwargs['improvement_rate_floor'] = args.improvement_rate_floor
+
         optimization_result = optimize_indicator(
             parse_result,
             data,
@@ -331,7 +357,8 @@ Examples:
             timeout_seconds=args.timeout,
             strategy=DEFAULT_OPTIMIZATION_STRATEGY,
             holdout_ratio=args.holdout_ratio,
-            holdout_gap_bars=args.holdout_gap_bars
+            holdout_gap_bars=args.holdout_gap_bars,
+            **optimizer_kwargs
         )
         
         # Step 4: Generate Optimized Pine Script
