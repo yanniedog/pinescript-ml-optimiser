@@ -568,7 +568,8 @@ class PineOptimizer:
         improvement_rate_floor: float = 0.05,
         improvement_rate_window: int = 5,
         holdout_ratio: float = 0.2,
-        holdout_gap_bars: Optional[int] = None
+        holdout_gap_bars: Optional[int] = None,
+        indicator_label: Optional[str] = None
     ):
         """
         Initialize optimizer.
@@ -618,7 +619,7 @@ class PineOptimizer:
         self.holdout_translators = {}
         self.holdout_backtesters = {}
         self.holdout_data_frames = {}
-        self.indicator_name = parse_result.indicator_name or "Indicator"
+        self.indicator_name = indicator_label or parse_result.indicator_name or "Indicator"
         self.realtime_plotter = get_realtime_plotter()
         
         # Extract parameter info
@@ -1570,7 +1571,7 @@ def optimize_indicator(
         result = _optimize_multi_fidelity(parse_result, data, interval, **kwargs)
     else:
         optimizer = PineOptimizer(parse_result, data, interval=interval, **kwargs)
-        result = optimizer.optimize()
+    result = optimizer.optimize()
     
     # Set interval in result
     result.interval = interval

@@ -726,6 +726,40 @@ def select_datasets_for_matrix(dm: DataManager):
     return datasets
 
 
+def select_indicator_subset(eligible_files):
+    if not eligible_files:
+        return []
+
+    use_all = input("\nUse all eligible indicators? [Y/n]: ").strip().lower()
+    if use_all in ["n", "no"]:
+        mode = input("Limit by [1] count or [2] names? [1]: ").strip()
+        if not mode:
+            mode = "1"
+        if mode == "2":
+            names_input = input("Indicator names (comma-separated, match file stems): ").strip()
+            if not names_input:
+                return eligible_files
+            names = {n.strip().lower() for n in names_input.split(",") if n.strip()}
+            subset = [f for f in eligible_files if f.stem.lower() in names]
+            if not subset:
+                print("[ERROR] No indicators matched the provided names. Keeping full list.")
+                return eligible_files
+            return subset
+        else:
+            count_input = input("How many indicators to include? ").strip()
+            try:
+                count = int(count_input)
+            except ValueError:
+                print("[ERROR] Invalid number. Keeping full list.")
+                return eligible_files
+            if count <= 0:
+                print("[ERROR] Count must be positive. Keeping full list.")
+                return eligible_files
+            return eligible_files[:min(count, len(eligible_files))]
+
+    return eligible_files
+
+
 def backup_previous_outputs():
     global BACKUP_DONE
     if BACKUP_DONE:
@@ -1173,13 +1207,21 @@ def run_matrix_optimization(dm: DataManager):
     if not datasets:
         return
 
-    combos = [(pine_file, symbol, interval) for pine_file in eligible_files for symbol, interval in datasets]
+    selected_indicators = list(eligible_files)
+
+    def build_combos():
+        return [
+            (pine_file, symbol, interval)
+            for pine_file in selected_indicators
+            for symbol, interval in datasets
+        ]
+
+    combos = build_combos()
 
     if not combos:
         print("\n[ERROR] No indicator/dataset combinations to run.")
         return
 
-    min_per_combo_seconds = 60
     print()
     print("Time budget mode:")
     print("  [1] Total minutes split across all combinations")
@@ -1197,38 +1239,55 @@ def run_matrix_optimization(dm: DataManager):
     per_combo_minutes = 0.0
     per_combo_seconds = None
 
-    combos_to_run = combos
     if budget_mode == "total":
+        need_time = True
         while True:
-            timeout_input = input("Total minutes to split across all combinations? [10]: ").strip()
-            if not timeout_input:
-                timeout_minutes = 10.0
-                break
-            try:
-                timeout_minutes = float(timeout_input)
-                if timeout_minutes > 0:
-                    break
+            if need_time:
+                timeout_input = input("Total minutes to split across all combinations? [10]: ").strip()
+                if not timeout_input:
+                    timeout_minutes = 10.0
                 else:
-                    print("[ERROR] Please enter a positive number")
-            except ValueError:
-                print("[ERROR] Please enter a valid number")
+                    try:
+                        timeout_minutes = float(timeout_input)
+                        if timeout_minutes <= 0:
+                            print("[ERROR] Please enter a positive number")
+                            continue
+                    except ValueError:
+                        print("[ERROR] Please enter a valid number")
+                        continue
+                need_time = False
 
-        total_seconds = int(timeout_minutes * 60)
-        max_combos = max(1, total_seconds // min_per_combo_seconds)
-        if max_combos < len(combos):
-            print(
-                f"\n[INFO] Time budget allows {max_combos} combination(s) at "
-                f"{min_per_combo_seconds}s each. Limiting run to first "
-                f"{max_combos} combinations."
-            )
-            combos_to_run = combos[:max_combos]
+            combos = build_combos()
+            if not combos:
+                print("\n[ERROR] No indicator/dataset combinations to run.")
+                return
 
-        base_seconds = total_seconds // len(combos_to_run)
-        extra_seconds = total_seconds % len(combos_to_run)
-        per_combo_budgets = [
-            base_seconds + (1 if i < extra_seconds else 0)
-            for i in range(len(combos_to_run))
-        ]
+            total_seconds = float(timeout_minutes * 60)
+            per_combo_seconds = total_seconds / len(combos)
+
+            print("\nMatrix scope summary:")
+            print(f"  - Indicators: {len(selected_indicators)}")
+            print(f"  - Datasets: {len(datasets)}")
+            print(f"  - Total combinations: {len(combos)}")
+            print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
+            print(f"  - Time per combo: {per_combo_seconds/60:.2f} minute(s)")
+            if per_combo_seconds < 1.0:
+                print("  [WARN] Per-combo time < 1 second; results may be unstable.")
+
+            choice = input("Proceed with this allocation? [P]roceed / [T]ime / [S]cope: ").strip().lower()
+            if not choice or choice in ["p", "proceed", "y", "yes"]:
+                per_combo_budgets = [per_combo_seconds] * len(combos)
+                break
+            if choice.startswith("t"):
+                need_time = True
+                continue
+            if choice.startswith("s"):
+                datasets = select_datasets_for_matrix(dm)
+                if not datasets:
+                    return
+                selected_indicators = select_indicator_subset(eligible_files)
+                continue
+            print("[ERROR] Please enter P, T, or S.")
     else:
         while True:
             per_combo_input = input("Minutes per combination? [3]: ").strip()
@@ -1244,21 +1303,25 @@ def run_matrix_optimization(dm: DataManager):
             except ValueError:
                 print("[ERROR] Please enter a valid number")
 
-        per_combo_seconds = int(per_combo_minutes * 60)
-        total_seconds = per_combo_seconds * len(combos_to_run)
-        per_combo_budgets = [per_combo_seconds] * len(combos_to_run)
+        combos = build_combos()
+        if not combos:
+            print("\n[ERROR] No indicator/dataset combinations to run.")
+            return
+
+        per_combo_seconds = float(per_combo_minutes * 60)
+        total_seconds = per_combo_seconds * len(combos)
+        per_combo_budgets = [per_combo_seconds] * len(combos)
 
     print(f"\nMatrix optimization configured:")
     print(f"  - Budget mode: {budget_mode.replace('_', ' ')}")
-    print(f"  - Indicators: {len(eligible_files)}")
+    print(f"  - Indicators: {len(selected_indicators)}")
     print(f"  - Datasets: {len(datasets)}")
-    print(f"  - Combinations to run: {len(combos_to_run)}")
+    print(f"  - Combinations to run: {len(combos)}")
     if budget_mode == "total":
         print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
-        print(
-            f"  - Time per combo: {min(per_combo_budgets)/60:.2f}–"
-            f"{max(per_combo_budgets)/60:.2f} minute(s)"
-        )
+        print(f"  - Time per combo: {per_combo_seconds/60:.2f} minute(s)")
+        if per_combo_seconds < 1.0:
+            print("  [WARN] Per-combo time < 1 second; results may be unstable.")
     else:
         print(f"  - Time per combo: {per_combo_minutes:.1f} minute(s)")
         print(f"  - Total time (all combos): {total_seconds/60:.1f} minute(s)")
@@ -1272,9 +1335,9 @@ def run_matrix_optimization(dm: DataManager):
     data_cache = {}
     parse_cache = {}
 
-    for idx, ((pine_file, symbol, interval), combo_timeout) in enumerate(zip(combos_to_run, per_combo_budgets), 1):
+    for idx, ((pine_file, symbol, interval), combo_timeout) in enumerate(zip(combos, per_combo_budgets), 1):
         print(f"\n{'='*70}")
-        print(f"Combo {idx}/{len(combos_to_run)}: {pine_file.name} | {symbol} @ {interval}")
+        print(f"Combo {idx}/{len(combos)}: {pine_file.name} | {symbol} @ {interval}")
         print("="*70)
 
         if pine_file not in parse_cache:
@@ -1298,6 +1361,8 @@ def run_matrix_optimization(dm: DataManager):
 
         data = {symbol: data_cache[key]}
 
+        combo_label = f"{parse_result.indicator_name or pine_file.stem}:{symbol}@{interval}"
+
         try:
             result = run_optimizer(
                 parse_result,
@@ -1307,7 +1372,8 @@ def run_matrix_optimization(dm: DataManager):
                 timeout_seconds=combo_timeout,
                 min_runtime_seconds=combo_timeout,
                 stall_seconds=combo_timeout + 1,
-                improvement_rate_floor=0.0
+                improvement_rate_floor=0.0,
+                indicator_label=combo_label
             )
         except KeyboardInterrupt:
             print("\n\nMatrix optimization interrupted by user.")
@@ -1358,16 +1424,16 @@ def run_matrix_optimization(dm: DataManager):
         "symbols": symbols,
         "datasets": len(datasets),
         "combo_total": len(combos),
-        "combo_run": len(combos_to_run),
+        "combo_run": len(combos),
         "budget_mode": budget_mode,
         "total_timeout_seconds": total_seconds,
         "timeout_seconds_per_combo_min": min(per_combo_budgets) if per_combo_budgets else 0,
         "timeout_seconds_per_combo_max": max(per_combo_budgets) if per_combo_budgets else 0,
-        "min_per_combo_seconds": min_per_combo_seconds,
         "per_combo_seconds": per_combo_seconds,
         "generated_all": generated,
         "total_indicators": len(pine_files),
         "eligible_indicators": len(eligible_files),
+        "selected_indicators": len(selected_indicators),
         "skipped_no_improvement": skipped_no_improvement,
         "errors": errors,
     }
