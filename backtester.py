@@ -145,14 +145,17 @@ class WalkForwardBacktester:
         self.high = df['high'].values
         self.low = df['low'].values
         self.length = len(df)
-        
+
+        # Create folds before filtering horizons so we can size horizons to training windows
+        self.folds = self._create_folds()
+
+        # Filter horizons that cannot fit inside any fold's training window
+        self.forecast_horizons = self._filter_forecast_horizons(self.forecast_horizons)
+
         # Pre-calculate future returns for different horizons
         self._future_returns = {}
         for h in self.forecast_horizons:
             self._future_returns[h] = self._calculate_future_returns(h)
-        
-        # Create folds
-        self.folds = self._create_folds()
     
     def _calculate_future_returns(self, horizon: int) -> np.ndarray:
         """
@@ -197,6 +200,37 @@ class WalkForwardBacktester:
             ))
         
         return folds
+
+    def _filter_forecast_horizons(self, horizons: List[int]) -> List[int]:
+        """Drop horizons that cannot fit inside any fold's training window."""
+        cleaned = sorted({int(h) for h in horizons if h is not None and int(h) > 0})
+        cleaned = [h for h in cleaned if h < self.length]
+        if not cleaned:
+            return [1]
+        if not self.folds:
+            return cleaned
+
+        min_train_len = min(
+            max(0, min(fold.train_end, fold.test_start) - fold.train_start)
+            for fold in self.folds
+        )
+        max_horizon = max(min_train_len - 1, 0)
+        filtered = [h for h in cleaned if h <= max_horizon]
+        if not filtered:
+            if max_horizon >= 1:
+                filtered = [max_horizon]
+            else:
+                logger.warning(
+                    "Training windows too small for forecast horizon search; using horizon=1."
+                )
+                return [1] if self.length > 1 else []
+        if filtered != cleaned:
+            logger.info(
+                "Filtered forecast horizons to fit training windows (max=%s): %s",
+                max_horizon,
+                filtered
+            )
+        return filtered
     
     def evaluate_indicator(
         self,

@@ -114,7 +114,7 @@ def generate_pine_scripts():
          "jaw = ta.sma(hl2, j)\nteeth = ta.sma(hl2, t)\nlips = ta.sma(hl2, l)\nplot(jaw[8], 'Jaw', color=color.blue)\nplot(teeth[5], 'Teeth', color=color.red)\nplot(lips[3], 'Lips', color=color.green)"],
          
         ["Accelerator", "Accelerator Oscillator", False, [("f", 0, 5, 1, 20), ("s", 0, 34, 1, 100)], 
-         "ao = ta.sma(hl2, f) - ta.sma(hl2, s)\nac = ao - ta.sma(ao, 5)\nplot(ac, 'AC', style=plot.style_histogram, color=(ac > ac[1] ? color.green : color.red))"],
+         "ao = ta.sma(hl2, f) - ta.sma(hl2, s)\nac = ao - ta.sma(ao, 5)\nac_plot = nz(ac)\nac_prev = nz(ac[1])\nplot(ac_plot, 'AC', style=plot.style_histogram, color=(ac_plot > ac_prev ? color.green : color.red))"],
          
         ["Gator", "Gator Oscillator", False, [("j", 0, 13, 1, 50), ("t", 0, 8, 1, 30), ("l", 0, 5, 1, 20)], 
          "jaw = ta.sma(hl2, j)[8]\nteeth = ta.sma(hl2, t)[5]\nlips = ta.sma(hl2, l)[3]\nu = math.abs(jaw - teeth)\nd = -math.abs(teeth - lips)\nplot(u, 'Up', style=plot.style_histogram, color=color.green)\nplot(d, 'Down', style=plot.style_histogram, color=color.red)"],

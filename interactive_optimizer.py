@@ -736,7 +736,7 @@ def select_indicator_subset(eligible_files):
         if not mode:
             mode = "1"
         if mode == "2":
-            names_input = input("Indicator names (comma-separated, match file stems): ").strip()
+            names_input = input("Indicator names (comma-separated, match file stems; single allowed): ").strip()
             if not names_input:
                 return eligible_files
             names = {n.strip().lower() for n in names_input.split(",") if n.strip()}
@@ -1203,11 +1203,14 @@ def run_matrix_optimization(dm: DataManager):
         print("\n[ERROR] No indicators eligible for optimization.")
         return
 
+    selected_indicators = select_indicator_subset(eligible_files)
+    if not selected_indicators:
+        print("\n[ERROR] No indicators selected for optimization.")
+        return
+
     datasets = select_datasets_for_matrix(dm)
     if not datasets:
         return
-
-    selected_indicators = list(eligible_files)
 
     def build_combos():
         return [

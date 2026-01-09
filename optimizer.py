@@ -86,6 +86,25 @@ def _metric_label(metric_key: str) -> str:
     return _METRIC_DEFS.get(metric_key, {}).get("label", metric_key)
 
 
+def _format_param_value(value: Any) -> str:
+    if isinstance(value, float):
+        if value == 0.0:
+            return "0"
+        if abs(value) < 0.0001:
+            return f"{value:.2e}"
+        return f"{value:.4g}"
+    return str(value)
+
+
+def _format_params(params: Optional[Dict[str, Any]]) -> str:
+    if not params:
+        return "N/A"
+    parts = []
+    for name in sorted(params.keys()):
+        parts.append(f"{name}={_format_param_value(params[name])}")
+    return ", ".join(parts)
+
+
 def _last_non_none(values: List[Optional[float]]) -> Optional[float]:
     for val in reversed(values):
         if val is not None:
@@ -645,8 +664,9 @@ class RealtimeBestPlotter:
         if series:
             series["x"].clear()
             series["metrics"] = {}
+            series["params"] = []
         else:
-            self._series[indicator_name] = {"x": [], "metrics": {}}
+            self._series[indicator_name] = {"x": [], "metrics": {}, "params": []}
         line = self._lines.get(indicator_name)
         if line is not None:
             line.set_data([], [])
@@ -668,7 +688,13 @@ class RealtimeBestPlotter:
         if "objective_best" in baseline:
             baseline["objective_delta"] = 0.0
 
-    def update(self, indicator_name: str, objective: float, metrics: Optional[Dict[str, float]] = None) -> None:
+    def update(
+        self,
+        indicator_name: str,
+        objective: float,
+        metrics: Optional[Dict[str, float]] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not self._ensure_ready():
             return
 
@@ -695,14 +721,16 @@ class RealtimeBestPlotter:
             "objective_delta",
             metrics_map["objective_best"] - baseline_obj if baseline_obj is not None else metrics_map["objective_best"]
         )
-        series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}})
+        series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}, "params": []})
         series["x"].append(elapsed)
         for key in _METRIC_KEYS:
             series["metrics"].setdefault(key, []).append(metrics_map.get(key))
+        series["params"].append(_format_params(params))
         if len(series["x"]) > self._max_points:
             series["x"] = series["x"][-self._max_points:]
             for key in _METRIC_KEYS:
                 series["metrics"][key] = series["metrics"][key][-self._max_points:]
+            series["params"] = series["params"][-self._max_points:]
 
         line = self._lines.get(indicator_name)
         if line is None:
@@ -801,6 +829,9 @@ class PlotlyRealtimePlotter:
 
         self._port = self._find_free_port()
         self._app = Dash(__name__)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        logging.getLogger("dash").setLevel(logging.ERROR)
+        self._app.logger.setLevel(logging.ERROR)
         metric_options = [{"label": _metric_label(key), "value": key} for key in _METRIC_KEYS]
 
         self._app.layout = html.Div(
@@ -941,6 +972,7 @@ class PlotlyRealtimePlotter:
                     k: {
                         "x": list(v.get("x", [])),
                         "metrics": {mk: list(mv) for mk, mv in v.get("metrics", {}).items()},
+                        "params": list(v.get("params", [])),
                     }
                     for k, v in self._series.items()
                 }
@@ -972,10 +1004,15 @@ class PlotlyRealtimePlotter:
 
                 x_vals = points.get("x", [])
                 y_vals = points.get("metrics", {}).get(y_metric, [])
+                params_vals = points.get("params", [])
                 if not x_vals:
                     continue
                 if not y_vals:
                     continue
+                if len(params_vals) < len(x_vals):
+                    params_vals = params_vals + ["N/A"] * (len(x_vals) - len(params_vals))
+                elif len(params_vals) > len(x_vals):
+                    params_vals = params_vals[-len(x_vals):]
 
                 if band_enabled:
                     band_vals = points.get("metrics", {}).get(band_metric, [])
@@ -1002,11 +1039,13 @@ class PlotlyRealtimePlotter:
                         name=label,
                         uid=label,
                         customdata=[label] * len(x_vals),
+                        text=params_vals,
                         line={"width": 2.5},
                         marker={"size": 6, "opacity": 0.15},
                         visible="legendonly" if label in hidden_set else True,
                         hovertemplate=(
                             "combo=%{customdata}<br>"
+                            "params=%{text}<br>"
                             f"{_metric_label(y_metric)}=%{{y:.4f}}<br>"
                             f"{x_label}=%{{x:.4f}}<extra></extra>"
                         )
@@ -1136,6 +1175,10 @@ class PlotlyRealtimePlotter:
         def toggle_hidden_series(_, hidden_series):
             if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
                 return hidden_series or []
+            triggered = ctx.triggered[0] if ctx.triggered else None
+            clicks = triggered.get("value") if triggered else None
+            if not clicks:
+                return hidden_series or []
             label = ctx.triggered_id.get("label")
             if not label:
                 return hidden_series or []
@@ -1162,10 +1205,11 @@ class PlotlyRealtimePlotter:
             if not source or "points" not in source or not source["points"]:
                 return "Click a line to reveal the exact combo and values."
             point = source["points"][0]
-            combo = point.get("customdata") or point.get("text") or "N/A"
+            combo = point.get("customdata") or "N/A"
+            params = point.get("text") or "N/A"
             x_val = point.get("x")
             y_val = point.get("y")
-            return f"combo={combo} | x={x_val:.4f} | y={y_val:.4f}"
+            return f"combo={combo} | params={params} | x={x_val:.4f} | y={y_val:.4f}"
 
         def run_server():
             run_fn = getattr(self._app, "run", None)
@@ -1201,7 +1245,7 @@ class PlotlyRealtimePlotter:
             return
         with self._lock:
             self._start_times[indicator_name] = time.time()
-            self._series[indicator_name] = {"x": [], "metrics": {}}
+            self._series[indicator_name] = {"x": [], "metrics": {}, "params": []}
             self._baseline_values.pop(indicator_name, None)
             self._register_line(indicator_name)
 
@@ -1223,7 +1267,13 @@ class PlotlyRealtimePlotter:
             if "objective_best" in baseline:
                 baseline["objective_delta"] = 0.0
 
-    def update(self, indicator_name: str, objective: float, metrics: Optional[Dict[str, float]] = None) -> None:
+    def update(
+        self,
+        indicator_name: str,
+        objective: float,
+        metrics: Optional[Dict[str, float]] = None,
+        params: Optional[Dict[str, Any]] = None
+    ) -> None:
         if not self._ensure_ready():
             return
         now = time.time()
@@ -1241,14 +1291,16 @@ class PlotlyRealtimePlotter:
                 "objective_delta",
                 metrics_map["objective_best"] - baseline_obj if baseline_obj is not None else metrics_map["objective_best"]
             )
-            series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}})
+            series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}, "params": []})
             series["x"].append(elapsed)
             for key in _METRIC_KEYS:
                 series["metrics"].setdefault(key, []).append(metrics_map.get(key))
+            series["params"].append(_format_params(params))
             if len(series["x"]) > self._max_points:
                 series["x"] = series["x"][-self._max_points:]
                 for key in _METRIC_KEYS:
                     series["metrics"][key] = series["metrics"][key][-self._max_points:]
+                series["params"] = series["params"][-self._max_points:]
             if indicator_name not in self._line_meta:
                 self._register_line(indicator_name)
 
@@ -1945,13 +1997,17 @@ class PineOptimizer:
             metrics_map["objective_overall"] = calculate_objective_score(aggregated_metrics)
 
             if self.realtime_plotter:
+                params_for_plot = {
+                    p.name: params.get(p.name)
+                    for p in self.optimizable_params
+                }
                 if not self._plot_initialized:
                     self.realtime_plotter.start_indicator(self.indicator_name)
                     self.realtime_plotter.set_baseline(self.indicator_name, baseline)
                     if self._baseline_metrics_map:
                         self.realtime_plotter.set_baseline_metrics(self.indicator_name, self._baseline_metrics_map)
                     self._plot_initialized = True
-                self.realtime_plotter.update(self.indicator_name, avg_objective, metrics_map)
+                self.realtime_plotter.update(self.indicator_name, avg_objective, metrics_map, params_for_plot)
             
             # Format sign for improvement vs original
             sign = "+" if pct_vs_original >= 0 else ""
