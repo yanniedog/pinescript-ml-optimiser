@@ -530,6 +530,15 @@ class PineTranslator:
             mom_len = self._get_param('length', 'len', 'period', 'lookback', default=14, param_type='int')
             main_values = ta.roc(self.close, mom_len)
         
+        # Apply optional smoothing/scaling if present
+        smooth_len = self._get_param('smooth_len', 'smoothLen', 'smooth', default=None, param_type='int')
+        if smooth_len is not None and smooth_len > 1:
+            main_values = ta.sma(main_values, int(smooth_len))
+
+        scale_mult = self._get_param('scale_mult', 'scaleMult', 'scale', default=None, param_type='float')
+        if scale_mult is not None:
+            main_values = main_values * float(scale_mult)
+
         # Generate signals based on signal type
         if signal_info.signal_type == SignalType.THRESHOLD:
             buy_level = signal_info.threshold_levels.get('buy', -20)

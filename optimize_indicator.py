@@ -334,7 +334,7 @@ Examples:
         print_step(3, total_steps, f"Running optimization ({trials_str} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
-        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency + Drawdown")
+        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency")
         print(f"   Lockbox holdout: {args.holdout_ratio:.0%} (gap: {args.holdout_gap_bars if args.holdout_gap_bars is not None else 'auto'} bars)")
         print()
         print(f"   [TIP] Press Q at any time to stop and use current best results")

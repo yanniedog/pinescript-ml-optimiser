@@ -959,13 +959,12 @@ class OutputGenerator:
             "                    consistent returns with less volatility/drawdowns.",
             "",
             "  OPTIMIZATION WEIGHTS USED:",
-            "    * Profit Factor:        25% (primary - are we making money?)",
-            "    * Directional Accuracy: 20% (does the indicator actually predict?)",
-            "    * Sharpe Ratio:         15% (is it consistent/low risk?)",
-            "    * Win Rate:             10% (psychological tradability)",
-            "    * Extreme Move Capture: 15% (detects major highs/lows)",
-            "    * Consistency Score:    10% (stability across folds)",
-            "    * Drawdown Control:      5% (avoid deep equity dips)",
+            "    * Profit Factor:        26% (primary - are we making money?)",
+            "    * Directional Accuracy: 21% (does the indicator actually predict?)",
+            "    * Sharpe Ratio:         16% (is it consistent/low risk?)",
+            "    * Win Rate:             10.5% (psychological tradability)",
+            "    * Extreme Move Capture: 16% (detects major highs/lows)",
+            "    * Consistency Score:    10.5% (stability across folds)",
             "",
             "-" * 70,
             "OPTIMAL FORECAST HORIZON",
@@ -1118,7 +1117,8 @@ class OutputGenerator:
 def generate_outputs(
     parse_result: ParseResult,
     optimization_result: OptimizationResult,
-    source_filename: str
+    source_filename: str,
+    output_tag: str = None
 ) -> Dict[str, str]:
     """
     Generate all output files.
@@ -1141,8 +1141,14 @@ def generate_outputs(
     pine_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     
-    pine_output = str(pine_dir / f"optimised_{source_path.stem}.pine")
-    report_output = str(report_dir / f"optimised_{source_path.stem}_report.txt")
+    if output_tag:
+        safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", output_tag.strip()).strip("_")
+    else:
+        safe_tag = ""
+
+    suffix = f"_{safe_tag}" if safe_tag else ""
+    pine_output = str(pine_dir / f"optimised_{source_path.stem}{suffix}.pine")
+    report_output = str(report_dir / f"optimised_{source_path.stem}{suffix}_report.txt")
     
     # Generate files
     pine_path = generator.generate_optimized_pine(pine_output)

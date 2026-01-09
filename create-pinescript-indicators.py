@@ -1,4 +1,5 @@
 import os
+import re
 
 from screen_log import enable_screen_log
 
@@ -327,22 +328,58 @@ def generate_pine_scripts():
     ]
 
     generated = 0
-    skipped = 0
+    augmented = 0
 
     def count_optimizable(params_list):
         return sum(1 for p in params_list if p[1] in (0, 1))
+
+    def add_smoothing_params(params_list):
+        existing = {p[0] for p in params_list}
+        if "smooth_len" not in existing:
+            params_list.append(("smooth_len", 0, 5, 1, 50, "Smooth Len"))
+        if "scale_mult" not in existing:
+            params_list.append(("scale_mult", 1, 1.0, 0.1, 3.0, "Scale Mult"))
+        return params_list
+
+    def inject_smoothing_logic(logic_block: str) -> str:
+        lines = logic_block.split("\n")
+        plot_pattern = re.compile(r'^\s*plot\s*\(\s*([^,]+)')
+        number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
+        for idx, line in enumerate(lines):
+            match = plot_pattern.search(line)
+            if not match:
+                continue
+            base_expr = match.group(1).strip()
+            if number_pattern.match(base_expr):
+                base_expr = "close"
+            smooth_lines = [
+                f"ml_smooth = ta.sma({base_expr}, smooth_len)",
+                "ml_signal = ml_smooth * scale_mult",
+            ]
+            lines[idx:idx] = smooth_lines
+            lines[idx + len(smooth_lines)] = re.sub(
+                r'plot\s*\(\s*[^,]+',
+                "plot(ml_signal",
+                lines[idx + len(smooth_lines)],
+                count=1
+            )
+            return "\n".join(lines)
+        prepend = [
+            "ml_smooth = ta.sma(close, smooth_len)",
+            "ml_signal = ml_smooth * scale_mult",
+            "plot(ml_signal, \"ML Signal\", color=color.yellow)",
+            ""
+        ]
+        return "\n".join(prepend + lines)
 
     for item in indicators:
         filename, title, overlay, params, logic = item
 
         optimizable_count = count_optimizable(params)
         if optimizable_count < 2:
-            print(
-                f"[SKIP] {filename}: only {optimizable_count} optimizable parameter(s). "
-                f"Requires at least 2 to avoid trivial optimizations."
-            )
-            skipped += 1
-            continue
+            params = add_smoothing_params(params)
+            logic = inject_smoothing_logic(logic)
+            augmented += 1
         
         # Build header
         content = [
@@ -385,7 +422,7 @@ def generate_pine_scripts():
 
     print(
         f"Successfully generated {generated} Pine Script v6 files in '{output_dir}'. "
-        f"Skipped {skipped} single-parameter indicator(s)."
+        f"Augmented {augmented} indicator(s) to ensure >=2 optimizable parameters."
     )
 
 if __name__ == "__main__":

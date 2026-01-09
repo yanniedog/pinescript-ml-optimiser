@@ -7,6 +7,8 @@ Includes data management for downloading any crypto symbol at any timeframe.
 import sys
 import os
 import runpy
+import csv
+import shutil
 from pathlib import Path
 
 # Ensure we can import our modules
@@ -15,13 +17,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 import optimize_indicator as optimize_module
 from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES, print_available_data
 from pine_parser import parse_pine_script
-from optimizer import get_optimizable_params
+from optimizer import get_optimizable_params, optimize_indicator as run_optimizer
+from output_generator import generate_outputs
 import argparse
 import json
 import time
 
 from objective import calculate_objective_score as objective_score
 from screen_log import enable_screen_log
+
+BACKUP_DONE = False
 
 
 def get_pine_files(directory: Path = None):
@@ -317,6 +322,34 @@ def _serialize_metrics(metrics):
     }
 
 
+def _safe_tag(tag: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in tag.strip())
+    return cleaned.strip("_")
+
+
+def _baseline_objective(result) -> float:
+    if result is None:
+        return 0.0
+    baseline = getattr(result, "baseline_objective", None)
+    if baseline is None or baseline == 0.0:
+        baseline = calculate_objective_score(result.original_metrics)
+    return baseline
+
+
+def _is_improved_result(result) -> bool:
+    if result is None:
+        return False
+    best_obj = calculate_objective_score(result.best_metrics)
+    baseline_obj = _baseline_objective(result)
+    return best_obj > baseline_obj
+
+
+def _serialize_params(params: dict) -> str:
+    if not params:
+        return ""
+    return json.dumps(params, sort_keys=True)
+
+
 def _json_safe_value(value):
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -387,6 +420,127 @@ def _serialize_data_usage_info(data_usage_info):
                 "potential_bias_issues": info.potential_bias_issues,
             }
     return serialized
+
+
+def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
+    summary_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = summary_dir / "unified_optimization_matrix.json"
+    csv_path = summary_dir / "unified_optimization_matrix.csv"
+    txt_path = summary_dir / "unified_optimization_matrix.txt"
+
+    payload = {
+        "run": run_info,
+        "matrix": rows,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, default=_json_safe_value), encoding="utf-8")
+
+    fieldnames = [
+        "indicator_name",
+        "file_name",
+        "symbol",
+        "interval",
+        "objective_best",
+        "baseline_objective",
+        "improvement_pf",
+        "forecast_horizon",
+        "total_trades",
+        "winning_trades",
+        "losing_trades",
+        "win_rate",
+        "profit_factor",
+        "sharpe_ratio",
+        "max_drawdown",
+        "avg_holding_bars",
+        "directional_accuracy",
+        "improvement_over_random",
+        "tail_capture_rate",
+        "consistency_score",
+        "total_return",
+        "avg_return",
+        "optimization_time",
+        "n_trials",
+        "best_params",
+        "original_params",
+        "output_pine",
+        "output_report",
+    ]
+
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            metrics = row.get("best_metrics", {})
+            writer.writerow({
+                "indicator_name": row.get("indicator_name"),
+                "file_name": row.get("file_name"),
+                "symbol": row.get("symbol"),
+                "interval": row.get("interval"),
+                "objective_best": row.get("objective_best"),
+                "baseline_objective": row.get("baseline_objective"),
+                "improvement_pf": row.get("improvement_pf"),
+                "forecast_horizon": metrics.get("forecast_horizon"),
+                "total_trades": metrics.get("total_trades"),
+                "winning_trades": metrics.get("winning_trades"),
+                "losing_trades": metrics.get("losing_trades"),
+                "win_rate": metrics.get("win_rate"),
+                "profit_factor": metrics.get("profit_factor"),
+                "sharpe_ratio": metrics.get("sharpe_ratio"),
+                "max_drawdown": metrics.get("max_drawdown"),
+                "avg_holding_bars": metrics.get("avg_holding_bars"),
+                "directional_accuracy": metrics.get("directional_accuracy"),
+                "improvement_over_random": metrics.get("improvement_over_random"),
+                "tail_capture_rate": metrics.get("tail_capture_rate"),
+                "consistency_score": metrics.get("consistency_score"),
+                "total_return": metrics.get("total_return"),
+                "avg_return": metrics.get("avg_return"),
+                "optimization_time": row.get("optimization_time"),
+                "n_trials": row.get("n_trials"),
+                "best_params": _serialize_params(row.get("best_params")),
+                "original_params": _serialize_params(row.get("original_params")),
+                "output_pine": row.get("output_pine"),
+                "output_report": row.get("output_report"),
+            })
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append("UNIFIED OPTIMIZATION MATRIX REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append("RUN CONFIG")
+    lines.append("-" * 70)
+    for key, value in run_info.items():
+        lines.append(f"{key}: {value}")
+    lines.append("")
+    lines.append(f"TOTAL ROWS: {len(rows)}")
+    lines.append("")
+
+    for row in rows:
+        metrics = row.get("best_metrics", {})
+        lines.append("-" * 70)
+        lines.append(f"{row.get('indicator_name')} | {row.get('symbol')} @ {row.get('interval')}")
+        lines.append(
+            f"Objective: {row.get('objective_best', 0):.4f} "
+            f"(baseline {row.get('baseline_objective', 0):.4f})"
+        )
+        lines.append(
+            f"PF {metrics.get('profit_factor', 0):.2f} | "
+            f"Win {metrics.get('win_rate', 0)*100:.1f}% | "
+            f"Sharpe {metrics.get('sharpe_ratio', 0):.2f} | "
+            f"Forecast {metrics.get('forecast_horizon', 0)} bars"
+        )
+        lines.append(f"Params: {_serialize_params(row.get('best_params'))}")
+        lines.append(
+            "Metrics: "
+            f"trades={metrics.get('total_trades', 0)} "
+            f"dir_acc={metrics.get('directional_accuracy', 0)*100:.1f}% "
+            f"tail={metrics.get('tail_capture_rate', 0)*100:.1f}% "
+            f"consistency={metrics.get('consistency_score', 0):.2f} "
+            f"impr_random={metrics.get('improvement_over_random', 0):+.1f}%"
+        )
+
+    txt_path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, results: list):
@@ -502,8 +656,155 @@ def maybe_generate_all_indicators():
         return False
 
 
+def get_eligible_indicators(pine_files):
+    eligible_files = []
+    ineligible = []
+    for pine_file in pine_files:
+        try:
+            parse_result = parse_pine_script(str(pine_file))
+            optimizable_params = get_optimizable_params(parse_result.parameters)
+            if len(optimizable_params) >= 2:
+                eligible_files.append(pine_file)
+            else:
+                ineligible.append((pine_file.name, len(optimizable_params)))
+        except Exception as exc:
+            ineligible.append((pine_file.name, f"parse error: {exc}"))
+    return eligible_files, ineligible
+
+
+def select_datasets_for_matrix(dm: DataManager):
+    datasets = dm.get_available_datasets()
+    if not datasets:
+        print("\n[ERROR] No datasets found. Download data first.")
+        return []
+
+    print("\n" + "-" * 70)
+    print("  Available datasets")
+    print("-" * 70)
+    print(f"  Total datasets: {len(datasets)}")
+    by_interval = {}
+    for symbol, interval in datasets:
+        by_interval.setdefault(interval, []).append(symbol)
+    for interval in sorted(by_interval.keys()):
+        symbols = by_interval[interval]
+        interval_name = INTERVAL_NAMES.get(interval, interval)
+        print(f"  {interval_name} ({interval}): {len(symbols)} symbols")
+
+    use_all = input("\nUse all available datasets? [Y/n]: ").strip().lower()
+    if use_all in ["n", "no"]:
+        intervals_input = input("Intervals (comma-separated, Enter for all): ").strip().lower()
+        symbols_input = input("Symbols (comma-separated, Enter for all): ").strip().upper()
+
+        intervals = None
+        if intervals_input:
+            intervals = [i.strip() for i in intervals_input.split(",") if i.strip()]
+
+        symbols = None
+        if symbols_input:
+            symbols = [s.strip() for s in symbols_input.split(",") if s.strip()]
+            symbols = [s if s.endswith("USDT") else f"{s}USDT" for s in symbols]
+
+        filtered = []
+        for symbol, interval in datasets:
+            if intervals and interval not in intervals:
+                continue
+            if symbols and symbol not in symbols:
+                continue
+            filtered.append((symbol, interval))
+        datasets = filtered
+
+    if not datasets:
+        print("\n[ERROR] No datasets match the selection.")
+        return []
+
+    print(f"\nUsing {len(datasets)} datasets. Sample:")
+    for symbol, interval in datasets[:10]:
+        print(f"  - {symbol} @ {interval}")
+    if len(datasets) > 10:
+        print(f"  ... and {len(datasets) - 10} more")
+
+    return datasets
+
+
+def backup_previous_outputs():
+    global BACKUP_DONE
+    if BACKUP_DONE:
+        return
+
+    sources = [Path("optimized_outputs"), Path("pinescripts")]
+    existing_sources = [p for p in sources if p.exists()]
+    if not existing_sources:
+        BACKUP_DONE = True
+        return
+
+    has_content = False
+    for path in existing_sources:
+        if path.is_dir() and any(path.rglob("*")):
+            has_content = True
+            break
+        if path.is_file():
+            has_content = True
+            break
+
+    if not has_content:
+        BACKUP_DONE = True
+        return
+
+    backup_root = Path("backup")
+    backup_root.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    backup_dir = backup_root / timestamp
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    for path in existing_sources:
+        dest = backup_dir / path.name
+        if path.is_dir():
+            shutil.copytree(path, dest)
+        else:
+            shutil.copy2(path, dest)
+
+    run_info = {}
+    summary_dir = Path("optimized_outputs") / "summary"
+    for name in ("unified_optimization_matrix.json", "unified_optimization_results.json"):
+        candidate = summary_dir / name
+        if candidate.exists():
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+                run_info = payload.get("run", {}) if isinstance(payload, dict) else {}
+                break
+            except Exception:
+                continue
+
+    info_payload = {
+        "backed_up_at": timestamp,
+        "source_paths": [str(p) for p in existing_sources],
+        "run": run_info,
+    }
+    (backup_dir / "backup_info.json").write_text(
+        json.dumps(info_payload, indent=2, default=_json_safe_value),
+        encoding="utf-8"
+    )
+
+    info_lines = [
+        "Backup info",
+        f"Backed up at: {timestamp}",
+        f"Sources: {', '.join(str(p) for p in existing_sources)}",
+        "",
+        "Run config:",
+    ]
+    if run_info:
+        for key, value in run_info.items():
+            info_lines.append(f"{key}: {value}")
+    else:
+        info_lines.append("No prior run config found in summary JSON.")
+    (backup_dir / "backup_info.txt").write_text("\n".join(info_lines), encoding="utf-8")
+
+    BACKUP_DONE = True
+
+
 def run_optimization(dm: DataManager):
     """Run the optimization workflow."""
+    backup_previous_outputs()
     pine_files = get_pine_files()
     
     if not pine_files:
@@ -578,6 +879,7 @@ def sort_rankings(rankings: list) -> list:
 
 def run_batch_optimization(dm: DataManager):
     """Run optimization across all indicators in a directory with ranking."""
+    backup_previous_outputs()
     generated = maybe_generate_all_indicators()
     
     if generated:
@@ -591,18 +893,7 @@ def run_batch_optimization(dm: DataManager):
         print(f"\n[ERROR] No Pine Script files found in: {indicator_dir}")
         return
 
-    eligible_files = []
-    ineligible = []
-    for pine_file in pine_files:
-        try:
-            parse_result = parse_pine_script(str(pine_file))
-            optimizable_params = get_optimizable_params(parse_result.parameters)
-            if len(optimizable_params) >= 2:
-                eligible_files.append(pine_file)
-            else:
-                ineligible.append((pine_file.name, len(optimizable_params)))
-        except Exception as exc:
-            ineligible.append((pine_file.name, f"parse error: {exc}"))
+    eligible_files, ineligible = get_eligible_indicators(pine_files)
 
     print(f"\nFound {len(pine_files)} Pine Script files in {indicator_dir}")
     print(f"Eligible for optimization: {len(eligible_files)}")
@@ -718,6 +1009,7 @@ def run_batch_optimization(dm: DataManager):
     
     rankings = []
     results = []
+    skipped_no_improvement = 0
     
     for i, pine_file in enumerate(eligible_files, 1):
         print(f"\n{'='*70}")
@@ -751,6 +1043,11 @@ def run_batch_optimization(dm: DataManager):
         if result is None:
             continue
         
+        if not _is_improved_result(result):
+            skipped_no_improvement += 1
+            print(f"[INFO] Skipping {pine_file.name} (no improvement vs baseline).")
+            continue
+
         metrics = result.best_metrics
         score = calculate_objective_score(metrics)
         rankings.append({
@@ -830,6 +1127,7 @@ def run_batch_optimization(dm: DataManager):
         "generated_all": generated,
         "total_indicators": len(pine_files),
         "eligible_indicators": len(eligible_files),
+        "skipped_no_improvement": skipped_no_improvement,
     }
     summary_dir = Path("optimized_outputs") / "summary"
     write_unified_report(
@@ -838,6 +1136,244 @@ def run_batch_optimization(dm: DataManager):
         run_info,
         results
     )
+
+
+def run_matrix_optimization(dm: DataManager):
+    """Run optimization independently for each indicator-symbol-timeframe combination."""
+    backup_previous_outputs()
+    generated = maybe_generate_all_indicators()
+
+    if generated:
+        indicator_dir = Path.cwd() / "pinescripts"
+    else:
+        indicator_dir = choose_indicator_directory()
+
+    pine_files = get_pine_files(indicator_dir)
+
+    if not pine_files:
+        print(f"\n[ERROR] No Pine Script files found in: {indicator_dir}")
+        return
+
+    eligible_files, ineligible = get_eligible_indicators(pine_files)
+
+    print(f"\nFound {len(pine_files)} Pine Script files in {indicator_dir}")
+    print(f"Eligible for optimization: {len(eligible_files)}")
+    if ineligible:
+        print(f"Skipped (insufficient params or parse errors): {len(ineligible)}")
+        for name, reason in ineligible[:10]:
+            print(f"  - {name}: {reason}")
+        if len(ineligible) > 10:
+            print(f"  ... and {len(ineligible) - 10} more")
+
+    if not eligible_files:
+        print("\n[ERROR] No indicators eligible for optimization.")
+        return
+
+    datasets = select_datasets_for_matrix(dm)
+    if not datasets:
+        return
+
+    combos = [(pine_file, symbol, interval) for pine_file in eligible_files for symbol, interval in datasets]
+
+    if not combos:
+        print("\n[ERROR] No indicator/dataset combinations to run.")
+        return
+
+    min_per_combo_seconds = 60
+    print()
+    print("Time budget mode:")
+    print("  [1] Total minutes split across all combinations")
+    print("  [2] Minutes per combination (each combination gets full time)")
+    while True:
+        budget_input = input("  Choose option [1]: ").strip()
+        if not budget_input:
+            budget_input = "1"
+        if budget_input in ["1", "2"]:
+            break
+        print("[ERROR] Please enter 1 or 2")
+
+    budget_mode = "total" if budget_input == "1" else "per_combo"
+    timeout_minutes = 0.0
+    per_combo_minutes = 0.0
+    per_combo_seconds = None
+
+    combos_to_run = combos
+    if budget_mode == "total":
+        while True:
+            timeout_input = input("Total minutes to split across all combinations? [10]: ").strip()
+            if not timeout_input:
+                timeout_minutes = 10.0
+                break
+            try:
+                timeout_minutes = float(timeout_input)
+                if timeout_minutes > 0:
+                    break
+                else:
+                    print("[ERROR] Please enter a positive number")
+            except ValueError:
+                print("[ERROR] Please enter a valid number")
+
+        total_seconds = int(timeout_minutes * 60)
+        max_combos = max(1, total_seconds // min_per_combo_seconds)
+        if max_combos < len(combos):
+            print(
+                f"\n[INFO] Time budget allows {max_combos} combination(s) at "
+                f"{min_per_combo_seconds}s each. Limiting run to first "
+                f"{max_combos} combinations."
+            )
+            combos_to_run = combos[:max_combos]
+
+        base_seconds = total_seconds // len(combos_to_run)
+        extra_seconds = total_seconds % len(combos_to_run)
+        per_combo_budgets = [
+            base_seconds + (1 if i < extra_seconds else 0)
+            for i in range(len(combos_to_run))
+        ]
+    else:
+        while True:
+            per_combo_input = input("Minutes per combination? [3]: ").strip()
+            if not per_combo_input:
+                per_combo_minutes = 3.0
+                break
+            try:
+                per_combo_minutes = float(per_combo_input)
+                if per_combo_minutes > 0:
+                    break
+                else:
+                    print("[ERROR] Please enter a positive number")
+            except ValueError:
+                print("[ERROR] Please enter a valid number")
+
+        per_combo_seconds = int(per_combo_minutes * 60)
+        total_seconds = per_combo_seconds * len(combos_to_run)
+        per_combo_budgets = [per_combo_seconds] * len(combos_to_run)
+
+    print(f"\nMatrix optimization configured:")
+    print(f"  - Budget mode: {budget_mode.replace('_', ' ')}")
+    print(f"  - Indicators: {len(eligible_files)}")
+    print(f"  - Datasets: {len(datasets)}")
+    print(f"  - Combinations to run: {len(combos_to_run)}")
+    if budget_mode == "total":
+        print(f"  - Total time: {timeout_minutes:.1f} minute(s)")
+        print(
+            f"  - Time per combo: {min(per_combo_budgets)/60:.2f}–"
+            f"{max(per_combo_budgets)/60:.2f} minute(s)"
+        )
+    else:
+        print(f"  - Time per combo: {per_combo_minutes:.1f} minute(s)")
+        print(f"  - Total time (all combos): {total_seconds/60:.1f} minute(s)")
+    print(f"  - Trials: unlimited (runs until time limit per combo)")
+    print(f"  - Early stop: disabled (uses full timeout per combo)")
+    print(f"  - Press Q anytime to stop early and use current best results")
+
+    results = []
+    skipped_no_improvement = 0
+    errors = 0
+    data_cache = {}
+    parse_cache = {}
+
+    for idx, ((pine_file, symbol, interval), combo_timeout) in enumerate(zip(combos_to_run, per_combo_budgets), 1):
+        print(f"\n{'='*70}")
+        print(f"Combo {idx}/{len(combos_to_run)}: {pine_file.name} | {symbol} @ {interval}")
+        print("="*70)
+
+        if pine_file not in parse_cache:
+            try:
+                parse_cache[pine_file] = parse_pine_script(str(pine_file))
+            except Exception as exc:
+                errors += 1
+                print(f"[ERROR] Failed to parse {pine_file.name}: {exc}")
+                continue
+
+        parse_result = parse_cache[pine_file]
+
+        key = (symbol, interval)
+        if key not in data_cache:
+            try:
+                data_cache[key] = dm.load_symbol(symbol, interval)
+            except Exception as exc:
+                errors += 1
+                print(f"[ERROR] Failed to load data for {symbol} @ {interval}: {exc}")
+                continue
+
+        data = {symbol: data_cache[key]}
+
+        try:
+            result = run_optimizer(
+                parse_result,
+                data,
+                interval=interval,
+                max_trials=None,
+                timeout_seconds=combo_timeout,
+                min_runtime_seconds=combo_timeout,
+                stall_seconds=combo_timeout + 1,
+                improvement_rate_floor=0.0
+            )
+        except KeyboardInterrupt:
+            print("\n\nMatrix optimization interrupted by user.")
+            break
+        except Exception as exc:
+            errors += 1
+            print(f"[ERROR] Optimization failed for {pine_file.name} {symbol} @ {interval}: {exc}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+        if not _is_improved_result(result):
+            skipped_no_improvement += 1
+            print(f"[INFO] Skipping {pine_file.name} {symbol} @ {interval} (no improvement).")
+            continue
+
+        output_tag = _safe_tag(f"{symbol}_{interval}")
+        outputs = generate_outputs(parse_result, result, str(pine_file), output_tag=output_tag)
+
+        row = {
+            "indicator_name": parse_result.indicator_name or pine_file.stem,
+            "file_name": pine_file.name,
+            "symbol": symbol,
+            "interval": interval,
+            "output_pine": outputs.get("pine_script"),
+            "output_report": outputs.get("report"),
+            "optimization_time": result.optimization_time,
+            "n_trials": result.n_trials,
+            "objective_best": calculate_objective_score(result.best_metrics),
+            "baseline_objective": _baseline_objective(result),
+            "improvement_pf": result.improvement_pf,
+            "best_metrics": _serialize_metrics(result.best_metrics),
+            "original_metrics": _serialize_metrics(result.original_metrics),
+            "original_params": result.original_params,
+            "best_params": result.best_params,
+        }
+        results.append(row)
+
+    if not results:
+        print("\nNo successful optimizations to report.")
+        return
+
+    intervals = sorted(set(interval for _, interval in datasets))
+    symbols = sorted(set(symbol for symbol, _ in datasets))
+    run_info = {
+        "indicator_directory": str(indicator_dir),
+        "intervals": intervals,
+        "symbols": symbols,
+        "datasets": len(datasets),
+        "combo_total": len(combos),
+        "combo_run": len(combos_to_run),
+        "budget_mode": budget_mode,
+        "total_timeout_seconds": total_seconds,
+        "timeout_seconds_per_combo_min": min(per_combo_budgets) if per_combo_budgets else 0,
+        "timeout_seconds_per_combo_max": max(per_combo_budgets) if per_combo_budgets else 0,
+        "min_per_combo_seconds": min_per_combo_seconds,
+        "per_combo_seconds": per_combo_seconds,
+        "generated_all": generated,
+        "total_indicators": len(pine_files),
+        "eligible_indicators": len(eligible_files),
+        "skipped_no_improvement": skipped_no_improvement,
+        "errors": errors,
+    }
+
+    summary_dir = Path("optimized_outputs") / "summary"
+    write_matrix_reports(summary_dir, run_info, results)
 
 
 def main_menu():
@@ -856,6 +1392,7 @@ def main_menu():
     [2] Download new data (any crypto symbol, any timeframe)
     [3] View available data
     [4] Optimize ALL indicators in a directory
+    [5] Optimize all indicators per symbol/timeframe (matrix)
     [Q] Quit
 """)
         
@@ -870,11 +1407,13 @@ def main_menu():
             input("\n  Press Enter to continue...")
         elif choice == '4':
             run_batch_optimization(dm)
+        elif choice == '5':
+            run_matrix_optimization(dm)
         elif choice == 'q':
             print("\nGoodbye!")
             break
         else:
-            print("\n  [ERROR] Invalid option. Please enter 1, 2, 3, or Q.")
+            print("\n  [ERROR] Invalid option. Please enter 1, 2, 3, 4, 5, or Q.")
 
 
 def main():

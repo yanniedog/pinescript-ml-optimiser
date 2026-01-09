@@ -20,16 +20,13 @@ def calculate_objective_score(
     win_score = metrics.win_rate
     tail_score = max(0.0, min(1.0, metrics.tail_capture_rate))
     consistency_score = max(0.0, min(1.0, metrics.consistency_score))
-    drawdown_score = 1 - min(max(metrics.max_drawdown, 0.0), 100.0) / 100.0
-
     objective = (
-        0.25 * pf_score +
-        0.20 * acc_score +
-        0.15 * sharpe_score +
-        0.10 * win_score +
-        0.15 * tail_score +
-        0.10 * consistency_score +
-        0.05 * drawdown_score
+        0.263 * pf_score +
+        0.211 * acc_score +
+        0.158 * sharpe_score +
+        0.105 * win_score +
+        0.158 * tail_score +
+        0.105 * consistency_score
     )
 
     if metrics.total_trades < min_trades_penalty:
