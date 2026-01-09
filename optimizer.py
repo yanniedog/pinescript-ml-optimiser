@@ -37,6 +37,79 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+_METRIC_DEFS = {
+    "objective_best": {"label": "Objective (avg)"},
+    "objective_delta": {"label": "Objective Delta"},
+    "objective_overall": {"label": "Objective (overall)"},
+    "profit_factor": {"label": "Profit Factor"},
+    "win_rate": {"label": "Win Rate"},
+    "directional_accuracy": {"label": "Directional Accuracy"},
+    "sharpe_ratio": {"label": "Sharpe Ratio"},
+    "max_drawdown": {"label": "Max Drawdown"},
+    "total_return": {"label": "Total Return"},
+    "avg_return": {"label": "Avg Return"},
+    "total_trades": {"label": "Total Trades"},
+    "winning_trades": {"label": "Winning Trades"},
+    "losing_trades": {"label": "Losing Trades"},
+    "avg_holding_bars": {"label": "Avg Holding Bars"},
+    "forecast_horizon": {"label": "Forecast Horizon"},
+    "improvement_over_random": {"label": "Improvement vs Random"},
+    "tail_capture_rate": {"label": "Tail Capture Rate"},
+    "consistency_score": {"label": "Consistency Score"},
+}
+_METRIC_KEYS = list(_METRIC_DEFS.keys())
+
+
+def _metrics_from_backtest(metrics: Optional[BacktestMetrics]) -> Dict[str, float]:
+    if metrics is None:
+        return {}
+    return {
+        "total_trades": metrics.total_trades,
+        "winning_trades": metrics.winning_trades,
+        "losing_trades": metrics.losing_trades,
+        "total_return": metrics.total_return,
+        "avg_return": metrics.avg_return,
+        "win_rate": metrics.win_rate,
+        "profit_factor": metrics.profit_factor,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "avg_holding_bars": metrics.avg_holding_bars,
+        "directional_accuracy": metrics.directional_accuracy,
+        "forecast_horizon": metrics.forecast_horizon,
+        "improvement_over_random": metrics.improvement_over_random,
+        "tail_capture_rate": metrics.tail_capture_rate,
+        "consistency_score": metrics.consistency_score,
+    }
+
+
+def _metric_label(metric_key: str) -> str:
+    return _METRIC_DEFS.get(metric_key, {}).get("label", metric_key)
+
+
+def _last_non_none(values: List[Optional[float]]) -> Optional[float]:
+    for val in reversed(values):
+        if val is not None:
+            return val
+    return None
+
+
+def _compute_rate_series(
+    elapsed_vals: List[float],
+    metric_vals: List[Optional[float]],
+    baseline_value: Optional[float]
+) -> List[Optional[float]]:
+    baseline = baseline_value if baseline_value is not None else 0.0
+    rates = []
+    for elapsed, val in zip(elapsed_vals, metric_vals):
+        if val is None or elapsed is None:
+            rates.append(None)
+            continue
+        if elapsed <= 0:
+            rates.append(0.0)
+            continue
+        rates.append((val - baseline) / elapsed)
+    return rates
+
 
 def get_optimizable_params(parameters: List[Parameter]) -> List[Parameter]:
     """Filter parameters to only those worth optimizing."""
@@ -155,6 +228,11 @@ class RealtimeBestPlotter:
         self._last_legend_update = 0.0
         self._legend_update_interval = 2.0
         self._line_meta = {}
+        self._y_metric = "objective_delta"
+        self._x_mode = "elapsed"
+        self._band_metric = None
+        self._band_min = None
+        self._band_max = None
         self._filters = {
             "indicator": set(),
             "symbol": set(),
@@ -185,14 +263,14 @@ class RealtimeBestPlotter:
             self._plt.ion()
             self._fig, self._ax = self._plt.subplots()
             self._fig.subplots_adjust(right=0.78, bottom=0.18)
-            self._ax.set_title("Best Objective Improvement vs Baseline")
+            self._ax.set_title("Optimization Progress")
             self._ax.set_xlabel("Elapsed time (s)")
-            self._ax.set_ylabel("Objective Delta (best - baseline)")
+            self._ax.set_ylabel(_metric_label(self._y_metric))
             self._ax.grid(True, alpha=0.3)
             self._status_text = self._ax.text(
                 0.01,
                 0.99,
-                "Filters: all | UI: indicator/symbol/timeframe | Click line to toggle",
+                "Filters: all | Y: objective_delta | X: elapsed | UI: indicator/symbol/timeframe | Click line to toggle",
                 transform=self._ax.transAxes,
                 va="top",
                 ha="left",
@@ -207,7 +285,7 @@ class RealtimeBestPlotter:
             self._enabled = True
             logger.info(
                 "Realtime plot controls: UI panel or keys A(all) I(indicator) "
-                "S(symbol) T(timeframe) L(legend)."
+                "S(symbol) T(timeframe) L(legend) Y(y-axis) X(x-axis) B(band)."
             )
             return True
         except Exception as exc:
@@ -251,6 +329,39 @@ class RealtimeBestPlotter:
         if self._status_text is None:
             return
         self._status_text.set_text(text)
+
+    def _update_axis_labels(self) -> None:
+        if self._ax is None:
+            return
+        if self._x_mode == "rate":
+            x_label = f"Improvement rate ({_metric_label(self._y_metric)} / s)"
+        else:
+            x_label = "Elapsed time (s)"
+        self._ax.set_xlabel(x_label)
+        self._ax.set_ylabel(_metric_label(self._y_metric))
+
+    def _get_series_xy(self, label: str) -> Tuple[List[float], List[Optional[float]]]:
+        series = self._series.get(label)
+        if not series:
+            return [], []
+        x_vals = series.get("x", [])
+        y_vals = series.get("metrics", {}).get(self._y_metric, [])
+        if self._x_mode == "rate":
+            baseline = self._baseline_values.get(label, {}).get(self._y_metric)
+            x_vals = _compute_rate_series(x_vals, y_vals, baseline)
+        return x_vals, y_vals
+
+    def _refresh_lines(self) -> None:
+        for label, line in self._lines.items():
+            x_vals, y_vals = self._get_series_xy(label)
+            line.set_data(x_vals, y_vals)
+        self._update_axis_labels()
+        self._redraw(force=True)
+
+    def _set_band_filter(self, metric: Optional[str], band_min: Optional[float], band_max: Optional[float]) -> None:
+        self._band_metric = metric
+        self._band_min = band_min
+        self._band_max = band_max
 
     def _init_ui(self, RadioButtons, TextBox, Button) -> None:
         self._ui_axes["indicator_input"] = self._fig.add_axes([0.80, 0.74, 0.18, 0.05])
@@ -356,7 +467,21 @@ class RealtimeBestPlotter:
             timeframe_val = meta.get("timeframe", "")
             timeframe_match = timeframe_val in self._filters["timeframe"]
 
-        return indicator_match and symbol_match and timeframe_match
+        if not (indicator_match and symbol_match and timeframe_match):
+            return False
+
+        if self._band_metric:
+            series = self._series.get(label, {})
+            values = series.get("metrics", {}).get(self._band_metric, [])
+            latest = _last_non_none(values)
+            if latest is None:
+                return False
+            if self._band_min is not None and latest < self._band_min:
+                return False
+            if self._band_max is not None and latest > self._band_max:
+                return False
+
+        return True
 
     def _apply_filters(self) -> None:
         for label, line in self._lines.items():
@@ -368,8 +493,12 @@ class RealtimeBestPlotter:
             summary_parts.append(f"symbol={','.join(sorted(self._filters['symbol']))}")
         if self._filters["timeframe"]:
             summary_parts.append(f"timeframe={','.join(sorted(self._filters['timeframe']))}")
+        if self._band_metric:
+            band_min = "" if self._band_min is None else f"{self._band_min:g}"
+            band_max = "" if self._band_max is None else f"{self._band_max:g}"
+            summary_parts.append(f"band={self._band_metric}[{band_min},{band_max}]")
         summary = "Filters: " + (", ".join(summary_parts) if summary_parts else "all")
-        summary += " | UI: indicator/symbol/timeframe | Click line to toggle"
+        summary += f" | Y: {self._y_metric} | X: {self._x_mode} | UI: indicator/symbol/timeframe | Click line to toggle"
         self._update_status(summary)
         self._refresh_legend(force=True)
         self._redraw(force=True)
@@ -419,6 +548,51 @@ class RealtimeBestPlotter:
             self._filters["timeframe"] = {value.lower()}
         self._apply_filters()
 
+    def _prompt_metric(self) -> None:
+        try:
+            value = input("Y metric (e.g., objective_delta, profit_factor): ").strip()
+        except Exception:
+            return
+        if not value:
+            return
+        if value not in _METRIC_DEFS:
+            self._update_status(f"Unknown metric '{value}'.")
+            return
+        self._y_metric = value
+        self._refresh_lines()
+        self._apply_filters()
+
+    def _prompt_band_filter(self) -> None:
+        try:
+            value = input("Band filter (metric:min:max), blank clears: ").strip()
+        except Exception:
+            return
+        if not value:
+            self._set_band_filter(None, None, None)
+            self._apply_filters()
+            return
+        parts = value.split(":")
+        metric = parts[0].strip()
+        if metric not in _METRIC_DEFS:
+            self._update_status(f"Unknown metric '{metric}'.")
+            return
+        band_min = None
+        band_max = None
+        if len(parts) > 1 and parts[1].strip():
+            try:
+                band_min = float(parts[1].strip())
+            except ValueError:
+                self._update_status(f"Invalid band min '{parts[1]}'.")
+                return
+        if len(parts) > 2 and parts[2].strip():
+            try:
+                band_max = float(parts[2].strip())
+            except ValueError:
+                self._update_status(f"Invalid band max '{parts[2]}'.")
+                return
+        self._set_band_filter(metric, band_min, band_max)
+        self._apply_filters()
+
     def _toggle_lines_by_query(self, query: str) -> None:
         if not query:
             return
@@ -450,6 +624,14 @@ class RealtimeBestPlotter:
             self._legend_enabled = not self._legend_enabled
             self._refresh_legend(force=True)
             self._redraw(force=True)
+        elif key == "y":
+            self._prompt_metric()
+        elif key == "x":
+            self._x_mode = "rate" if self._x_mode == "elapsed" else "elapsed"
+            self._refresh_lines()
+            self._apply_filters()
+        elif key == "b":
+            self._prompt_band_filter()
 
     def start_indicator(self, indicator_name: str) -> None:
         if not self._ensure_ready():
@@ -462,22 +644,31 @@ class RealtimeBestPlotter:
         series = self._series.get(indicator_name)
         if series:
             series["x"].clear()
-            series["y"].clear()
-            line = self._lines.get(indicator_name)
-            if line is not None:
-                line.set_data([], [])
-            self._ax.relim()
-            self._ax.autoscale_view()
-            self._fig.canvas.draw_idle()
-            self._fig.canvas.flush_events()
+            series["metrics"] = {}
+        else:
+            self._series[indicator_name] = {"x": [], "metrics": {}}
+        line = self._lines.get(indicator_name)
+        if line is not None:
+            line.set_data([], [])
+        self._ax.relim()
+        self._ax.autoscale_view()
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
 
     def set_baseline(self, indicator_name: str, objective: float) -> None:
         if not np.isfinite(objective):
             return
+        self.set_baseline_metrics(indicator_name, {"objective_best": objective})
 
-        self._baseline_values[indicator_name] = objective
+    def set_baseline_metrics(self, indicator_name: str, metrics: Dict[str, float]) -> None:
+        if not metrics:
+            return
+        baseline = self._baseline_values.setdefault(indicator_name, {})
+        baseline.update(metrics)
+        if "objective_best" in baseline:
+            baseline["objective_delta"] = 0.0
 
-    def update(self, indicator_name: str, objective: float) -> None:
+    def update(self, indicator_name: str, objective: float, metrics: Optional[Dict[str, float]] = None) -> None:
         if not self._ensure_ready():
             return
 
@@ -496,14 +687,22 @@ class RealtimeBestPlotter:
             return
         self._best_objectives[indicator_name] = objective
 
-        baseline_value = self._baseline_values.get(indicator_name)
-        delta = objective - baseline_value if baseline_value is not None else objective
-        series = self._series.setdefault(indicator_name, {"x": [], "y": []})
+        metrics_map = dict(metrics or {})
+        if "objective_best" not in metrics_map:
+            metrics_map["objective_best"] = objective
+        baseline_obj = self._baseline_values.get(indicator_name, {}).get("objective_best")
+        metrics_map.setdefault(
+            "objective_delta",
+            metrics_map["objective_best"] - baseline_obj if baseline_obj is not None else metrics_map["objective_best"]
+        )
+        series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}})
         series["x"].append(elapsed)
-        series["y"].append(delta)
+        for key in _METRIC_KEYS:
+            series["metrics"].setdefault(key, []).append(metrics_map.get(key))
         if len(series["x"]) > self._max_points:
             series["x"] = series["x"][-self._max_points:]
-            series["y"] = series["y"][-self._max_points:]
+            for key in _METRIC_KEYS:
+                series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
         line = self._lines.get(indicator_name)
         if line is None:
@@ -524,7 +723,8 @@ class RealtimeBestPlotter:
                 line.set_visible(False)
             self._refresh_legend()
 
-        line.set_data(series["x"], series["y"])
+        x_vals, y_vals = self._get_series_xy(indicator_name)
+        line.set_data(x_vals, y_vals)
         self._redraw()
 
 
@@ -545,6 +745,9 @@ class PlotlyRealtimePlotter:
         self._lock = threading.Lock()
         self._opened = False
         self._last_options = {"indicator": [], "symbol": [], "timeframe": []}
+        self._default_y_metric = "objective_delta"
+        self._default_x_mode = "elapsed"
+        self._default_band_metric = "objective_overall"
 
     def _parse_label(self, label: str):
         indicator = label
@@ -588,7 +791,8 @@ class PlotlyRealtimePlotter:
             return self._enabled
         self._init_attempted = True
         try:
-            from dash import Dash, dcc, html, Input, Output, ctx
+            from dash import Dash, dcc, html, Input, Output, State, ctx
+            from dash.dependencies import ALL
             import plotly.graph_objects as go
         except Exception as exc:
             logger.info("Plotly realtime plot disabled (dash/plotly not available): %s", exc)
@@ -597,6 +801,7 @@ class PlotlyRealtimePlotter:
 
         self._port = self._find_free_port()
         self._app = Dash(__name__)
+        metric_options = [{"label": _metric_label(key), "value": key} for key in _METRIC_KEYS]
 
         self._app.layout = html.Div(
             style={
@@ -608,15 +813,15 @@ class PlotlyRealtimePlotter:
                 html.Div(
                     style={"marginBottom": "8px"},
                     children=[
-                        html.H3("Objective Delta (Best vs Baseline)", style={"margin": "0 0 6px 0"}),
+                        html.H3("Optimization Metric Explorer", style={"margin": "0 0 6px 0"}),
                         html.Div(
-                            "Filter by indicator, symbol, and timeframe (multi-select).",
+                            "Filter by indicator, symbol, timeframe, and metric bands.",
                             style={"fontSize": "12px", "color": "#555"}
                         ),
                     ],
                 ),
                 html.Div(
-                    style={"display": "flex", "gap": "8px", "marginBottom": "8px"},
+                    style={"display": "grid", "gap": "8px", "marginBottom": "8px", "gridTemplateColumns": "2fr 2fr 2fr auto"},
                     children=[
                         dcc.Dropdown(
                             id="indicator-filter",
@@ -639,10 +844,76 @@ class PlotlyRealtimePlotter:
                         html.Button("Clear Filters", id="clear-filters", n_clicks=0),
                     ],
                 ),
+                html.Div(
+                    style={"display": "grid", "gap": "8px", "marginBottom": "8px", "gridTemplateColumns": "2fr 1fr 2fr 1fr 1fr"},
+                    children=[
+                        dcc.Dropdown(
+                            id="y-metric",
+                            options=metric_options,
+                            value=self._default_y_metric,
+                            clearable=False
+                        ),
+                        dcc.Dropdown(
+                            id="x-axis",
+                            options=[
+                                {"label": "Elapsed (s)", "value": "elapsed"},
+                                {"label": "Improvement rate (/s)", "value": "rate"},
+                            ],
+                            value=self._default_x_mode,
+                            clearable=False
+                        ),
+                        dcc.Dropdown(
+                            id="band-metric",
+                            options=metric_options,
+                            value=self._default_band_metric,
+                            clearable=True,
+                            placeholder="Band metric"
+                        ),
+                        dcc.Input(
+                            id="band-min",
+                            type="number",
+                            placeholder="Band min",
+                            debounce=True
+                        ),
+                        dcc.Input(
+                            id="band-max",
+                            type="number",
+                            placeholder="Band max",
+                            debounce=True
+                        ),
+                    ],
+                ),
                 dcc.Graph(
                     id="objective-graph",
                     config={"displayModeBar": True, "responsive": True},
                     style={"height": "72vh"}
+                ),
+                dcc.Store(id="hidden-series", data=[]),
+                html.Div(
+                    id="legend-box",
+                    style={
+                        "marginTop": "8px",
+                        "padding": "6px 8px",
+                        "backgroundColor": "#ffffff",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "fontSize": "12px",
+                        "maxHeight": "140px",
+                        "overflowY": "auto"
+                    },
+                    children="Legend: no series yet."
+                ),
+                html.Div(
+                    id="click-details",
+                    style={
+                        "marginTop": "8px",
+                        "padding": "8px 10px",
+                        "backgroundColor": "#ffffff",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "fontSize": "12px"
+                    },
+                    children="Click a line to reveal the exact combo and values."
                 ),
                 dcc.Interval(id="update-interval", interval=1000, n_intervals=0),
             ],
@@ -664,16 +935,32 @@ class PlotlyRealtimePlotter:
                 [{"label": v, "value": v} for v in timeframes],
             )
 
-        def build_figure(indicators, symbols, timeframes):
+        def build_figure(indicators, symbols, timeframes, y_metric, x_mode, band_metric, band_min, band_max, hidden):
             with self._lock:
-                series = {k: v.copy() for k, v in self._series.items()}
+                series = {
+                    k: {
+                        "x": list(v.get("x", [])),
+                        "metrics": {mk: list(mv) for mk, mv in v.get("metrics", {}).items()},
+                    }
+                    for k, v in self._series.items()
+                }
                 meta = dict(self._line_meta)
+                baselines = {k: dict(v) for k, v in self._baseline_values.items()}
 
             indicators = set(indicators or [])
             symbols = set(symbols or [])
             timeframes = set(timeframes or [])
+            if y_metric not in _METRIC_DEFS:
+                y_metric = self._default_y_metric
+            if x_mode not in ("elapsed", "rate"):
+                x_mode = self._default_x_mode
+            if band_metric not in _METRIC_DEFS:
+                band_metric = None
+            band_enabled = band_metric is not None and (band_min is not None or band_max is not None)
 
             fig = go.Figure()
+            hidden_set = set(hidden or [])
+            visible_labels = []
             for label, points in series.items():
                 meta_info = meta.get(label, {})
                 if indicators and meta_info.get("indicator") not in indicators:
@@ -684,29 +971,64 @@ class PlotlyRealtimePlotter:
                     continue
 
                 x_vals = points.get("x", [])
-                y_vals = points.get("y", [])
+                y_vals = points.get("metrics", {}).get(y_metric, [])
                 if not x_vals:
                     continue
+                if not y_vals:
+                    continue
 
+                if band_enabled:
+                    band_vals = points.get("metrics", {}).get(band_metric, [])
+                    latest_band = _last_non_none(band_vals)
+                    if latest_band is None:
+                        continue
+                    if band_min is not None and latest_band < band_min:
+                        continue
+                    if band_max is not None and latest_band > band_max:
+                        continue
+
+                visible_labels.append(label)
+
+                if x_mode == "rate":
+                    baseline_val = baselines.get(label, {}).get(y_metric)
+                    x_vals = _compute_rate_series(x_vals, y_vals, baseline_val)
+
+                x_label = "rate_per_s" if x_mode == "rate" else "elapsed_s"
                 fig.add_trace(
                     go.Scatter(
                         x=x_vals,
                         y=y_vals,
-                        mode="lines",
+                        mode="lines+markers",
                         name=label,
-                        hovertemplate="t=%{x:.1f}s<br>delta=%{y:.4f}<extra></extra>"
+                        uid=label,
+                        customdata=[label] * len(x_vals),
+                        line={"width": 2.5},
+                        marker={"size": 6, "opacity": 0.15},
+                        visible="legendonly" if label in hidden_set else True,
+                        hovertemplate=(
+                            "combo=%{customdata}<br>"
+                            f"{_metric_label(y_metric)}=%{{y:.4f}}<br>"
+                            f"{x_label}=%{{x:.4f}}<extra></extra>"
+                        )
                     )
                 )
 
+            if x_mode == "rate":
+                x_title = f"Improvement rate ({_metric_label(y_metric)} / s)"
+            else:
+                x_title = "Elapsed (s)"
             fig.update_layout(
                 template="plotly_white",
                 margin={"l": 40, "r": 10, "t": 30, "b": 40},
-                legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+                showlegend=False,
+                hovermode="closest",
+                hoverdistance=50,
+                spikedistance=50,
                 uirevision="keep"
             )
-            fig.update_xaxes(title="Elapsed (s)")
-            fig.update_yaxes(title="Objective Delta")
-            return fig
+            fig.update_xaxes(title=x_title)
+            fig.update_yaxes(title=_metric_label(y_metric))
+            return fig, visible_labels
 
         @self._app.callback(
             Output("objective-graph", "figure"),
@@ -716,17 +1038,40 @@ class PlotlyRealtimePlotter:
             Output("indicator-filter", "value"),
             Output("symbol-filter", "value"),
             Output("timeframe-filter", "value"),
+            Output("band-min", "value"),
+            Output("band-max", "value"),
+            Output("legend-box", "children"),
             Input("update-interval", "n_intervals"),
             Input("indicator-filter", "value"),
             Input("symbol-filter", "value"),
             Input("timeframe-filter", "value"),
             Input("clear-filters", "n_clicks"),
+            Input("y-metric", "value"),
+            Input("x-axis", "value"),
+            Input("band-metric", "value"),
+            Input("band-min", "value"),
+            Input("band-max", "value"),
+            Input("hidden-series", "data"),
         )
-        def update_plot(_, indicator_vals, symbol_vals, timeframe_vals, clear_clicks):
+        def update_plot(
+            _,
+            indicator_vals,
+            symbol_vals,
+            timeframe_vals,
+            clear_clicks,
+            y_metric,
+            x_mode,
+            band_metric,
+            band_min,
+            band_max,
+            hidden_series
+        ):
             if ctx.triggered_id == "clear-filters":
                 indicator_vals = []
                 symbol_vals = []
                 timeframe_vals = []
+                band_min = None
+                band_max = None
 
             indicator_opts, symbol_opts, timeframe_opts = build_options()
 
@@ -734,7 +1079,42 @@ class PlotlyRealtimePlotter:
             symbol_vals = [v for v in (symbol_vals or []) if v in self._last_options["symbol"]]
             timeframe_vals = [v for v in (timeframe_vals or []) if v in self._last_options["timeframe"]]
 
-            fig = build_figure(indicator_vals, symbol_vals, timeframe_vals)
+            fig, visible_labels = build_figure(
+                indicator_vals,
+                symbol_vals,
+                timeframe_vals,
+                y_metric,
+                x_mode,
+                band_metric,
+                band_min,
+                band_max,
+                hidden_series
+            )
+            if visible_labels:
+                hidden_set = set(hidden_series or [])
+                legend_children = []
+                for label in visible_labels:
+                    is_hidden = label in hidden_set
+                    legend_children.append(
+                        html.Button(
+                            label,
+                            id={"type": "legend-item", "label": label},
+                            n_clicks=0,
+                            **{"data-label": label},
+                            style={
+                                "display": "block",
+                                "width": "100%",
+                                "textAlign": "left",
+                                "border": "none",
+                                "background": "none",
+                                "padding": "2px 0",
+                                "cursor": "pointer",
+                                "color": "#999" if is_hidden else "#222"
+                            }
+                        )
+                    )
+            else:
+                legend_children = "Legend: no series match the filters."
             return (
                 fig,
                 indicator_opts,
@@ -743,7 +1123,49 @@ class PlotlyRealtimePlotter:
                 indicator_vals,
                 symbol_vals,
                 timeframe_vals,
+                band_min,
+                band_max,
+                legend_children,
             )
+
+        @self._app.callback(
+            Output("hidden-series", "data"),
+            Input({"type": "legend-item", "label": ALL}, "n_clicks"),
+            State("hidden-series", "data"),
+        )
+        def toggle_hidden_series(_, hidden_series):
+            if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
+                return hidden_series or []
+            label = ctx.triggered_id.get("label")
+            if not label:
+                return hidden_series or []
+            hidden = list(hidden_series or [])
+            if label in hidden:
+                hidden.remove(label)
+            else:
+                hidden.append(label)
+            return hidden
+
+        @self._app.callback(
+            Output("click-details", "children"),
+            Input("objective-graph", "clickData"),
+            Input("objective-graph", "hoverData"),
+        )
+        def show_click_details(click_data, hover_data):
+            prop_id = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+            if prop_id.endswith("clickData") and click_data:
+                source = click_data
+            elif prop_id.endswith("hoverData") and hover_data:
+                source = hover_data
+            else:
+                source = click_data or hover_data
+            if not source or "points" not in source or not source["points"]:
+                return "Click a line to reveal the exact combo and values."
+            point = source["points"][0]
+            combo = point.get("customdata") or point.get("text") or "N/A"
+            x_val = point.get("x")
+            y_val = point.get("y")
+            return f"combo={combo} | x={x_val:.4f} | y={y_val:.4f}"
 
         def run_server():
             run_fn = getattr(self._app, "run", None)
@@ -779,7 +1201,7 @@ class PlotlyRealtimePlotter:
             return
         with self._lock:
             self._start_times[indicator_name] = time.time()
-            self._series[indicator_name] = {"x": [], "y": []}
+            self._series[indicator_name] = {"x": [], "metrics": {}}
             self._baseline_values.pop(indicator_name, None)
             self._register_line(indicator_name)
 
@@ -787,9 +1209,21 @@ class PlotlyRealtimePlotter:
         if not self._ensure_ready():
             return
         with self._lock:
-            self._baseline_values[indicator_name] = objective
+            self._baseline_values.setdefault(indicator_name, {})["objective_best"] = objective
+            self._baseline_values[indicator_name]["objective_delta"] = 0.0
 
-    def update(self, indicator_name: str, objective: float) -> None:
+    def set_baseline_metrics(self, indicator_name: str, metrics: Dict[str, float]) -> None:
+        if not self._ensure_ready():
+            return
+        if not metrics:
+            return
+        with self._lock:
+            baseline = self._baseline_values.setdefault(indicator_name, {})
+            baseline.update(metrics)
+            if "objective_best" in baseline:
+                baseline["objective_delta"] = 0.0
+
+    def update(self, indicator_name: str, objective: float, metrics: Optional[Dict[str, float]] = None) -> None:
         if not self._ensure_ready():
             return
         now = time.time()
@@ -799,14 +1233,22 @@ class PlotlyRealtimePlotter:
                 start_time = now
                 self._start_times[indicator_name] = start_time
             elapsed = now - start_time
-            baseline = self._baseline_values.get(indicator_name)
-            delta = objective - baseline if baseline is not None else objective
-            series = self._series.setdefault(indicator_name, {"x": [], "y": []})
+            metrics_map = dict(metrics or {})
+            if "objective_best" not in metrics_map:
+                metrics_map["objective_best"] = objective
+            baseline_obj = self._baseline_values.get(indicator_name, {}).get("objective_best")
+            metrics_map.setdefault(
+                "objective_delta",
+                metrics_map["objective_best"] - baseline_obj if baseline_obj is not None else metrics_map["objective_best"]
+            )
+            series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}})
             series["x"].append(elapsed)
-            series["y"].append(delta)
+            for key in _METRIC_KEYS:
+                series["metrics"].setdefault(key, []).append(metrics_map.get(key))
             if len(series["x"]) > self._max_points:
                 series["x"] = series["x"][-self._max_points:]
-                series["y"] = series["y"][-self._max_points:]
+                for key in _METRIC_KEYS:
+                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
             if indicator_name not in self._line_meta:
                 self._register_line(indicator_name)
 
@@ -1263,6 +1705,9 @@ class PineOptimizer:
         self.last_improvement_trial = None
         self.last_improvement_time = None
         self._plot_initialized = False
+        self._baseline_metrics = None
+        self._baseline_objective = None
+        self._baseline_metrics_map = {}
 
     def _parse_interval_seconds(self, interval: str) -> Optional[int]:
         """Convert interval string (e.g., 1h, 4h, 1d) to seconds."""
@@ -1450,6 +1895,7 @@ class PineOptimizer:
         # Evaluate across all symbols/timeframes
         total_objective = 0.0
         symbol_count = 0
+        metrics_list = []
         
         for key in self.translators:
             translator = self.translators[key]
@@ -1461,12 +1907,13 @@ class PineOptimizer:
                 
                 # Evaluate performance
                 metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
-                
+
                 # Calculate objective
                 obj = backtester.calculate_objective(metrics)
-                
+
                 total_objective += obj
                 symbol_count += 1
+                metrics_list.append(metrics)
                 
             except Exception as e:
                 logger.debug(f"Trial failed for {key}: {e}")
@@ -1483,7 +1930,7 @@ class PineOptimizer:
             return 0.0
         
         avg_objective = total_objective / symbol_count
-        
+
         # Track best and report improvement rate vs original config
         improvement_info = self.progress_tracker.update(avg_objective, params)
         if improvement_info:
@@ -1492,12 +1939,19 @@ class PineOptimizer:
             rate_pct = improvement_info['improvement_rate_pct']
             baseline = improvement_info['baseline_objective']
 
+            aggregated_metrics = self._aggregate_metrics(metrics_list)
+            metrics_map = _metrics_from_backtest(aggregated_metrics)
+            metrics_map["objective_best"] = avg_objective
+            metrics_map["objective_overall"] = calculate_objective_score(aggregated_metrics)
+
             if self.realtime_plotter:
                 if not self._plot_initialized:
                     self.realtime_plotter.start_indicator(self.indicator_name)
                     self.realtime_plotter.set_baseline(self.indicator_name, baseline)
+                    if self._baseline_metrics_map:
+                        self.realtime_plotter.set_baseline_metrics(self.indicator_name, self._baseline_metrics_map)
                     self._plot_initialized = True
-                self.realtime_plotter.update(self.indicator_name, avg_objective)
+                self.realtime_plotter.update(self.indicator_name, avg_objective, metrics_map)
             
             # Format sign for improvement vs original
             sign = "+" if pct_vs_original >= 0 else ""
@@ -1592,6 +2046,12 @@ class PineOptimizer:
         else:
             original_metrics = self._aggregate_metrics(list(original_per_symbol.values()))
         original_objective = self._calculate_avg_objective(original_per_symbol)
+
+        self._baseline_metrics = original_metrics
+        self._baseline_objective = original_objective
+        self._baseline_metrics_map = _metrics_from_backtest(original_metrics)
+        self._baseline_metrics_map["objective_best"] = original_objective
+        self._baseline_metrics_map["objective_overall"] = calculate_objective_score(original_metrics)
         
         self.start_time = time.time()
         self.trial_count = 0
