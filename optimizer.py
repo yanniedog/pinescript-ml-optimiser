@@ -11,6 +11,8 @@ import logging
 import time
 import sys
 import threading
+import socket
+import webbrowser
 import re
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
@@ -131,6 +133,8 @@ class RealtimeBestPlotter:
         self._plt = None
         self._fig = None
         self._ax = None
+        self._ui_axes = {}
+        self._ui_widgets = {}
         self._lines = {}
         self._series = {}
         self._indicator_colors = {}
@@ -139,6 +143,28 @@ class RealtimeBestPlotter:
         self._color_index = 0
         self._start_times = {}
         self._best_objectives = {}
+        self._last_draw_time = 0.0
+        self._min_draw_interval = 0.25
+        self._last_autoscale_time = 0.0
+        self._autoscale_interval = 1.0
+        self._max_points = 300
+        self._legend = None
+        self._legend_enabled = True
+        self._legend_max_lines = 25
+        self._legend_map = {}
+        self._last_legend_update = 0.0
+        self._legend_update_interval = 2.0
+        self._line_meta = {}
+        self._filters = {
+            "indicator": set(),
+            "symbol": set(),
+            "timeframe": set()
+        }
+        self._status_text = None
+        self._indicator_input = None
+        self._symbol_input = None
+        self._timeframe_input = None
+        self._toggle_input = None
 
     def _ensure_ready(self) -> bool:
         if self._init_attempted:
@@ -147,6 +173,7 @@ class RealtimeBestPlotter:
         try:
             import matplotlib.pyplot as plt
             from matplotlib import cm
+            from matplotlib.widgets import RadioButtons, TextBox, Button
         except Exception as exc:
             logger.info("Realtime plot disabled (matplotlib not available): %s", exc)
             self._enabled = False
@@ -157,14 +184,31 @@ class RealtimeBestPlotter:
             self._colors = list(cm.tab20.colors)
             self._plt.ion()
             self._fig, self._ax = self._plt.subplots()
+            self._fig.subplots_adjust(right=0.78, bottom=0.18)
             self._ax.set_title("Best Objective Improvement vs Baseline")
             self._ax.set_xlabel("Elapsed time (s)")
             self._ax.set_ylabel("Objective Delta (best - baseline)")
             self._ax.grid(True, alpha=0.3)
+            self._status_text = self._ax.text(
+                0.01,
+                0.99,
+                "Filters: all | UI: indicator/symbol/timeframe | Click line to toggle",
+                transform=self._ax.transAxes,
+                va="top",
+                ha="left",
+                fontsize=8
+            )
+            self._init_ui(RadioButtons, TextBox, Button)
             self._fig.tight_layout()
             self._fig.show()
             self._fig.canvas.draw()
+            self._fig.canvas.mpl_connect("pick_event", self._on_pick)
+            self._fig.canvas.mpl_connect("key_press_event", self._on_key_press)
             self._enabled = True
+            logger.info(
+                "Realtime plot controls: UI panel or keys A(all) I(indicator) "
+                "S(symbol) T(timeframe) L(legend)."
+            )
             return True
         except Exception as exc:
             logger.info("Realtime plot disabled (matplotlib backend error): %s", exc)
@@ -182,6 +226,230 @@ class RealtimeBestPlotter:
             self._color_index += 1
         self._indicator_colors[indicator_name] = color
         return color
+
+    def _parse_label(self, label: str):
+        indicator = label
+        symbol = ""
+        timeframe = ""
+        if ":" in label:
+            indicator, remainder = label.split(":", 1)
+            if "@" in remainder:
+                symbol, timeframe = remainder.split("@", 1)
+            else:
+                symbol = remainder
+        return indicator.strip(), symbol.strip(), timeframe.strip()
+
+    def _register_line(self, label: str) -> None:
+        indicator, symbol, timeframe = self._parse_label(label)
+        self._line_meta[label] = {
+            "indicator": indicator.lower(),
+            "symbol": symbol.lower(),
+            "timeframe": timeframe.lower()
+        }
+
+    def _update_status(self, text: str) -> None:
+        if self._status_text is None:
+            return
+        self._status_text.set_text(text)
+
+    def _init_ui(self, RadioButtons, TextBox, Button) -> None:
+        self._ui_axes["indicator_input"] = self._fig.add_axes([0.80, 0.74, 0.18, 0.05])
+        self._indicator_input = TextBox(self._ui_axes["indicator_input"], "Indicators", initial="")
+
+        self._ui_axes["symbol_input"] = self._fig.add_axes([0.80, 0.67, 0.18, 0.05])
+        self._symbol_input = TextBox(self._ui_axes["symbol_input"], "Symbols", initial="")
+
+        self._ui_axes["timeframe_input"] = self._fig.add_axes([0.80, 0.60, 0.18, 0.05])
+        self._timeframe_input = TextBox(self._ui_axes["timeframe_input"], "Timeframes", initial="")
+
+        self._ui_axes["apply"] = self._fig.add_axes([0.80, 0.53, 0.18, 0.05])
+        self._ui_widgets["apply"] = Button(self._ui_axes["apply"], "Apply Filters")
+        self._ui_widgets["apply"].on_clicked(self._on_apply_filters)
+
+        self._ui_axes["clear"] = self._fig.add_axes([0.80, 0.47, 0.18, 0.05])
+        self._ui_widgets["clear"] = Button(self._ui_axes["clear"], "Clear Filters")
+        self._ui_widgets["clear"].on_clicked(self._on_clear_filters)
+
+        self._ui_axes["legend"] = self._fig.add_axes([0.80, 0.41, 0.18, 0.05])
+        self._ui_widgets["legend"] = Button(self._ui_axes["legend"], "Toggle Legend")
+        self._ui_widgets["legend"].on_clicked(self._on_toggle_legend)
+
+        self._ui_axes["toggle_input"] = self._fig.add_axes([0.80, 0.33, 0.18, 0.05])
+        self._toggle_input = TextBox(self._ui_axes["toggle_input"], "Toggle", initial="")
+
+        self._ui_axes["toggle_btn"] = self._fig.add_axes([0.80, 0.27, 0.18, 0.05])
+        self._ui_widgets["toggle_btn"] = Button(self._ui_axes["toggle_btn"], "Toggle Lines")
+        self._ui_widgets["toggle_btn"].on_clicked(self._on_toggle_lines)
+
+    def _on_apply_filters(self, _event) -> None:
+        indicator_text = self._indicator_input.text if self._indicator_input else ""
+        symbol_text = self._symbol_input.text if self._symbol_input else ""
+        timeframe_text = self._timeframe_input.text if self._timeframe_input else ""
+
+        self._filters["indicator"] = {
+            t.strip().lower()
+            for t in indicator_text.split(",")
+            if t.strip()
+        }
+        self._filters["symbol"] = {
+            t.strip().upper()
+            for t in symbol_text.split(",")
+            if t.strip()
+        }
+        self._filters["timeframe"] = {
+            t.strip().lower()
+            for t in timeframe_text.split(",")
+            if t.strip()
+        }
+        self._apply_filters()
+
+    def _on_clear_filters(self, _event) -> None:
+        if self._indicator_input:
+            self._indicator_input.set_val("")
+        if self._symbol_input:
+            self._symbol_input.set_val("")
+        if self._timeframe_input:
+            self._timeframe_input.set_val("")
+        self._filters = {"indicator": set(), "symbol": set(), "timeframe": set()}
+        self._apply_filters()
+
+    def _on_toggle_legend(self, _event) -> None:
+        self._legend_enabled = not self._legend_enabled
+        self._refresh_legend(force=True)
+        self._redraw(force=True)
+
+    def _on_toggle_lines(self, _event) -> None:
+        query = self._toggle_input.text if self._toggle_input else ""
+        self._toggle_lines_by_query(query)
+
+    def _refresh_legend(self, force: bool = False) -> None:
+        if not self._legend_enabled or len(self._lines) > self._legend_max_lines:
+            if self._legend is not None:
+                self._legend.remove()
+                self._legend = None
+                self._legend_map = {}
+            return
+        now = time.time()
+        if not force and (now - self._last_legend_update) < self._legend_update_interval:
+            return
+        self._legend = self._ax.legend(loc="best", fontsize=8)
+        self._legend_map = {}
+        for legline, origline in zip(self._legend.legendHandles, self._lines.values()):
+            legline.set_picker(5)
+            legline.set_alpha(1.0 if origline.get_visible() else 0.2)
+            self._legend_map[legline] = origline
+        self._last_legend_update = now
+
+    def _line_matches_filter(self, label: str) -> bool:
+        meta = self._line_meta.get(label, {})
+        indicator_match = True
+        symbol_match = True
+        timeframe_match = True
+
+        if self._filters["indicator"]:
+            indicator_val = meta.get("indicator", "")
+            indicator_match = any(token in indicator_val for token in self._filters["indicator"])
+        if self._filters["symbol"]:
+            symbol_val = meta.get("symbol", "").upper()
+            symbol_match = symbol_val in self._filters["symbol"]
+        if self._filters["timeframe"]:
+            timeframe_val = meta.get("timeframe", "")
+            timeframe_match = timeframe_val in self._filters["timeframe"]
+
+        return indicator_match and symbol_match and timeframe_match
+
+    def _apply_filters(self) -> None:
+        for label, line in self._lines.items():
+            line.set_visible(self._line_matches_filter(label))
+        summary_parts = []
+        if self._filters["indicator"]:
+            summary_parts.append(f"indicator={','.join(sorted(self._filters['indicator']))}")
+        if self._filters["symbol"]:
+            summary_parts.append(f"symbol={','.join(sorted(self._filters['symbol']))}")
+        if self._filters["timeframe"]:
+            summary_parts.append(f"timeframe={','.join(sorted(self._filters['timeframe']))}")
+        summary = "Filters: " + (", ".join(summary_parts) if summary_parts else "all")
+        summary += " | UI: indicator/symbol/timeframe | Click line to toggle"
+        self._update_status(summary)
+        self._refresh_legend(force=True)
+        self._redraw(force=True)
+
+    def _redraw(self, force: bool = False) -> None:
+        if not self._enabled:
+            return
+        now = time.time()
+        if not force and (now - self._last_draw_time) < self._min_draw_interval:
+            return
+        if now - self._last_autoscale_time >= self._autoscale_interval:
+            self._ax.relim()
+            self._ax.autoscale_view()
+            self._last_autoscale_time = now
+        self._fig.canvas.draw_idle()
+        self._fig.canvas.flush_events()
+        self._plt.pause(0.001)
+        self._last_draw_time = now
+
+    def _on_pick(self, event) -> None:
+        artist = event.artist
+        if artist in self._legend_map:
+            line = self._legend_map[artist]
+            line.set_visible(not line.get_visible())
+            self._refresh_legend(force=True)
+            self._redraw(force=True)
+            return
+        for line in self._lines.values():
+            if artist == line:
+                line.set_visible(not line.get_visible())
+                self._refresh_legend(force=True)
+                self._redraw(force=True)
+                return
+
+    def _prompt_filter(self, mode: str, prompt: str) -> None:
+        try:
+            value = input(prompt).strip()
+        except Exception:
+            return
+        if not value:
+            return
+        if mode == "indicator":
+            self._filters["indicator"] = {value.lower()}
+        elif mode == "symbol":
+            self._filters["symbol"] = {value.upper()}
+        elif mode == "timeframe":
+            self._filters["timeframe"] = {value.lower()}
+        self._apply_filters()
+
+    def _toggle_lines_by_query(self, query: str) -> None:
+        if not query:
+            return
+        query_lower = query.lower()
+        toggled = 0
+        for label, line in self._lines.items():
+            if query_lower in label.lower():
+                line.set_visible(not line.get_visible())
+                toggled += 1
+        if toggled == 0:
+            self._update_status(f"Filter: {self._filter_mode} | No lines matched '{query}'")
+        self._refresh_legend(force=True)
+        self._redraw(force=True)
+
+    def _on_key_press(self, event) -> None:
+        if event.key is None:
+            return
+        key = event.key.lower()
+        if key == "a":
+            self._filters = {"indicator": set(), "symbol": set(), "timeframe": set()}
+            self._apply_filters()
+        elif key == "i":
+            self._prompt_filter("indicator", "Filter indicator (substring): ")
+        elif key == "s":
+            self._prompt_filter("symbol", "Filter symbol (exact, e.g., ADAUSDT): ")
+        elif key == "t":
+            self._prompt_filter("timeframe", "Filter timeframe (exact, e.g., 5m): ")
+        elif key == "l":
+            self._legend_enabled = not self._legend_enabled
+            self._refresh_legend(force=True)
+            self._redraw(force=True)
 
     def start_indicator(self, indicator_name: str) -> None:
         if not self._ensure_ready():
@@ -233,6 +501,9 @@ class RealtimeBestPlotter:
         series = self._series.setdefault(indicator_name, {"x": [], "y": []})
         series["x"].append(elapsed)
         series["y"].append(delta)
+        if len(series["x"]) > self._max_points:
+            series["x"] = series["x"][-self._max_points:]
+            series["y"] = series["y"][-self._max_points:]
 
         line = self._lines.get(indicator_name)
         if line is None:
@@ -247,14 +518,297 @@ class RealtimeBestPlotter:
                 color=color
             )
             self._lines[indicator_name] = line
-            self._ax.legend(loc="best", fontsize=8)
+            line.set_picker(5)
+            self._register_line(indicator_name)
+            if not self._line_matches_filter(indicator_name):
+                line.set_visible(False)
+            self._refresh_legend()
 
         line.set_data(series["x"], series["y"])
-        self._ax.relim()
-        self._ax.autoscale_view()
-        self._fig.canvas.draw_idle()
-        self._fig.canvas.flush_events()
-        self._plt.pause(0.001)
+        self._redraw()
+
+
+class PlotlyRealtimePlotter:
+    """Realtime plot using Plotly Dash with filter controls."""
+
+    def __init__(self):
+        self._init_attempted = False
+        self._enabled = False
+        self._app = None
+        self._port = None
+        self._thread = None
+        self._start_times = {}
+        self._series = {}
+        self._baseline_values = {}
+        self._line_meta = {}
+        self._max_points = 300
+        self._lock = threading.Lock()
+        self._opened = False
+        self._last_options = {"indicator": [], "symbol": [], "timeframe": []}
+
+    def _parse_label(self, label: str):
+        indicator = label
+        symbol = ""
+        timeframe = ""
+        if ":" in label:
+            indicator, remainder = label.split(":", 1)
+            if "@" in remainder:
+                symbol, timeframe = remainder.split("@", 1)
+            else:
+                symbol = remainder
+        return indicator.strip(), symbol.strip(), timeframe.strip()
+
+    def _register_line(self, label: str) -> None:
+        indicator, symbol, timeframe = self._parse_label(label)
+        self._line_meta[label] = {
+            "indicator": indicator,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe.lower()
+        }
+
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def _wait_for_server(self, url: str, timeout_s: float = 5.0) -> bool:
+        import urllib.request
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=1) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                time.sleep(0.2)
+        return False
+
+    def _ensure_ready(self) -> bool:
+        if self._init_attempted:
+            return self._enabled
+        self._init_attempted = True
+        try:
+            from dash import Dash, dcc, html, Input, Output, ctx
+            import plotly.graph_objects as go
+        except Exception as exc:
+            logger.info("Plotly realtime plot disabled (dash/plotly not available): %s", exc)
+            self._enabled = False
+            return False
+
+        self._port = self._find_free_port()
+        self._app = Dash(__name__)
+
+        self._app.layout = html.Div(
+            style={
+                "fontFamily": "Helvetica, Arial, sans-serif",
+                "padding": "12px",
+                "backgroundColor": "#f7f7f7"
+            },
+            children=[
+                html.Div(
+                    style={"marginBottom": "8px"},
+                    children=[
+                        html.H3("Objective Delta (Best vs Baseline)", style={"margin": "0 0 6px 0"}),
+                        html.Div(
+                            "Filter by indicator, symbol, and timeframe (multi-select).",
+                            style={"fontSize": "12px", "color": "#555"}
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"display": "flex", "gap": "8px", "marginBottom": "8px"},
+                    children=[
+                        dcc.Dropdown(
+                            id="indicator-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Indicators"
+                        ),
+                        dcc.Dropdown(
+                            id="symbol-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Symbols"
+                        ),
+                        dcc.Dropdown(
+                            id="timeframe-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Timeframes"
+                        ),
+                        html.Button("Clear Filters", id="clear-filters", n_clicks=0),
+                    ],
+                ),
+                dcc.Graph(
+                    id="objective-graph",
+                    config={"displayModeBar": True, "responsive": True},
+                    style={"height": "72vh"}
+                ),
+                dcc.Interval(id="update-interval", interval=1000, n_intervals=0),
+            ],
+        )
+
+        def build_options():
+            with self._lock:
+                indicators = sorted({m["indicator"] for m in self._line_meta.values() if m["indicator"]})
+                symbols = sorted({m["symbol"] for m in self._line_meta.values() if m["symbol"]})
+                timeframes = sorted({m["timeframe"] for m in self._line_meta.values() if m["timeframe"]})
+            self._last_options = {
+                "indicator": indicators,
+                "symbol": symbols,
+                "timeframe": timeframes
+            }
+            return (
+                [{"label": v, "value": v} for v in indicators],
+                [{"label": v, "value": v} for v in symbols],
+                [{"label": v, "value": v} for v in timeframes],
+            )
+
+        def build_figure(indicators, symbols, timeframes):
+            with self._lock:
+                series = {k: v.copy() for k, v in self._series.items()}
+                meta = dict(self._line_meta)
+
+            indicators = set(indicators or [])
+            symbols = set(symbols or [])
+            timeframes = set(timeframes or [])
+
+            fig = go.Figure()
+            for label, points in series.items():
+                meta_info = meta.get(label, {})
+                if indicators and meta_info.get("indicator") not in indicators:
+                    continue
+                if symbols and meta_info.get("symbol") not in symbols:
+                    continue
+                if timeframes and meta_info.get("timeframe") not in timeframes:
+                    continue
+
+                x_vals = points.get("x", [])
+                y_vals = points.get("y", [])
+                if not x_vals:
+                    continue
+
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode="lines",
+                        name=label,
+                        hovertemplate="t=%{x:.1f}s<br>delta=%{y:.4f}<extra></extra>"
+                    )
+                )
+
+            fig.update_layout(
+                template="plotly_white",
+                margin={"l": 40, "r": 10, "t": 30, "b": 40},
+                legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+                uirevision="keep"
+            )
+            fig.update_xaxes(title="Elapsed (s)")
+            fig.update_yaxes(title="Objective Delta")
+            return fig
+
+        @self._app.callback(
+            Output("objective-graph", "figure"),
+            Output("indicator-filter", "options"),
+            Output("symbol-filter", "options"),
+            Output("timeframe-filter", "options"),
+            Output("indicator-filter", "value"),
+            Output("symbol-filter", "value"),
+            Output("timeframe-filter", "value"),
+            Input("update-interval", "n_intervals"),
+            Input("indicator-filter", "value"),
+            Input("symbol-filter", "value"),
+            Input("timeframe-filter", "value"),
+            Input("clear-filters", "n_clicks"),
+        )
+        def update_plot(_, indicator_vals, symbol_vals, timeframe_vals, clear_clicks):
+            if ctx.triggered_id == "clear-filters":
+                indicator_vals = []
+                symbol_vals = []
+                timeframe_vals = []
+
+            indicator_opts, symbol_opts, timeframe_opts = build_options()
+
+            indicator_vals = [v for v in (indicator_vals or []) if v in self._last_options["indicator"]]
+            symbol_vals = [v for v in (symbol_vals or []) if v in self._last_options["symbol"]]
+            timeframe_vals = [v for v in (timeframe_vals or []) if v in self._last_options["timeframe"]]
+
+            fig = build_figure(indicator_vals, symbol_vals, timeframe_vals)
+            return (
+                fig,
+                indicator_opts,
+                symbol_opts,
+                timeframe_opts,
+                indicator_vals,
+                symbol_vals,
+                timeframe_vals,
+            )
+
+        def run_server():
+            run_fn = getattr(self._app, "run", None)
+            if callable(run_fn):
+                run_fn(host="127.0.0.1", port=self._port, debug=False, use_reloader=False)
+            else:
+                self._app.run_server(
+                    host="127.0.0.1",
+                    port=self._port,
+                    debug=False,
+                    use_reloader=False
+                )
+
+        self._thread = threading.Thread(target=run_server, daemon=True)
+        self._thread.start()
+        self._enabled = True
+        logger.info("Plotly realtime chart running at http://127.0.0.1:%s", self._port)
+        url = f"http://127.0.0.1:{self._port}"
+        print(f"[PLOTLY] Realtime chart: {url}")
+        ready = self._wait_for_server(url)
+        if not ready:
+            logger.warning("Plotly server did not respond at %s", url)
+        if not self._opened:
+            try:
+                webbrowser.open(url)
+                self._opened = True
+            except Exception:
+                pass
+        return True
+
+    def start_indicator(self, indicator_name: str) -> None:
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            self._start_times[indicator_name] = time.time()
+            self._series[indicator_name] = {"x": [], "y": []}
+            self._baseline_values.pop(indicator_name, None)
+            self._register_line(indicator_name)
+
+    def set_baseline(self, indicator_name: str, objective: float) -> None:
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            self._baseline_values[indicator_name] = objective
+
+    def update(self, indicator_name: str, objective: float) -> None:
+        if not self._ensure_ready():
+            return
+        now = time.time()
+        with self._lock:
+            start_time = self._start_times.get(indicator_name)
+            if start_time is None:
+                start_time = now
+                self._start_times[indicator_name] = start_time
+            elapsed = now - start_time
+            baseline = self._baseline_values.get(indicator_name)
+            delta = objective - baseline if baseline is not None else objective
+            series = self._series.setdefault(indicator_name, {"x": [], "y": []})
+            series["x"].append(elapsed)
+            series["y"].append(delta)
+            if len(series["x"]) > self._max_points:
+                series["x"] = series["x"][-self._max_points:]
+                series["y"] = series["y"][-self._max_points:]
+            if indicator_name not in self._line_meta:
+                self._register_line(indicator_name)
 
 
 _REALTIME_PLOTTER = None
@@ -263,7 +817,14 @@ _REALTIME_PLOTTER = None
 def get_realtime_plotter() -> RealtimeBestPlotter:
     global _REALTIME_PLOTTER
     if _REALTIME_PLOTTER is None:
-        _REALTIME_PLOTTER = RealtimeBestPlotter()
+        try:
+            plotly_plotter = PlotlyRealtimePlotter()
+            if plotly_plotter._ensure_ready():
+                _REALTIME_PLOTTER = plotly_plotter
+            else:
+                _REALTIME_PLOTTER = RealtimeBestPlotter()
+        except Exception:
+            _REALTIME_PLOTTER = RealtimeBestPlotter()
     return _REALTIME_PLOTTER
 
 

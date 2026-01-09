@@ -16,6 +16,8 @@ class TeeWriter:
     def write(self, data):
         if not data:
             return 0
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         self._stream.write(data)
         self._log_file.write(data)
         return len(data)
