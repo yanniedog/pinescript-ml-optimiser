@@ -9,6 +9,7 @@ import os
 import runpy
 import csv
 import shutil
+import re
 from pathlib import Path
 
 # Ensure we can import our modules
@@ -152,12 +153,25 @@ def download_new_data(dm: DataManager):
     print(f"  Valid timeframes: {', '.join(VALID_INTERVALS)}")
     
     while True:
-        interval = input("  Timeframe [1h]: ").strip().lower()
-        if not interval:
-            interval = "1h"
-        if interval in VALID_INTERVALS:
+        interval_input = input("  Timeframes [1h] (comma/space separated): ").strip().lower()
+        if not interval_input:
+            intervals = ["1h"]
             break
-        print(f"  [ERROR] Invalid. Choose from: {', '.join(VALID_INTERVALS)}")
+        parts = [part for part in re.split(r"[,\s]+", interval_input) if part]
+        invalid = [part for part in parts if part not in VALID_INTERVALS]
+        if invalid:
+            print(
+                "  [ERROR] Invalid timeframe(s): "
+                f"{', '.join(sorted(set(invalid)))}. Choose from: {', '.join(VALID_INTERVALS)}"
+            )
+            continue
+        intervals = []
+        seen = set()
+        for part in parts:
+            if part not in seen:
+                intervals.append(part)
+                seen.add(part)
+        break
     
     # Get symbols
     print(f"\n  Step 2: Enter symbols to download")
@@ -194,7 +208,8 @@ def download_new_data(dm: DataManager):
         break
     
     # Confirm
-    print(f"\n  Will download {len(symbols)} symbols at {interval} timeframe:")
+    print(f"\n  Will download {len(symbols)} symbols across {len(intervals)} timeframe(s):")
+    print(f"    Timeframes: {', '.join(intervals)}")
     print(f"    {', '.join(s + 'USDT' for s in symbols[:10])}")
     if len(symbols) > 10:
         print(f"    ... and {len(symbols) - 10} more")
@@ -206,12 +221,14 @@ def download_new_data(dm: DataManager):
     
     # Download
     print()
-    for symbol in symbols:
-        full_symbol = symbol + 'USDT' if not symbol.endswith('USDT') else symbol
-        try:
-            dm.download_symbol(full_symbol, interval)
-        except Exception as e:
-            print(f"  [ERROR] Failed to download {full_symbol}: {e}")
+    for interval in intervals:
+        print(f"\n  Downloading timeframe: {interval}")
+        for symbol in symbols:
+            full_symbol = symbol + 'USDT' if not symbol.endswith('USDT') else symbol
+            try:
+                dm.download_symbol(full_symbol, interval)
+            except Exception as e:
+                print(f"  [ERROR] Failed to download {full_symbol} @ {interval}: {e}")
     
     print("\n  Download complete!")
 
