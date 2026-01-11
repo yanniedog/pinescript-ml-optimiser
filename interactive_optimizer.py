@@ -1346,8 +1346,11 @@ def run_batch_optimization(dm: DataManager):
         })
         
         if outputs:
+            # Safely get LAST_PINE_PATH - getattr returns None if attribute exists but is None
+            last_path = getattr(optimize_module, "LAST_PINE_PATH", None)
+            indicator_name = (result.best_metrics and last_path and last_path.stem) or pine_file.stem
             results.append({
-                "indicator_name": result.best_metrics and getattr(optimize_module, "LAST_PINE_PATH", pine_file).stem or pine_file.stem,
+                "indicator_name": indicator_name,
                 "file_name": pine_file.name,
                 "output_pine": outputs.get("pine_script"),
                 "output_report": outputs.get("report"),
