@@ -30,6 +30,98 @@ from screen_log import enable_screen_log
 
 BACKUP_DONE = False
 
+TRIAL_CONTROL_OPTIONS = {
+    "max_trials": None,
+    "min_runtime_seconds": None,
+    "stall_seconds": None,
+    "improvement_rate_floor": None,
+}
+
+
+def _get_trial_overrides():
+    """Return the currently configured trial controls."""
+    return {k: v for k, v in TRIAL_CONTROL_OPTIONS.items() if v is not None}
+
+
+def apply_trial_overrides(target: dict):
+    """Apply trial control defaults to a dictionary (preserving existing entries)."""
+    for key, value in _get_trial_overrides().items():
+        if key not in target or target[key] is None:
+            target[key] = value
+
+
+def _prompt_trial_setting(prompt: str, current, cast, validator, invalid_msg: str):
+    """Helper to prompt for trial control values (int/float)."""
+    while True:
+        default = f"[{current}]" if current is not None else "[none]"
+        entry = input(f"  {prompt} {default} (enter 'clear' to reset, blank to keep): ").strip()
+        if not entry:
+            return current
+        if entry.lower() in {"clear", "none"}:
+            return None
+        try:
+            value = cast(entry)
+        except ValueError:
+            print(f"  [ERROR] Invalid number: '{entry}'")
+            continue
+        if not validator(value):
+            print(f"  [ERROR] {invalid_msg}")
+            continue
+        return value
+
+
+def configure_trial_controls():
+    """Interactive menu to configure max/min/stall trial settings."""
+    print("\n" + "=" * 70)
+    print("  Trial Control Settings")
+    print("=" * 70)
+    print(
+        "  These settings are applied to subsequent optimizations "
+        "and persist until cleared."
+    )
+    print("  Set 'max trials' to cap the search, 'min runtime' to prevent early exits,")
+    print("  'stall timeout' to delay the no-improvement guard, and 'improvement floor'")
+    print("  to tune how sensitive the optimizer is to slowing progress.")
+
+    TRIAL_CONTROL_OPTIONS["max_trials"] = _prompt_trial_setting(
+        "Max trials",
+        TRIAL_CONTROL_OPTIONS["max_trials"],
+        int,
+        lambda v: v > 0,
+        "Enter a positive integer."
+    )
+    TRIAL_CONTROL_OPTIONS["min_runtime_seconds"] = _prompt_trial_setting(
+        "Minimum runtime (seconds) before early-stop checks",
+        TRIAL_CONTROL_OPTIONS["min_runtime_seconds"],
+        int,
+        lambda v: v >= 0,
+        "Enter 0 or a positive number."
+    )
+    TRIAL_CONTROL_OPTIONS["stall_seconds"] = _prompt_trial_setting(
+        "Stall timeout (seconds, 0 disables)",
+        TRIAL_CONTROL_OPTIONS["stall_seconds"],
+        int,
+        lambda v: v >= 0,
+        "Enter 0 or a positive number."
+    )
+    TRIAL_CONTROL_OPTIONS["improvement_rate_floor"] = _prompt_trial_setting(
+        "Improvement rate floor (%/s)",
+        TRIAL_CONTROL_OPTIONS["improvement_rate_floor"],
+        float,
+        lambda v: True,
+        "Enter a number."
+    )
+
+    print("\n  Trial controls updated:")
+    for label, key in [
+        ("Max trials", "max_trials"),
+        ("Min runtime (sec)", "min_runtime_seconds"),
+        ("Stall timeout (sec)", "stall_seconds"),
+        ("Improvement rate floor", "improvement_rate_floor"),
+    ]:
+        value = TRIAL_CONTROL_OPTIONS[key]
+        print(f"    {label}: {value if value is not None else 'none'}")
+
 
 def split_choice_input(raw: str):
     """Split user input by commas or whitespace."""
@@ -1040,6 +1132,8 @@ def run_optimization(dm: DataManager):
     else:
         print("Using defaults: 1h timeframe, all available symbols")
         options['interval'] = '1h'
+
+    apply_trial_overrides(options)
     
     # Run optimization
     original_argv = sys.argv
@@ -1192,6 +1286,8 @@ def run_batch_optimization(dm: DataManager):
     else:
         print("Using defaults: 1h timeframe, all available symbols")
         options['interval'] = '1h'
+
+    apply_trial_overrides(options)
     
     rankings = []
     results = []
@@ -1523,17 +1619,22 @@ def run_matrix_optimization(dm: DataManager):
 
         combo_label = f"{parse_result.indicator_name or pine_file.stem}:{symbol}@{interval}"
 
+        run_kwargs = {
+            "interval": interval,
+            "max_trials": None,
+            "timeout_seconds": combo_timeout,
+            "min_runtime_seconds": combo_timeout,
+            "stall_seconds": combo_timeout + 1,
+            "improvement_rate_floor": 0.0,
+            "indicator_label": combo_label,
+        }
+        apply_trial_overrides(run_kwargs)
+
         try:
             result = run_optimizer(
                 parse_result,
                 data,
-                interval=interval,
-                max_trials=None,
-                timeout_seconds=combo_timeout,
-                min_runtime_seconds=combo_timeout,
-                stall_seconds=combo_timeout + 1,
-                improvement_rate_floor=0.0,
-                indicator_label=combo_label
+                **run_kwargs
             )
         except KeyboardInterrupt:
             print("\n\nMatrix optimization interrupted by user.")
@@ -1620,6 +1721,7 @@ def main_menu():
     [3] View available data
     [4] Optimize ALL indicators in a directory
     [5] Optimize all indicators per symbol/timeframe (matrix)
+    [6] Configure trial controls (max/min/stall)
     [Q] Quit
 """)
         
@@ -1636,6 +1738,8 @@ def main_menu():
             run_batch_optimization(dm)
         elif choice == '5':
             run_matrix_optimization(dm)
+        elif choice == '6':
+            configure_trial_controls()
         elif choice == 'q':
             print("\nGoodbye!")
             break

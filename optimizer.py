@@ -992,6 +992,7 @@ class PlotlyRealtimePlotter:
                         "x": list(v.get("x", [])),
                         "metrics": {mk: list(mv) for mk, mv in v.get("metrics", {}).items()},
                         "params": list(v.get("params", [])),
+                        "trials": list(v.get("trials", [])),
                     }
                     for k, v in self._series.items()
                 }
@@ -2176,7 +2177,8 @@ class PineOptimizer:
         self.progress_tracker.start()
         self._plot_initialized = False
         self.last_improvement_trial = 0
-        self.last_improvement_time = self.start_time
+        # Don't start the stall timer until the first improvement completes (1m data can take a while per trial).
+        self.last_improvement_time = None
         if self.stall_seconds is None:
             self.stall_seconds = max(10, len(self.optimizable_params) * 4)
         
