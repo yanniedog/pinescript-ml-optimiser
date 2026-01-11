@@ -11,6 +11,24 @@ import csv
 import shutil
 import re
 from pathlib import Path
+import builtins
+
+# Allow overriding input to support go-back shortcuts.
+_ORIGINAL_INPUT = builtins.input
+
+
+def _input_with_go_back(prompt=""):
+    response = _ORIGINAL_INPUT(prompt)
+    if response is not None and response.strip().lower() in {"b", "back", "go back"}:
+        raise GoBack()
+    return response
+
+
+class GoBack(Exception):
+    """Raised when the user requests to go back in a menu."""
+
+
+builtins.input = _input_with_go_back
 
 # Ensure we can import our modules
 sys.path.insert(0, str(Path(__file__).parent))
@@ -23,12 +41,24 @@ from output_generator import generate_outputs
 import argparse
 import json
 import time
-from typing import Optional
+from typing import Optional, Callable
 
 from objective import calculate_objective_score as objective_score
 from screen_log import enable_screen_log
 
 BACKUP_DONE = False
+
+
+def handle_go_back(message: str = "[INFO] Returning to previous menu.") -> Callable:
+    """Decorator to catch GoBack and show a message."""
+    def decorator(fn):
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except GoBack:
+                print("\n" + message)
+        return wrapper
+    return decorator
 
 TRIAL_CONTROL_OPTIONS = {
     "max_trials": None,
@@ -70,8 +100,10 @@ def _prompt_trial_setting(prompt: str, current, cast, validator, invalid_msg: st
         return value
 
 
+@handle_go_back("[INFO] Returning to main menu.")
 def configure_trial_controls():
     """Interactive menu to configure max/min/stall trial settings."""
+    print("\n  Enter 'B' at any prompt to return to the previous menu.")
     print("\n" + "=" * 70)
     print("  Trial Control Settings")
     print("=" * 70)
@@ -258,8 +290,10 @@ def select_timeframe(dm: DataManager) -> str:
         print(f"  [ERROR] Invalid timeframe. Valid options: {', '.join(VALID_INTERVALS)}")
 
 
+@handle_go_back("[INFO] Returning to main menu.")
 def download_new_data(dm: DataManager):
     """Interactive data download."""
+    print("\n  Enter 'B' at any prompt to return to the previous menu.")
     print("\n" + "="*70)
     print("  Download New Data")
     print("="*70)
@@ -1080,8 +1114,10 @@ def backup_previous_outputs():
     BACKUP_DONE = True
 
 
+@handle_go_back("[INFO] Returning to main menu.")
 def run_optimization(dm: DataManager):
     """Run the optimization workflow."""
+    print("\n  Enter 'B' at any prompt to return to the previous menu.")
     backup_previous_outputs()
     pine_files = get_pine_files()
     
@@ -1157,8 +1193,10 @@ def sort_rankings(rankings: list) -> list:
     return sorted(rankings, key=lambda r: r.get("score", 0), reverse=True)
 
 
+@handle_go_back("[INFO] Returning to main menu.")
 def run_batch_optimization(dm: DataManager):
     """Run optimization across all indicators in a directory with ranking."""
+    print("\n  Enter 'B' at any prompt to return to the previous menu.")
     backup_previous_outputs()
     generated = maybe_generate_all_indicators()
     
@@ -1426,8 +1464,10 @@ def run_batch_optimization(dm: DataManager):
     )
 
 
+@handle_go_back("[INFO] Returning to main menu.")
 def run_matrix_optimization(dm: DataManager):
     """Run optimization independently for each indicator-symbol-timeframe combination."""
+    print("\n  Enter 'B' at any prompt to return to the previous menu.")
     backup_previous_outputs()
     generated = maybe_generate_all_indicators()
 
@@ -1727,8 +1767,12 @@ def main_menu():
     [6] Configure trial controls (max/min/stall)
     [Q] Quit
 """)
-        
-        choice = input("  Select option: ").strip().lower()
+        print("  Enter 'B' at any prompt to return to the previous menu (main menu only).")
+        try:
+            choice = input("  Select option: ").strip().lower()
+        except GoBack:
+            print("  [INFO] Already at the main menu.")
+            continue
         
         if choice == '1':
             run_optimization(dm)
