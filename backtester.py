@@ -402,7 +402,7 @@ class WalkForwardBacktester:
             tn=total_tn,
             fp=total_fp,
             fn=total_fn,
-            mcc_threshold=float(np.median(fold_thresholds)) if fold_thresholds else 0.0,
+            mcc_threshold=float(np.median([t for t in fold_thresholds if t is not None])) if fold_thresholds and any(t is not None for t in fold_thresholds) else 0.0,
             trades=all_trades
         )
 
@@ -555,7 +555,7 @@ class WalkForwardBacktester:
         indicator_result: IndicatorResult,
         use_discrete_signals: bool,
         fold: Optional[WalkForwardFold] = None
-    ) -> Tuple[int, float]:
+    ) -> Tuple[int, Optional[float]]:
         """
         Find the forecast horizon with best MCC on training data.
         
@@ -566,11 +566,13 @@ class WalkForwardBacktester:
                   If None, uses all data (for backwards compatibility, but should be avoided)
         
         Returns:
-            Optimal forecast horizon in bars and training MCC threshold
+            Optimal forecast horizon in bars and training MCC threshold.
+            If no valid training data exists, returns horizon with threshold=None (caller should handle).
         """
         best_horizon = self.forecast_horizons[0] if self.forecast_horizons else 24  # Default
         best_mcc = -1.0
-        best_threshold = 0.0
+        best_threshold = None  # Use None to indicate no valid threshold found
+        found_valid_data = False
 
         if fold is None:
             # No fold provided - use all data (backwards compatibility)
@@ -595,10 +597,30 @@ class WalkForwardBacktester:
                 end_idx=end_idx
             )
             threshold, mcc = self._select_mcc_threshold(scores, labels)
-            if mcc > best_mcc:
-                best_mcc = mcc
-                best_horizon = horizon
-                best_threshold = threshold
+            # Only update if we have valid data (non-empty and non-degenerate)
+            # _select_mcc_threshold returns (0.0, 0.0) for invalid data, but we also check if we have samples
+            if len(labels) > 0 and len(scores) > 0 and mcc > best_mcc:
+                # Verify we have both positive and negative labels (non-degenerate)
+                pos_count = int(np.sum(labels == 1))
+                neg_count = int(np.sum(labels == 0))
+                if pos_count > 0 and neg_count > 0:
+                    found_valid_data = True
+                    best_mcc = mcc
+                    best_horizon = horizon
+                    best_threshold = threshold
+
+        # If no valid training data found, log warning and use neutral threshold
+        if not found_valid_data:
+            logger.warning(
+                f"No valid training data found for horizon selection in fold "
+                f"(train_start={fold.train_start if fold else 'N/A'}, "
+                f"train_end={fold.train_end if fold else 'N/A'}). "
+                f"All horizons returned empty or degenerate classification data. "
+                f"Using neutral threshold (median of test scores) which may bias metrics."
+            )
+            # Return None as threshold to signal invalid training data
+            # The caller (_evaluate_fold) will handle this by using a neutral threshold
+            best_threshold = None
 
         return best_horizon, best_threshold
     
@@ -757,7 +779,7 @@ class WalkForwardBacktester:
         indicator_result: IndicatorResult,
         fold: WalkForwardFold,
         horizon: int,
-        threshold: float,
+        threshold: Optional[float],
         use_discrete_signals: bool
     ) -> BacktestMetrics:
         """
@@ -911,8 +933,28 @@ class WalkForwardBacktester:
             start_idx=test_start,
             end_idx=effective_end
         )
+        
+        # Determine classification threshold
+        # Handle case where no valid training threshold was found
+        # Use neutral threshold (median of test scores) to avoid bias from 0.0 threshold
+        if threshold is None:
+            if len(scores) > 0:
+                classification_threshold = float(np.median(scores))
+                logger.warning(
+                    f"Using neutral threshold (median={classification_threshold:.4f}) for classification "
+                    f"in fold (test_start={test_start}, test_end={effective_end}) because no valid "
+                    f"training threshold was found. This may bias classification metrics."
+                )
+            else:
+                classification_threshold = 0.0
+                logger.warning(
+                    f"No test scores available for classification in fold. Using threshold=0.0."
+                )
+        else:
+            classification_threshold = threshold
+        
         if len(labels) > 0:
-            preds = scores >= threshold
+            preds = scores >= classification_threshold
             pos_mask = labels == 1
             neg_mask = ~pos_mask
             tp = int(np.sum(preds & pos_mask))
@@ -954,7 +996,7 @@ class WalkForwardBacktester:
             tn=tn,
             fp=fp,
             fn=fn,
-            mcc_threshold=threshold,
+            mcc_threshold=classification_threshold,
             trades=trades
         )
     
