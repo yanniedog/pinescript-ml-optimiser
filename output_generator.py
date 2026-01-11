@@ -107,14 +107,38 @@ class OutputGenerator:
                     all_orig_metrics = []
                     for timeframe, metrics_dict in timeframes_dict.items():
                         all_orig_metrics.append(metrics_dict.get('original', BacktestMetrics()))
-                    
-                    # Simple average for now
+
+                    def _aggregate_classification(metrics_list):
+                        total_tp = sum(m.tp for m in metrics_list)
+                        total_tn = sum(m.tn for m in metrics_list)
+                        total_fp = sum(m.fp for m in metrics_list)
+                        total_fn = sum(m.fn for m in metrics_list)
+                        total_samples = sum(m.classification_samples for m in metrics_list)
+                        if total_samples > 0:
+                            roc_auc = sum(m.roc_auc * m.classification_samples for m in metrics_list) / total_samples
+                        else:
+                            roc_auc = 0.5
+                        denom = (total_tp + total_fp) * (total_tp + total_fn) * (total_tn + total_fp) * (total_tn + total_fn)
+                        mcc = (total_tp * total_tn - total_fp * total_fn) / (denom ** 0.5) if denom > 0 else 0.0
+                        return mcc, roc_auc, total_samples, total_tp, total_tn, total_fp, total_fn
+
+                    opt_mcc, opt_auc, opt_samples, opt_tp, opt_tn, opt_fp, opt_fn = _aggregate_classification(all_metrics)
+                    orig_mcc, orig_auc, orig_samples, orig_tp, orig_tn, orig_fp, orig_fn = _aggregate_classification(all_orig_metrics)
+
+                    # Simple average for now (plus classification aggregates)
                     avg_opt_metrics = BacktestMetrics(
                         profit_factor=sum(m.profit_factor for m in all_metrics) / len(all_metrics),
                         win_rate=sum(m.win_rate for m in all_metrics) / len(all_metrics),
                         directional_accuracy=sum(m.directional_accuracy for m in all_metrics) / len(all_metrics),
                         sharpe_ratio=sum(m.sharpe_ratio for m in all_metrics) / len(all_metrics),
-                        total_trades=sum(m.total_trades for m in all_metrics)
+                        total_trades=sum(m.total_trades for m in all_metrics),
+                        mcc=opt_mcc,
+                        roc_auc=opt_auc,
+                        classification_samples=opt_samples,
+                        tp=opt_tp,
+                        tn=opt_tn,
+                        fp=opt_fp,
+                        fn=opt_fn
                     )
                     
                     avg_orig_metrics = BacktestMetrics(
@@ -122,7 +146,14 @@ class OutputGenerator:
                         win_rate=sum(m.win_rate for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
                         directional_accuracy=sum(m.directional_accuracy for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
                         sharpe_ratio=sum(m.sharpe_ratio for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
-                        total_trades=sum(m.total_trades for m in all_orig_metrics) if all_orig_metrics else 0
+                        total_trades=sum(m.total_trades for m in all_orig_metrics) if all_orig_metrics else 0,
+                        mcc=orig_mcc,
+                        roc_auc=orig_auc,
+                        classification_samples=orig_samples,
+                        tp=orig_tp,
+                        tn=orig_tn,
+                        fp=orig_fp,
+                        fn=orig_fn
                     )
                     
                     if metric_type == 'objective':
@@ -285,6 +316,8 @@ class OutputGenerator:
             f"// Symbols: {', '.join(data_summary['symbols']) if data_summary['symbols'] else 'Not specified'}",
             f"// Date range: {data_summary['date_range']}",
             "// ---------------------------------------------------------------------------",
+            f"// MCC (primary): {metrics.mcc:.3f}",
+            f"// ROC AUC: {metrics.roc_auc:.3f}",
             f"// Profit Factor: {metrics.profit_factor:.2f} ({opt.improvement_pf:+.1f}% vs original)",
             f"// Win Rate: {metrics.win_rate:.1%}",
             f"// Directional Accuracy: {metrics.directional_accuracy:.1%}",
@@ -299,6 +332,8 @@ class OutputGenerator:
             header_lines.extend([
                 "// ---------------------------------------------------------------------------",
                 "// LOCKBOX (OUT-OF-SAMPLE) RESULTS:",
+                f"//   MCC (primary): {opt.holdout_original_metrics.mcc:.3f} -> {opt.holdout_metrics.mcc:.3f}",
+                f"//   ROC AUC: {opt.holdout_original_metrics.roc_auc:.3f} -> {opt.holdout_metrics.roc_auc:.3f}",
                 f"//   Profit Factor: {opt.holdout_original_metrics.profit_factor:.2f} -> {opt.holdout_metrics.profit_factor:.2f}",
                 f"//   Win Rate: {opt.holdout_original_metrics.win_rate:.1%} -> {opt.holdout_metrics.win_rate:.1%}",
                 f"//   Directional Accuracy: {opt.holdout_original_metrics.directional_accuracy:.1%} -> {opt.holdout_metrics.directional_accuracy:.1%}",
@@ -492,6 +527,9 @@ class OutputGenerator:
         
         # Add metric comparisons
         metrics_to_compare = [
+            ('MCC (primary)', orig_metrics.mcc, best_metrics.mcc, '.3f'),
+            ('ROC AUC', orig_metrics.roc_auc, best_metrics.roc_auc, '.3f'),
+            ('Classification Samples', orig_metrics.classification_samples, best_metrics.classification_samples, 'd'),
             ('Profit Factor', orig_metrics.profit_factor, best_metrics.profit_factor, '.2f'),
             ('Win Rate', orig_metrics.win_rate * 100, best_metrics.win_rate * 100, '.1f%'),
             ('Directional Accuracy', orig_metrics.directional_accuracy * 100, best_metrics.directional_accuracy * 100, '.1f%'),
@@ -518,8 +556,8 @@ class OutputGenerator:
                 change = best - orig
                 change_str = f"{change:+.1f}pp"
             else:
-                orig_str = f"{orig:.2f}"
-                best_str = f"{best:.2f}"
+                orig_str = f"{orig:{fmt}}"
+                best_str = f"{best:{fmt}}"
                 if orig > 0:
                     change = (best - orig) / orig * 100
                     change_str = f"{change:+.1f}%"
@@ -540,6 +578,9 @@ class OutputGenerator:
             ])
 
             holdout_metrics_to_compare = [
+                ('MCC (primary)', opt.holdout_original_metrics.mcc, opt.holdout_metrics.mcc, '.3f'),
+                ('ROC AUC', opt.holdout_original_metrics.roc_auc, opt.holdout_metrics.roc_auc, '.3f'),
+                ('Classification Samples', opt.holdout_original_metrics.classification_samples, opt.holdout_metrics.classification_samples, 'd'),
                 ('Profit Factor', opt.holdout_original_metrics.profit_factor, opt.holdout_metrics.profit_factor, '.2f'),
                 ('Win Rate', opt.holdout_original_metrics.win_rate * 100, opt.holdout_metrics.win_rate * 100, '.1f%'),
                 ('Directional Accuracy', opt.holdout_original_metrics.directional_accuracy * 100, opt.holdout_metrics.directional_accuracy * 100, '.1f%'),
@@ -566,8 +607,8 @@ class OutputGenerator:
                     change = best - orig
                     change_str = f"{change:+.1f}pp"
                 else:
-                    orig_str = f"{orig:.2f}"
-                    best_str = f"{best:.2f}"
+                    orig_str = f"{orig:{fmt}}"
+                    best_str = f"{best:{fmt}}"
                     if orig > 0:
                         change = (best - orig) / orig * 100
                         change_str = f"{change:+.1f}%"
@@ -923,48 +964,19 @@ class OutputGenerator:
             "UNDERSTANDING THE METRICS",
             "-" * 70,
             "",
-            "  PROFIT FACTOR (Primary Metric)",
-            "    What it measures: Gross Profit / Gross Loss",
-            "    Good value: > 1.5 (above 1.0 = profitable)",
-            "    Why it matters: Directly measures profitability. A PF of 1.5 means",
-            "                    you make $1.50 for every $1.00 you lose.",
+            "  MCC (PRIMARY OBJECTIVE)",
+            "    What it measures: Correlation between predicted and actual direction",
+            "    Good value: > 0.10 (0.0 = random, 1.0 = perfect, -1.0 = inverse)",
+            "    Why it matters: Robust to class imbalance and penalizes all error types.",
             "",
-            "  WIN RATE",
-            "    What it measures: Percentage of trades that are profitable",
-            "    Good value: > 55%",
-            "    Why it matters: Psychological comfort - easier to trade with higher",
-            "                    win rates. But high win rate with small wins and",
-            "                    big losses can still lose money!",
+            "  ROC AUC (CONSTRAINT)",
+            "    What it measures: Threshold-independent ranking quality",
+            "    Good value: >= 0.52 (0.50 = random)",
+            "    Why it matters: Ensures genuine predictive signal beyond threshold tuning.",
             "",
-            "  DIRECTIONAL ACCURACY",
-            "    What it measures: How well signals predict future price direction",
-            "    Good value: > 55% (50% = random chance)",
-            "    Why it matters: Shows if the indicator has genuine predictive power",
-            "                    vs just getting lucky. Doesn't account for move size.",
-            "",
-            "  EXTREME MOVE CAPTURE",
-            "    What it measures: Balance of recall/precision for major up/down moves",
-            "    Good value: > 35% (higher means fewer misses and fewer false signals)",
-            "    Why it matters: Targets significant highs/lows without flooding signals.",
-            "",
-            "  CONSISTENCY SCORE",
-            "    What it measures: Stability of performance across walk-forward folds",
-            "    Good value: > 0.60 (lower means results are erratic across regimes)",
-            "    Why it matters: Reliable signals should work in multiple market phases.",
-            "",
-            "  SHARPE RATIO",
-            "    What it measures: Risk-adjusted return (return / volatility)",
-            "    Good value: > 1.0 (> 2.0 = excellent)",
-            "    Why it matters: Balances returns against risk. High Sharpe = more",
-            "                    consistent returns with less volatility/drawdowns.",
-            "",
-            "  OPTIMIZATION WEIGHTS USED:",
-            "    * Profit Factor:        26% (primary - are we making money?)",
-            "    * Directional Accuracy: 21% (does the indicator actually predict?)",
-            "    * Sharpe Ratio:         16% (is it consistent/low risk?)",
-            "    * Win Rate:             10.5% (psychological tradability)",
-            "    * Extreme Move Capture: 16% (detects major highs/lows)",
-            "    * Consistency Score:    10.5% (stability across folds)",
+            "  REPORTING METRICS (NOT OPTIMIZED)",
+            "    Profit Factor, Win Rate, Sharpe, Directional Accuracy, Tail Capture,",
+            "    Consistency, and Drawdown are provided for context only.",
             "",
             "-" * 70,
             "OPTIMAL FORECAST HORIZON",
@@ -973,10 +985,11 @@ class OutputGenerator:
             f"  Optimal forecast horizon: ~{best_metrics.forecast_horizon} hours",
             "",
             "-" * 70,
-            "EXPECTED PROFITABILITY",
+            "EXPECTED SIGNAL QUALITY",
             "-" * 70,
-            f"  Improvement over random baseline: {best_metrics.improvement_over_random:+.1f}%",
-            f"  Improvement over original config: {opt.improvement_pf:+.1f}% (profit factor)",
+            f"  MCC (OOS): {best_metrics.mcc:.3f}",
+            f"  ROC AUC (OOS): {best_metrics.roc_auc:.3f}",
+            f"  Classification samples: {best_metrics.classification_samples}",
             "",
             "  WHEN TO TRADE:",
             f"    * Best during: {self._get_optimal_conditions()}",
@@ -1095,8 +1108,8 @@ class OutputGenerator:
         print(f"OPTIMIZATION COMPLETE: {self.parse_result.indicator_name}")
         print("=" * 60)
         print(f"Peak Forecast Timeframe: {metrics.forecast_horizon} hours")
+        print(f"MCC (primary):          {metrics.mcc:.3f} | AUC: {metrics.roc_auc:.3f}")
         print(f"Performance vs Original: {opt.improvement_pf:+.1f}% profit factor improvement")
-        print(f"Performance vs Random:   {metrics.improvement_over_random:+.1f}% improvement")
         print(f"Extreme Move Capture:    {metrics.tail_capture_rate:.1%}")
         print(f"Consistency Score:       {metrics.consistency_score:.2f}")
         print(f"Expected Profitability:  Best during {self._get_optimal_conditions()}")

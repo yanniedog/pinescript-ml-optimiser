@@ -44,6 +44,9 @@ _METRIC_DEFS = {
     "profit_factor": {"label": "Profit Factor"},
     "win_rate": {"label": "Win Rate"},
     "directional_accuracy": {"label": "Directional Accuracy"},
+    "mcc": {"label": "MCC"},
+    "roc_auc": {"label": "ROC AUC"},
+    "classification_samples": {"label": "Class Samples"},
     "sharpe_ratio": {"label": "Sharpe Ratio"},
     "max_drawdown": {"label": "Max Drawdown"},
     "total_return": {"label": "Total Return"},
@@ -75,6 +78,9 @@ def _metrics_from_backtest(metrics: Optional[BacktestMetrics]) -> Dict[str, floa
         "max_drawdown": metrics.max_drawdown,
         "avg_holding_bars": metrics.avg_holding_bars,
         "directional_accuracy": metrics.directional_accuracy,
+        "mcc": metrics.mcc,
+        "roc_auc": metrics.roc_auc,
+        "classification_samples": metrics.classification_samples,
         "forecast_horizon": metrics.forecast_horizon,
         "improvement_over_random": metrics.improvement_over_random,
         "tail_capture_rate": metrics.tail_capture_rate,
@@ -249,6 +255,7 @@ class RealtimeBestPlotter:
         self._line_meta = {}
         self._y_metric = "objective_delta"
         self._x_mode = "elapsed"
+        self._x_modes = ["elapsed", "rate", "trial"]
         self._band_metric = None
         self._band_min = None
         self._band_max = None
@@ -354,6 +361,8 @@ class RealtimeBestPlotter:
             return
         if self._x_mode == "rate":
             x_label = f"Improvement rate ({_metric_label(self._y_metric)} / s)"
+        elif self._x_mode == "trial":
+            x_label = "Trial #"
         else:
             x_label = "Elapsed time (s)"
         self._ax.set_xlabel(x_label)
@@ -368,6 +377,8 @@ class RealtimeBestPlotter:
         if self._x_mode == "rate":
             baseline = self._baseline_values.get(label, {}).get(self._y_metric)
             x_vals = _compute_rate_series(x_vals, y_vals, baseline)
+        elif self._x_mode == "trial":
+            x_vals = series.get("trials", [])
         return x_vals, y_vals
 
     def _refresh_lines(self) -> None:
@@ -646,7 +657,12 @@ class RealtimeBestPlotter:
         elif key == "y":
             self._prompt_metric()
         elif key == "x":
-            self._x_mode = "rate" if self._x_mode == "elapsed" else "elapsed"
+            modes = self._x_modes
+            try:
+                idx = modes.index(self._x_mode)
+            except ValueError:
+                idx = 0
+            self._x_mode = modes[(idx + 1) % len(modes)]
             self._refresh_lines()
             self._apply_filters()
         elif key == "b":
@@ -665,8 +681,9 @@ class RealtimeBestPlotter:
             series["x"].clear()
             series["metrics"] = {}
             series["params"] = []
+            series.setdefault("trials", []).clear()
         else:
-            self._series[indicator_name] = {"x": [], "metrics": {}, "params": []}
+            self._series[indicator_name] = {"x": [], "metrics": {}, "params": [], "trials": []}
         line = self._lines.get(indicator_name)
         if line is not None:
             line.set_data([], [])
@@ -693,7 +710,8 @@ class RealtimeBestPlotter:
         indicator_name: str,
         objective: float,
         metrics: Optional[Dict[str, float]] = None,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        trial_number: Optional[int] = None
     ) -> None:
         if not self._ensure_ready():
             return
@@ -889,6 +907,7 @@ class PlotlyRealtimePlotter:
                             options=[
                                 {"label": "Elapsed (s)", "value": "elapsed"},
                                 {"label": "Improvement rate (/s)", "value": "rate"},
+                                {"label": "Trial #", "value": "trial"},
                             ],
                             value=self._default_x_mode,
                             clearable=False
@@ -984,7 +1003,7 @@ class PlotlyRealtimePlotter:
             timeframes = set(timeframes or [])
             if y_metric not in _METRIC_DEFS:
                 y_metric = self._default_y_metric
-            if x_mode not in ("elapsed", "rate"):
+            if x_mode not in ("elapsed", "rate", "trial"):
                 x_mode = self._default_x_mode
             if band_metric not in _METRIC_DEFS:
                 band_metric = None
@@ -1002,9 +1021,16 @@ class PlotlyRealtimePlotter:
                 if timeframes and meta_info.get("timeframe") not in timeframes:
                     continue
 
-                x_vals = points.get("x", [])
+                x_elapsed = points.get("x", [])
+                trial_vals = points.get("trials", [])
                 y_vals = points.get("metrics", {}).get(y_metric, [])
                 params_vals = points.get("params", [])
+                if x_mode == "trial":
+                    if not trial_vals:
+                        continue
+                    x_vals = trial_vals
+                else:
+                    x_vals = x_elapsed
                 if not x_vals:
                     continue
                 if not y_vals:
@@ -1030,7 +1056,12 @@ class PlotlyRealtimePlotter:
                     baseline_val = baselines.get(label, {}).get(y_metric)
                     x_vals = _compute_rate_series(x_vals, y_vals, baseline_val)
 
-                x_label = "rate_per_s" if x_mode == "rate" else "elapsed_s"
+                if x_mode == "rate":
+                    x_label = "rate_per_s"
+                elif x_mode == "trial":
+                    x_label = "trial"
+                else:
+                    x_label = "elapsed_s"
                 fig.add_trace(
                     go.Scatter(
                         x=x_vals,
@@ -1054,6 +1085,8 @@ class PlotlyRealtimePlotter:
 
             if x_mode == "rate":
                 x_title = f"Improvement rate ({_metric_label(y_metric)} / s)"
+            elif x_mode == "trial":
+                x_title = "Trial #"
             else:
                 x_title = "Elapsed (s)"
             fig.update_layout(
@@ -1245,7 +1278,7 @@ class PlotlyRealtimePlotter:
             return
         with self._lock:
             self._start_times[indicator_name] = time.time()
-            self._series[indicator_name] = {"x": [], "metrics": {}, "params": []}
+            self._series[indicator_name] = {"x": [], "metrics": {}, "params": [], "trials": []}
             self._baseline_values.pop(indicator_name, None)
             self._register_line(indicator_name)
 
@@ -1272,7 +1305,8 @@ class PlotlyRealtimePlotter:
         indicator_name: str,
         objective: float,
         metrics: Optional[Dict[str, float]] = None,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        trial_number: Optional[int] = None
     ) -> None:
         if not self._ensure_ready():
             return
@@ -1291,8 +1325,14 @@ class PlotlyRealtimePlotter:
                 "objective_delta",
                 metrics_map["objective_best"] - baseline_obj if baseline_obj is not None else metrics_map["objective_best"]
             )
-            series = self._series.setdefault(indicator_name, {"x": [], "metrics": {}, "params": []})
+            series = self._series.setdefault(
+                indicator_name,
+                {"x": [], "metrics": {}, "params": [], "trials": []}
+            )
             series["x"].append(elapsed)
+            trial_list = series.setdefault("trials", [])
+            trial_idx = trial_number if trial_number is not None else len(trial_list) + 1
+            trial_list.append(trial_idx)
             for key in _METRIC_KEYS:
                 series["metrics"].setdefault(key, []).append(metrics_map.get(key))
             series["params"].append(_format_params(params))
@@ -1301,6 +1341,7 @@ class PlotlyRealtimePlotter:
                 for key in _METRIC_KEYS:
                     series["metrics"][key] = series["metrics"][key][-self._max_points:]
                 series["params"] = series["params"][-self._max_points:]
+                series["trials"] = series["trials"][-self._max_points:]
             if indicator_name not in self._line_meta:
                 self._register_line(indicator_name)
 
@@ -1565,6 +1606,8 @@ class OptimizationResult:
             f"Optimization completed in {time_str} ({self.n_trials} trials)",
             f"",
             f"Performance Comparison:",
+            f"  MCC (primary): {self.original_metrics.mcc:.3f} -> {self.best_metrics.mcc:.3f}",
+            f"  ROC AUC:       {self.original_metrics.roc_auc:.3f} -> {self.best_metrics.roc_auc:.3f}",
             f"  Profit Factor:  {self.original_metrics.profit_factor:.2f} -> {self.best_metrics.profit_factor:.2f} ({self.improvement_pf:+.1f}%)",
             f"  Win Rate:       {self.original_metrics.win_rate:.1%} -> {self.best_metrics.win_rate:.1%}",
             f"  Dir. Accuracy:  {self.original_metrics.directional_accuracy:.1%} -> {self.best_metrics.directional_accuracy:.1%} ({self.improvement_accuracy:+.1f}%)",
@@ -1580,6 +1623,14 @@ class OptimizationResult:
         if self.holdout_metrics is not None and self.holdout_original_metrics is not None:
             lines.append("")
             lines.append("Lockbox (OOS) Performance:")
+            lines.append(
+                f"  MCC (primary): {self.holdout_original_metrics.mcc:.3f} -> "
+                f"{self.holdout_metrics.mcc:.3f}"
+            )
+            lines.append(
+                f"  ROC AUC:       {self.holdout_original_metrics.roc_auc:.3f} -> "
+                f"{self.holdout_metrics.roc_auc:.3f}"
+            )
             lines.append(
                 f"  Profit Factor:  {self.holdout_original_metrics.profit_factor:.2f} -> "
                 f"{self.holdout_metrics.profit_factor:.2f}"
@@ -2007,7 +2058,13 @@ class PineOptimizer:
                     if self._baseline_metrics_map:
                         self.realtime_plotter.set_baseline_metrics(self.indicator_name, self._baseline_metrics_map)
                     self._plot_initialized = True
-                self.realtime_plotter.update(self.indicator_name, avg_objective, metrics_map, params_for_plot)
+                self.realtime_plotter.update(
+                    self.indicator_name,
+                    avg_objective,
+                    metrics_map,
+                    params_for_plot,
+                    trial_number=self.trial_count
+                )
             
             # Format sign for improvement vs original
             sign = "+" if pct_vs_original >= 0 else ""
@@ -2460,6 +2517,24 @@ class PineOptimizer:
         if not valid_metrics:
             return BacktestMetrics()
         
+        total_tp = sum(m.tp for m in valid_metrics)
+        total_tn = sum(m.tn for m in valid_metrics)
+        total_fp = sum(m.fp for m in valid_metrics)
+        total_fn = sum(m.fn for m in valid_metrics)
+        total_samples = sum(m.classification_samples for m in valid_metrics)
+        if total_samples > 0:
+            roc_auc = sum(m.roc_auc * m.classification_samples for m in valid_metrics) / total_samples
+        else:
+            roc_auc = 0.5
+
+        denom = float(
+            (total_tp + total_fp)
+            * (total_tp + total_fn)
+            * (total_tn + total_fp)
+            * (total_tn + total_fn)
+        )
+        mcc = (total_tp * total_tn - total_fp * total_fn) / np.sqrt(denom) if denom > 0 else 0.0
+
         return BacktestMetrics(
             total_trades=sum(m.total_trades for m in valid_metrics),
             winning_trades=sum(m.winning_trades for m in valid_metrics),
@@ -2475,7 +2550,17 @@ class PineOptimizer:
             forecast_horizon=int(np.median([m.forecast_horizon for m in valid_metrics])),
             improvement_over_random=np.mean([m.improvement_over_random for m in valid_metrics]),
             tail_capture_rate=np.mean([m.tail_capture_rate for m in valid_metrics]),
-            consistency_score=np.mean([m.consistency_score for m in valid_metrics])
+            consistency_score=np.mean([m.consistency_score for m in valid_metrics]),
+            mcc=mcc,
+            roc_auc=roc_auc,
+            classification_samples=total_samples,
+            positive_labels=sum(m.positive_labels for m in valid_metrics),
+            negative_labels=sum(m.negative_labels for m in valid_metrics),
+            tp=total_tp,
+            tn=total_tn,
+            fp=total_fp,
+            fn=total_fn,
+            mcc_threshold=float(np.median([m.mcc_threshold for m in valid_metrics])) if valid_metrics else 0.0
         )
     
     def _extract_data_usage_info(self, backtester: WalkForwardBacktester, df: pd.DataFrame) -> DataUsageInfo:

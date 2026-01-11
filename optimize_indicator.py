@@ -3,7 +3,7 @@
 Pine Script Indicator ML Optimizer
 
 Optimizes Pine Script indicator parameters using Bayesian optimization
-with walk-forward validation to maximize leading indicator profitability.
+with walk-forward validation to maximize MCC with a ROC AUC constraint.
 
 Usage:
     python optimize_indicator.py <pine_script_file> [options]
@@ -334,7 +334,7 @@ Examples:
         print_step(3, total_steps, f"Running optimization ({trials_str} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
-        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency")
+        print(f"   Objective: MCC (primary) with ROC AUC constraint")
         print(f"   Lockbox holdout: {args.holdout_ratio:.0%} (gap: {args.holdout_gap_bars if args.holdout_gap_bars is not None else 'auto'} bars)")
         print()
         print(f"   [TIP] Press Q at any time to stop and use current best results")
@@ -388,6 +388,8 @@ Examples:
 |    * vs Random Baseline: {metrics.improvement_over_random:>+6.1f}%                               |
 |                                                                      |
 |  Key Metrics:                                                        |
+|    * MCC (primary):       {metrics.mcc:>6.3f}                                  |
+|    * ROC AUC:             {metrics.roc_auc:>6.3f}                                  |
 |    * Profit Factor:       {metrics.profit_factor:>6.2f}                                  |
 |    * Win Rate:            {metrics.win_rate*100:>5.1f}%                                  |
 |    * Directional Accuracy:{metrics.directional_accuracy*100:>5.1f}%                                  |
@@ -406,6 +408,8 @@ Examples:
             holdout_best = optimization_result.holdout_metrics
             holdout_orig = optimization_result.holdout_original_metrics
             print("LOCKBOX (OUT-OF-SAMPLE) RESULTS")
+            print(f"  MCC (primary):       {holdout_orig.mcc:.3f} -> {holdout_best.mcc:.3f}")
+            print(f"  ROC AUC:             {holdout_orig.roc_auc:.3f} -> {holdout_best.roc_auc:.3f}")
             print(f"  Profit Factor:       {holdout_orig.profit_factor:.2f} -> {holdout_best.profit_factor:.2f}")
             print(f"  Win Rate:            {holdout_orig.win_rate*100:>5.1f}% -> {holdout_best.win_rate*100:>5.1f}%")
             print(f"  Directional Accuracy:{holdout_orig.directional_accuracy*100:>5.1f}% -> {holdout_best.directional_accuracy*100:>5.1f}%")

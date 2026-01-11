@@ -13,6 +13,9 @@ from interactive_optimizer import write_unified_report
 
 
 METRIC_MAP = {
+    "MCC (primary)": "mcc",
+    "ROC AUC": "roc_auc",
+    "Classification Samples": "classification_samples",
     "Profit Factor": "profit_factor",
     "Win Rate": "win_rate",
     "Directional Accuracy": "directional_accuracy",
@@ -24,7 +27,7 @@ METRIC_MAP = {
 }
 
 RATE_METRICS = {"Win Rate", "Directional Accuracy", "Extreme Move Capture"}
-INT_METRICS = {"Total Trades"}
+INT_METRICS = {"Total Trades", "Classification Samples"}
 
 
 def _parse_numeric(metric_name: str, raw: str):
@@ -56,6 +59,9 @@ def _build_metrics(values: dict) -> BacktestMetrics:
     metrics.profit_factor = float(values.get("profit_factor") or 0.0)
     metrics.win_rate = float(values.get("win_rate") or 0.0)
     metrics.directional_accuracy = float(values.get("directional_accuracy") or 0.0)
+    metrics.mcc = float(values.get("mcc") or 0.0)
+    metrics.roc_auc = float(values.get("roc_auc") or 0.0)
+    metrics.classification_samples = int(values.get("classification_samples") or 0)
     metrics.tail_capture_rate = float(values.get("tail_capture_rate") or 0.0)
     metrics.consistency_score = float(values.get("consistency_score") or 0.0)
     metrics.sharpe_ratio = float(values.get("sharpe_ratio") or 0.0)
@@ -157,6 +163,9 @@ def _serialize_metrics(metrics: BacktestMetrics) -> dict:
         "max_drawdown": metrics.max_drawdown,
         "avg_holding_bars": metrics.avg_holding_bars,
         "directional_accuracy": metrics.directional_accuracy,
+        "mcc": metrics.mcc,
+        "roc_auc": metrics.roc_auc,
+        "classification_samples": metrics.classification_samples,
         "forecast_horizon": metrics.forecast_horizon,
         "improvement_over_random": metrics.improvement_over_random,
         "tail_capture_rate": metrics.tail_capture_rate,

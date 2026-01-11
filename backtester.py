@@ -1,7 +1,7 @@
 """
 Walk-Forward Backtester
 Implements walk-forward cross-validation with no look-ahead bias.
-Calculates profitability metrics for indicator optimization.
+Calculates classification and reporting metrics for indicator optimization.
 """
 
 import numpy as np
@@ -62,6 +62,16 @@ class BacktestMetrics:
     improvement_over_random: float = 0.0
     tail_capture_rate: float = 0.0  # Ability to capture extreme moves
     consistency_score: float = 0.0  # Stability across walk-forward folds
+    mcc: float = 0.0  # Matthews Correlation Coefficient (classification)
+    roc_auc: float = 0.0  # ROC AUC (classification)
+    classification_samples: int = 0
+    positive_labels: int = 0
+    negative_labels: int = 0
+    tp: int = 0
+    tn: int = 0
+    fp: int = 0
+    fn: int = 0
+    mcc_threshold: float = 0.0
     trades: List[Trade] = field(default_factory=list)
     
     def to_dict(self) -> Dict:
@@ -80,7 +90,17 @@ class BacktestMetrics:
             'forecast_horizon': self.forecast_horizon,
             'improvement_over_random': self.improvement_over_random,
             'tail_capture_rate': self.tail_capture_rate,
-            'consistency_score': self.consistency_score
+            'consistency_score': self.consistency_score,
+            'mcc': self.mcc,
+            'roc_auc': self.roc_auc,
+            'classification_samples': self.classification_samples,
+            'positive_labels': self.positive_labels,
+            'negative_labels': self.negative_labels,
+            'tp': self.tp,
+            'tn': self.tn,
+            'fp': self.fp,
+            'fn': self.fn,
+            'mcc_threshold': self.mcc_threshold
         }
 
 
@@ -101,8 +121,8 @@ class WalkForwardBacktester:
     Key features:
     - Walk-forward cross-validation with embargo period
     - Multiple forecast horizon testing
-    - Directional accuracy measurement
-    - Profit factor and Sharpe ratio calculation
+    - MCC/ROC AUC classification evaluation
+    - Directional accuracy and profitability reporting
     
     CRITICAL: Each fold selects its optimal forecast horizon using ONLY its training data.
     Test data is never used for horizon selection, preventing lookahead bias. The selected
@@ -122,7 +142,8 @@ class WalkForwardBacktester:
         embargo_bars: int = 72,
         train_ratio: float = 0.6,
         min_trades_per_fold: int = 10,
-        forecast_horizons: Optional[List[int]] = None
+        forecast_horizons: Optional[List[int]] = None,
+        min_classification_samples: int = 50
     ):
         """
         Initialize backtester.
@@ -139,6 +160,7 @@ class WalkForwardBacktester:
         self.embargo_bars = embargo_bars
         self.train_ratio = train_ratio
         self.min_trades_per_fold = min_trades_per_fold
+        self.min_classification_samples = min_classification_samples
         self.forecast_horizons = forecast_horizons or self.FORECAST_HORIZONS
         
         self.close = df['close'].values
@@ -254,25 +276,28 @@ class WalkForwardBacktester:
         all_trades = []
         fold_metrics = []
         fold_horizons = []
+        fold_thresholds = []
         
         for fold in self.folds:
             # CRITICAL: Select optimal horizon using ONLY this fold's training data
             # This prevents lookahead bias by ensuring test data is never used for horizon selection
-            fold_best_horizon = self._find_optimal_horizon(
+            fold_best_horizon, fold_threshold = self._find_optimal_horizon(
                 indicator_result,
                 use_discrete_signals,
                 fold=fold  # Pass fold to restrict to training data only
             )
             fold_horizons.append(fold_best_horizon)
+            fold_thresholds.append(fold_threshold)
             
             # Evaluate test data using the horizon selected from training data
             metrics = self._evaluate_fold(
                 indicator_result,
                 fold,
                 fold_best_horizon,  # Use fold-specific horizon
+                fold_threshold,
                 use_discrete_signals
             )
-            if metrics.total_trades >= self.min_trades_per_fold:
+            if metrics.classification_samples >= self.min_classification_samples:
                 fold_metrics.append(metrics)
                 all_trades.extend(metrics.trades)
         
@@ -283,8 +308,15 @@ class WalkForwardBacktester:
         total_trades = sum(m.total_trades for m in fold_metrics)
         winning_trades = sum(m.winning_trades for m in fold_metrics)
         losing_trades = sum(m.losing_trades for m in fold_metrics)
+        total_samples = sum(m.classification_samples for m in fold_metrics)
+        total_tp = sum(m.tp for m in fold_metrics)
+        total_tn = sum(m.tn for m in fold_metrics)
+        total_fp = sum(m.fp for m in fold_metrics)
+        total_fn = sum(m.fn for m in fold_metrics)
+        total_pos = sum(m.positive_labels for m in fold_metrics)
+        total_neg = sum(m.negative_labels for m in fold_metrics)
         
-        if total_trades == 0:
+        if total_trades == 0 and total_samples == 0:
             return BacktestMetrics()
         
         # Calculate returns
@@ -324,14 +356,23 @@ class WalkForwardBacktester:
         directional_accuracy = np.mean([m.directional_accuracy for m in fold_metrics])
         directional_accuracy = max(0.0, min(1.0, directional_accuracy))  # Safety clamp
 
+        # MCC from aggregated confusion counts
+        mcc = self._calculate_mcc(total_tp, total_tn, total_fp, total_fn)
+
+        # ROC AUC weighted by sample counts
+        if total_samples > 0:
+            roc_auc = sum(m.roc_auc * m.classification_samples for m in fold_metrics) / total_samples
+        else:
+            roc_auc = 0.5
+
         # Extreme move capture rate (average across folds)
         tail_capture_rate = np.mean([m.tail_capture_rate for m in fold_metrics]) if fold_metrics else 0.0
 
         # Consistency across folds (profit factor + directional accuracy stability)
         consistency_score = self._calculate_consistency_score(fold_metrics)
         
-        # Improvement over random (50% baseline)
-        improvement_over_random = (directional_accuracy - 0.5) / 0.5 * 100 if directional_accuracy > 0.5 else 0
+        # Improvement over random (50% baseline) based on ROC AUC
+        improvement_over_random = (roc_auc - 0.5) / 0.5 * 100 if roc_auc > 0.5 else 0
         
         # Average holding bars
         avg_holding = np.mean([t.holding_bars for t in all_trades]) if all_trades else 0
@@ -352,6 +393,16 @@ class WalkForwardBacktester:
             improvement_over_random=improvement_over_random,
             tail_capture_rate=tail_capture_rate,
             consistency_score=consistency_score,
+            mcc=mcc,
+            roc_auc=roc_auc,
+            classification_samples=total_samples,
+            positive_labels=total_pos,
+            negative_labels=total_neg,
+            tp=total_tp,
+            tn=total_tn,
+            fp=total_fp,
+            fn=total_fn,
+            mcc_threshold=float(np.median(fold_thresholds)) if fold_thresholds else 0.0,
             trades=all_trades
         )
 
@@ -376,6 +427,104 @@ class WalkForwardBacktester:
         acc_score = score(acc_values)
 
         return float(np.mean([pf_score, acc_score]))
+
+    @staticmethod
+    def _calculate_mcc(tp: int, tn: int, fp: int, fn: int) -> float:
+        """Calculate Matthews Correlation Coefficient from confusion counts."""
+        denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
+        if denom <= 0:
+            return 0.0
+        return (tp * tn - fp * fn) / np.sqrt(denom)
+
+    @staticmethod
+    def _calculate_roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
+        """Compute ROC AUC using rank-based statistics (handles ties)."""
+        if labels.size == 0:
+            return 0.5
+        pos = labels == 1
+        neg = labels == 0
+        n_pos = int(np.sum(pos))
+        n_neg = int(np.sum(neg))
+        if n_pos == 0 or n_neg == 0:
+            return 0.5
+
+        order = np.argsort(scores)
+        ranks = np.empty_like(order, dtype=float)
+        i = 0
+        n = len(scores)
+        while i < n:
+            j = i
+            score_i = scores[order[i]]
+            while j + 1 < n and scores[order[j + 1]] == score_i:
+                j += 1
+            avg_rank = (i + j + 2) / 2.0  # 1-based ranks
+            ranks[order[i:j + 1]] = avg_rank
+            i = j + 1
+
+        sum_pos = float(np.sum(ranks[pos]))
+        auc = (sum_pos - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        return float(auc)
+
+    def _prepare_classification_data(
+        self,
+        indicator_result: IndicatorResult,
+        horizon: int,
+        start_idx: int,
+        end_idx: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Build binary labels and scores for classification from a data slice."""
+        future_returns = self._future_returns[horizon][start_idx:end_idx]
+        scores = indicator_result.combined_signal[start_idx:end_idx]
+        valid = ~np.isnan(future_returns) & ~np.isnan(scores) & (future_returns != 0)
+        if not np.any(valid):
+            return np.array([], dtype=int), np.array([], dtype=float)
+        labels = (future_returns[valid] > 0).astype(int)
+        scores = scores[valid].astype(float)
+        return labels, scores
+
+    def _select_mcc_threshold(
+        self,
+        scores: np.ndarray,
+        labels: np.ndarray
+    ) -> Tuple[float, float]:
+        """Pick a score threshold that maximizes MCC on training data."""
+        if scores.size == 0 or labels.size == 0:
+            return 0.0, 0.0
+        pos_total = int(np.sum(labels == 1))
+        neg_total = int(np.sum(labels == 0))
+        if pos_total == 0 or neg_total == 0:
+            return 0.0, 0.0
+
+        order = np.argsort(scores)[::-1]
+        sorted_scores = scores[order]
+        sorted_labels = labels[order]
+
+        tp = 0
+        fp = 0
+        fn = pos_total
+        tn = neg_total
+
+        best_mcc = self._calculate_mcc(tp, tn, fp, fn)
+        best_threshold = sorted_scores[0] + 1e-9
+
+        i = 0
+        n = len(sorted_scores)
+        while i < n:
+            score_i = sorted_scores[i]
+            while i < n and sorted_scores[i] == score_i:
+                if sorted_labels[i] == 1:
+                    tp += 1
+                    fn -= 1
+                else:
+                    fp += 1
+                    tn -= 1
+                i += 1
+            mcc = self._calculate_mcc(tp, tn, fp, fn)
+            if mcc > best_mcc:
+                best_mcc = mcc
+                best_threshold = score_i
+
+        return float(best_threshold), float(best_mcc)
 
     def _get_train_range_for_horizon(
         self,
@@ -406,9 +555,9 @@ class WalkForwardBacktester:
         indicator_result: IndicatorResult,
         use_discrete_signals: bool,
         fold: Optional[WalkForwardFold] = None
-    ) -> int:
+    ) -> Tuple[int, float]:
         """
-        Find the forecast horizon with best directional accuracy.
+        Find the forecast horizon with best MCC on training data.
         
         Args:
             indicator_result: Indicator result with signals
@@ -417,10 +566,11 @@ class WalkForwardBacktester:
                   If None, uses all data (for backwards compatibility, but should be avoided)
         
         Returns:
-            Optimal forecast horizon in bars
+            Optimal forecast horizon in bars and training MCC threshold
         """
         best_horizon = self.forecast_horizons[0] if self.forecast_horizons else 24  # Default
-        best_accuracy = 0.0
+        best_mcc = -1.0
+        best_threshold = 0.0
 
         if fold is None:
             # No fold provided - use all data (backwards compatibility)
@@ -429,8 +579,8 @@ class WalkForwardBacktester:
                 "_find_optimal_horizon called without fold parameter. "
                 "This may cause lookahead bias if test data is included."
             )
-            start_idx = None
-            end_idx = None
+            start_idx = 0
+            end_idx = self.length
 
         for horizon in self.forecast_horizons:
             if fold is not None:
@@ -438,18 +588,19 @@ class WalkForwardBacktester:
                 if train_range is None:
                     continue
                 start_idx, end_idx = train_range
-            accuracy = self._calculate_directional_accuracy(
+            labels, scores = self._prepare_classification_data(
                 indicator_result,
                 horizon,
-                use_discrete_signals,
                 start_idx=start_idx,
                 end_idx=end_idx
             )
-            if accuracy > best_accuracy:
-                best_accuracy = accuracy
+            threshold, mcc = self._select_mcc_threshold(scores, labels)
+            if mcc > best_mcc:
+                best_mcc = mcc
                 best_horizon = horizon
+                best_threshold = threshold
 
-        return best_horizon
+        return best_horizon, best_threshold
     
     def _calculate_directional_accuracy(
         self,
@@ -606,6 +757,7 @@ class WalkForwardBacktester:
         indicator_result: IndicatorResult,
         fold: WalkForwardFold,
         horizon: int,
+        threshold: float,
         use_discrete_signals: bool
     ) -> BacktestMetrics:
         """
@@ -720,7 +872,7 @@ class WalkForwardBacktester:
         max_drawdown = abs(np.min(drawdowns)) if len(drawdowns) > 0 else 0.0
         max_drawdown = min(100.0, max_drawdown)
         
-        # Directional accuracy for this fold
+        # Directional accuracy for this fold (reporting only)
         test_returns = future_returns[test_start:effective_end]
         valid_mask = ~np.isnan(test_returns)  # Filter out NaN future returns
         
@@ -751,6 +903,34 @@ class WalkForwardBacktester:
             horizon,
             use_discrete_signals
         )
+
+        # Classification metrics (MCC + ROC AUC) on test data
+        labels, scores = self._prepare_classification_data(
+            indicator_result,
+            horizon,
+            start_idx=test_start,
+            end_idx=effective_end
+        )
+        if len(labels) > 0:
+            preds = scores >= threshold
+            pos_mask = labels == 1
+            neg_mask = ~pos_mask
+            tp = int(np.sum(preds & pos_mask))
+            fp = int(np.sum(preds & neg_mask))
+            fn = int(np.sum((~preds) & pos_mask))
+            tn = int(np.sum((~preds) & neg_mask))
+            mcc = self._calculate_mcc(tp, tn, fp, fn)
+            roc_auc = self._calculate_roc_auc(labels, scores)
+            classification_samples = int(len(labels))
+            positive_labels = int(np.sum(pos_mask))
+            negative_labels = int(np.sum(neg_mask))
+        else:
+            tp = tn = fp = fn = 0
+            mcc = 0.0
+            roc_auc = 0.5
+            classification_samples = 0
+            positive_labels = 0
+            negative_labels = 0
         
         return BacktestMetrics(
             total_trades=len(trades),
@@ -765,6 +945,16 @@ class WalkForwardBacktester:
             directional_accuracy=directional_accuracy,
             forecast_horizon=horizon,
             tail_capture_rate=tail_capture_rate,
+            mcc=mcc,
+            roc_auc=roc_auc,
+            classification_samples=classification_samples,
+            positive_labels=positive_labels,
+            negative_labels=negative_labels,
+            tp=tp,
+            tn=tn,
+            fp=fp,
+            fn=fn,
+            mcc_threshold=threshold,
             trades=trades
         )
     
@@ -775,8 +965,7 @@ class WalkForwardBacktester:
         """
         return calculate_objective_score(
             metrics,
-            min_trades=self.min_trades_per_fold,
-            min_trades_penalty=50
+            min_classification_samples=self.min_classification_samples
         )
 
 

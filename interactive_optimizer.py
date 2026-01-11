@@ -23,11 +23,35 @@ from output_generator import generate_outputs
 import argparse
 import json
 import time
+from typing import Optional
 
 from objective import calculate_objective_score as objective_score
 from screen_log import enable_screen_log
 
 BACKUP_DONE = False
+
+
+def split_choice_input(raw: str):
+    """Split user input by commas or whitespace."""
+    if not raw:
+        return []
+    return [token.strip() for token in re.split(r"[,\s]+", raw.strip()) if token.strip()]
+
+
+def ask_yes_no(prompt: str, default: Optional[bool] = True) -> bool:
+    """Prompt for a yes/no answer, insisting on validity before proceeding."""
+    while True:
+        user_input = input(prompt).strip().lower()
+        if not user_input:
+            if default is not None:
+                return default
+            print("  [ERROR] Please enter Y or N.")
+            continue
+        if user_input in {"y", "yes"}:
+            return True
+        if user_input in {"n", "no"}:
+            return False
+        print("  [ERROR] Please enter Y or N.")
 
 
 def get_pine_files(directory: Path = None):
@@ -214,8 +238,7 @@ def download_new_data(dm: DataManager):
     if len(symbols) > 10:
         print(f"    ... and {len(symbols) - 10} more")
     
-    confirm = input("\n  Proceed with download? [Y/n]: ").strip().lower()
-    if confirm in ['n', 'no']:
+    if not ask_yes_no("\n  Proceed with download? [Y/n]: ", default=True):
         print("  Download cancelled.")
         return
     
@@ -263,9 +286,19 @@ def get_optimization_options(dm: DataManager):
         if len(available_symbols) > 10:
             print(f"    ... and {len(available_symbols) - 10} more")
     
-    symbols_input = input("\n  Symbols (comma-separated, or Enter for all available) [all]: ").strip()
+    symbols_input = input("\n  Symbols (comma/space-separated, or Enter for all available) [all]: ").strip()
     if symbols_input:
-        options['symbols'] = symbols_input.upper()
+        normalized_symbols = []
+        seen_symbols = set()
+        for token in split_choice_input(symbols_input.upper()):
+            if not token:
+                continue
+            candidate = token if token.endswith("USDT") else f"{token}USDT"
+            if candidate not in seen_symbols:
+                normalized_symbols.append(candidate)
+                seen_symbols.add(candidate)
+        if normalized_symbols:
+            options['symbols'] = ",".join(normalized_symbols)
     
     # Force download
     force_input = input("  Force re-download data? [n]: ").strip().lower()
@@ -332,6 +365,9 @@ def _serialize_metrics(metrics):
         "max_drawdown": metrics.max_drawdown,
         "avg_holding_bars": metrics.avg_holding_bars,
         "directional_accuracy": metrics.directional_accuracy,
+        "mcc": metrics.mcc,
+        "roc_auc": metrics.roc_auc,
+        "classification_samples": metrics.classification_samples,
         "forecast_horizon": metrics.forecast_horizon,
         "improvement_over_random": metrics.improvement_over_random,
         "tail_capture_rate": metrics.tail_capture_rate,
@@ -457,6 +493,7 @@ def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
         "file_name",
         "symbol",
         "interval",
+        "improved",
         "objective_best",
         "baseline_objective",
         "improvement_pf",
@@ -470,6 +507,9 @@ def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
         "max_drawdown",
         "avg_holding_bars",
         "directional_accuracy",
+        "mcc",
+        "roc_auc",
+        "classification_samples",
         "improvement_over_random",
         "tail_capture_rate",
         "consistency_score",
@@ -493,6 +533,7 @@ def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
                 "file_name": row.get("file_name"),
                 "symbol": row.get("symbol"),
                 "interval": row.get("interval"),
+                "improved": row.get("improved"),
                 "objective_best": row.get("objective_best"),
                 "baseline_objective": row.get("baseline_objective"),
                 "improvement_pf": row.get("improvement_pf"),
@@ -506,6 +547,9 @@ def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
                 "max_drawdown": metrics.get("max_drawdown"),
                 "avg_holding_bars": metrics.get("avg_holding_bars"),
                 "directional_accuracy": metrics.get("directional_accuracy"),
+                "mcc": metrics.get("mcc"),
+                "roc_auc": metrics.get("roc_auc"),
+                "classification_samples": metrics.get("classification_samples"),
                 "improvement_over_random": metrics.get("improvement_over_random"),
                 "tail_capture_rate": metrics.get("tail_capture_rate"),
                 "consistency_score": metrics.get("consistency_score"),
@@ -541,11 +585,17 @@ def write_matrix_reports(summary_dir: Path, run_info: dict, rows: list):
             f"Objective: {row.get('objective_best', 0):.4f} "
             f"(baseline {row.get('baseline_objective', 0):.4f})"
         )
+        lines.append(f"Improved: {'yes' if row.get('improved') else 'no'}")
         lines.append(
             f"PF {metrics.get('profit_factor', 0):.2f} | "
             f"Win {metrics.get('win_rate', 0)*100:.1f}% | "
             f"Sharpe {metrics.get('sharpe_ratio', 0):.2f} | "
             f"Forecast {metrics.get('forecast_horizon', 0)} bars"
+        )
+        lines.append(
+            f"MCC {metrics.get('mcc', 0):.3f} | "
+            f"AUC {metrics.get('roc_auc', 0):.3f} | "
+            f"Samples {metrics.get('classification_samples', 0)}"
         )
         lines.append(f"Params: {_serialize_params(row.get('best_params'))}")
         lines.append(
@@ -604,12 +654,20 @@ def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, re
     lines.append("TOP INDICATORS (BY OBJECTIVE)")
     lines.append("-" * 70)
     for row in ranked[:10]:
-        lines.append(f"{row['indicator_name']}: objective={row['objective_best']:.4f} pf={row['best_metrics']['profit_factor']:.2f}")
+        lines.append(
+            f"{row['indicator_name']}: objective={row['objective_best']:.4f} "
+            f"mcc={row['best_metrics'].get('mcc', 0):.3f} "
+            f"auc={row['best_metrics'].get('roc_auc', 0):.3f}"
+        )
     lines.append("")
     lines.append("BOTTOM INDICATORS (BY OBJECTIVE)")
     lines.append("-" * 70)
     for row in ranked[-10:]:
-        lines.append(f"{row['indicator_name']}: objective={row['objective_best']:.4f} pf={row['best_metrics']['profit_factor']:.2f}")
+        lines.append(
+            f"{row['indicator_name']}: objective={row['objective_best']:.4f} "
+            f"mcc={row['best_metrics'].get('mcc', 0):.3f} "
+            f"auc={row['best_metrics'].get('roc_auc', 0):.3f}"
+        )
     lines.append("")
     
     # Per-indicator details
@@ -620,8 +678,19 @@ def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, re
         lines.append(f"{row['indicator_name']} ({row['file_name']})")
         lines.append(f"  Objective: {row['objective_best']:.4f} (baseline {row['baseline_objective']:.4f})")
         lines.append(f"  Trials: {row['n_trials']} | Time: {row['optimization_time']:.1f}s")
-        lines.append(f"  Profit Factor: {row['best_metrics']['profit_factor']:.2f} | Win Rate: {row['best_metrics']['win_rate']*100:.1f}%")
-        lines.append(f"  Sharpe: {row['best_metrics']['sharpe_ratio']:.2f} | Drawdown: {row['best_metrics']['max_drawdown']:.1f}%")
+        lines.append(
+            f"  MCC: {row['best_metrics'].get('mcc', 0):.3f} | "
+            f"AUC: {row['best_metrics'].get('roc_auc', 0):.3f} | "
+            f"Samples: {row['best_metrics'].get('classification_samples', 0)}"
+        )
+        lines.append(
+            f"  Profit Factor: {row['best_metrics']['profit_factor']:.2f} | "
+            f"Win Rate: {row['best_metrics']['win_rate']*100:.1f}%"
+        )
+        lines.append(
+            f"  Sharpe: {row['best_metrics']['sharpe_ratio']:.2f} | "
+            f"Drawdown: {row['best_metrics']['max_drawdown']:.1f}%"
+        )
         lines.append(f"  Output Pine: {row['output_pine']}")
         lines.append(f"  Output Report: {row['output_report']}")
         lines.append(f"  Strategy: {row['config']['strategy']} | Sampler: {row['config']['sampler']}")
@@ -636,17 +705,44 @@ def choose_indicator_directory() -> Path:
     """Prompt for indicator directory, defaulting to ./pinescripts if present."""
     default_dir = Path.cwd() / "pinescripts"
     if default_dir.exists():
-        prompt = "Indicator directory [pinescripts]: "
         default_value = default_dir
     else:
-        prompt = "Indicator directory [current]: "
         default_value = Path.cwd()
-    
+
+    available_dirs = find_pine_directories(Path.cwd())
+    counts_map = {path: count for path, count in available_dirs}
+    default_count = counts_map.get(default_value)
+    if default_count is None:
+        if default_value.exists():
+            default_count = sum(1 for _ in default_value.rglob("*.pine"))
+        else:
+            default_count = 0
+    directory_choices = [(default_value, default_count)]
+    for path, count in available_dirs:
+        if path == default_value:
+            continue
+        directory_choices.append((path, count))
+
+    print("\n  Detected Pine Script directories:")
+    for idx, (path, count) in enumerate(directory_choices, 1):
+        print(f"    [{idx}] {path} ({count} .pine files)")
+    print("    [C] Custom directory path")
+
+    prompt = f"  Select directory (1-{len(directory_choices)}) or enter path [default: {default_value}]: "
     while True:
         user_input = input(prompt).strip()
         if not user_input:
             return default_value
-        candidate = Path(user_input)
+        if user_input.lower() in {"c", "custom"}:
+            custom_input = input("  Enter custom directory path: ").strip()
+            candidate = Path(custom_input)
+        else:
+            candidate = None
+            if user_input.isdigit():
+                idx = int(user_input) - 1
+                if 0 <= idx < len(directory_choices):
+                    return directory_choices[idx][0]
+            candidate = Path(user_input)
         if candidate.exists() and candidate.is_dir():
             return candidate
         print("  [ERROR] Directory not found. Please enter a valid path.")
@@ -689,6 +785,26 @@ def get_eligible_indicators(pine_files):
     return eligible_files, ineligible
 
 
+def find_pine_directories(root: Path):
+    """Return directories under root that contain .pine files with counts."""
+    counts = {}
+    for pine_file in root.rglob("*.pine"):
+        if pine_file.is_file():
+            parent = pine_file.parent
+            counts[parent] = counts.get(parent, 0) + 1
+    return sorted(counts.items(), key=lambda item: str(item[0]))
+
+
+def display_indicator_catalog(pine_files, directory: Path = None, limit: int = 30):
+    """Print a numbered list of indicators, optionally tied to a directory."""
+    heading = f"Indicators in {directory}" if directory else "Indicators"
+    print(f"\n{heading} ({len(pine_files)} total):")
+    for idx, pine_file in enumerate(pine_files[:limit], 1):
+        print(f"  [{idx}] {pine_file.name}")
+    if len(pine_files) > limit:
+        print(f"  ... and {len(pine_files) - limit} more")
+
+
 def select_datasets_for_matrix(dm: DataManager):
     datasets = dm.get_available_datasets()
     if not datasets:
@@ -707,19 +823,28 @@ def select_datasets_for_matrix(dm: DataManager):
         interval_name = INTERVAL_NAMES.get(interval, interval)
         print(f"  {interval_name} ({interval}): {len(symbols)} symbols")
 
-    use_all = input("\nUse all available datasets? [Y/n]: ").strip().lower()
-    if use_all in ["n", "no"]:
-        intervals_input = input("Intervals (comma-separated, Enter for all): ").strip().lower()
-        symbols_input = input("Symbols (comma-separated, Enter for all): ").strip().upper()
+    use_all = ask_yes_no("\nUse all available datasets? [Y/n]: ", default=True)
+    if not use_all:
+        intervals_input = input("Intervals (comma/space-separated, Enter for all): ").strip()
+        symbols_input = input("Symbols (comma/space-separated, Enter for all): ").strip()
 
         intervals = None
         if intervals_input:
-            intervals = [i.strip() for i in intervals_input.split(",") if i.strip()]
+            intervals = [part.lower() for part in split_choice_input(intervals_input)]
 
         symbols = None
         if symbols_input:
-            symbols = [s.strip() for s in symbols_input.split(",") if s.strip()]
-            symbols = [s if s.endswith("USDT") else f"{s}USDT" for s in symbols]
+            symbols = []
+            seen = set()
+            for part in split_choice_input(symbols_input):
+                if not part:
+                    continue
+                candidate = part.upper()
+                if not candidate.endswith("USDT"):
+                    candidate = f"{candidate}USDT"
+                if candidate not in seen:
+                    symbols.append(candidate)
+                    seen.add(candidate)
 
         filtered = []
         for symbol, interval in datasets:
@@ -747,34 +872,44 @@ def select_indicator_subset(eligible_files):
     if not eligible_files:
         return []
 
-    use_all = input("\nUse all eligible indicators? [Y/n]: ").strip().lower()
-    if use_all in ["n", "no"]:
-        mode = input("Limit by [1] count or [2] names? [1]: ").strip()
-        if not mode:
-            mode = "1"
-        if mode == "2":
-            names_input = input("Indicator names (comma-separated, match file stems; single allowed): ").strip()
-            if not names_input:
-                return eligible_files
-            names = {n.strip().lower() for n in names_input.split(",") if n.strip()}
-            subset = [f for f in eligible_files if f.stem.lower() in names]
-            if not subset:
-                print("[ERROR] No indicators matched the provided names. Keeping full list.")
-                return eligible_files
-            return subset
-        else:
-            count_input = input("How many indicators to include? ").strip()
-            try:
-                count = int(count_input)
-            except ValueError:
-                print("[ERROR] Invalid number. Keeping full list.")
-                return eligible_files
-            if count <= 0:
-                print("[ERROR] Count must be positive. Keeping full list.")
-                return eligible_files
-            return eligible_files[:min(count, len(eligible_files))]
+    display_indicator_catalog(eligible_files, limit=30)
 
-    return eligible_files
+    selection_input = input(
+        "\nEnter indicator numbers or name fragments (comma/space-separated), "
+        "or press Enter to use all: "
+    ).strip()
+    if not selection_input:
+        return eligible_files
+
+    tokens = split_choice_input(selection_input)
+    if not tokens:
+        return eligible_files
+
+    selected = []
+    seen = set()
+    for token in tokens:
+        if not token:
+            continue
+        if token.isdigit():
+            idx = int(token)
+            if 1 <= idx <= len(eligible_files):
+                if idx not in seen:
+                    selected.append(eligible_files[idx - 1])
+                    seen.add(idx)
+            continue
+        lower_token = token.lower()
+        for f in eligible_files:
+            if f in selected:
+                continue
+            stem = f.stem.lower()
+            name = f.name.lower()
+            if lower_token in stem or lower_token in name:
+                selected.append(f)
+    if not selected:
+        print("[ERROR] No indicators matched the provided selection. Keeping full list.")
+        return eligible_files
+
+    return selected
 
 
 def backup_previous_outputs():
@@ -1094,10 +1229,10 @@ def run_batch_optimization(dm: DataManager):
         if result is None:
             continue
         
-        if not _is_improved_result(result):
+        improved = _is_improved_result(result)
+        if not improved:
             skipped_no_improvement += 1
-            print(f"[INFO] Skipping {pine_file.name} (no improvement vs baseline).")
-            continue
+            print(f"[INFO] No improvement for {pine_file.name}; keeping baseline outputs.")
 
         metrics = result.best_metrics
         score = calculate_objective_score(metrics)
@@ -1109,6 +1244,8 @@ def run_batch_optimization(dm: DataManager):
             "directional_accuracy": metrics.directional_accuracy,
             "sharpe_ratio": metrics.sharpe_ratio,
             "max_drawdown": metrics.max_drawdown,
+            "mcc": metrics.mcc,
+            "roc_auc": metrics.roc_auc,
             "improvement_pf": result.improvement_pf,
         })
         
@@ -1122,6 +1259,7 @@ def run_batch_optimization(dm: DataManager):
                 "n_trials": result.n_trials,
                 "objective_best": calculate_objective_score(result.best_metrics),
                 "baseline_objective": result.baseline_objective,
+                "improved": improved,
                 "best_metrics": _serialize_metrics(result.best_metrics),
                 "original_metrics": _serialize_metrics(result.original_metrics),
                 "original_params": result.original_params,
@@ -1155,12 +1293,12 @@ def run_batch_optimization(dm: DataManager):
     print("\n" + "="*70)
     print("  OPTIMIZATION RANKINGS (Best to Worst)")
     print("="*70)
-    print("  Rank  Score  PF    Win%  DirAcc  Sharpe  Drawdown  Indicator")
-    print("  ----  -----  ----  ----- ------  ------  --------  ---------")
+    print("  Rank  Score  MCC   AUC   PF    Win%  DirAcc  Sharpe  Drawdown  Indicator")
+    print("  ----  -----  ----  ----  ----  ----- ------  ------  --------  ---------")
     for idx, row in enumerate(rankings, 1):
         print(
-            f"  {idx:>4}  {row['score']:.3f}  {row['profit_factor']:.2f}  "
-            f"{row['win_rate']*100:>5.1f}  {row['directional_accuracy']*100:>6.1f}  "
+            f"  {idx:>4}  {row['score']:.3f}  {row['mcc']:.3f}  {row['roc_auc']:.3f}  "
+            f"{row['profit_factor']:.2f}  {row['win_rate']*100:>5.1f}  {row['directional_accuracy']*100:>6.1f}  "
             f"{row['sharpe_ratio']:>6.2f}  {row['max_drawdown']:>8.2f}  {row['file']}"
         )
     
@@ -1204,6 +1342,8 @@ def run_matrix_optimization(dm: DataManager):
     if not pine_files:
         print(f"\n[ERROR] No Pine Script files found in: {indicator_dir}")
         return
+
+    display_indicator_catalog(pine_files, directory=indicator_dir, limit=30)
 
     eligible_files, ineligible = get_eligible_indicators(pine_files)
 
@@ -1405,10 +1545,10 @@ def run_matrix_optimization(dm: DataManager):
             traceback.print_exc()
             continue
 
-        if not _is_improved_result(result):
+        improved = _is_improved_result(result)
+        if not improved:
             skipped_no_improvement += 1
-            print(f"[INFO] Skipping {pine_file.name} {symbol} @ {interval} (no improvement).")
-            continue
+            print(f"[INFO] No improvement for {pine_file.name} {symbol} @ {interval}; keeping baseline outputs.")
 
         output_tag = _safe_tag(f"{symbol}_{interval}")
         outputs = generate_outputs(parse_result, result, str(pine_file), output_tag=output_tag)
@@ -1418,6 +1558,7 @@ def run_matrix_optimization(dm: DataManager):
             "file_name": pine_file.name,
             "symbol": symbol,
             "interval": interval,
+            "improved": improved,
             "output_pine": outputs.get("pine_script"),
             "output_report": outputs.get("report"),
             "optimization_time": result.optimization_time,
