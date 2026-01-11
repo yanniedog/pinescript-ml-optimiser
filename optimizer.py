@@ -1709,7 +1709,15 @@ class PineOptimizer:
         self.pruning_warmup_trials = pruning_warmup_trials
         self.min_improvement_threshold = min_improvement_threshold
         self.enable_keyboard_interrupt = enable_keyboard_interrupt
-        self.interval = interval
+        # Normalize interval - extract first interval if comma-separated
+        # This ensures _parse_interval_seconds() receives a single interval format
+        if interval and ',' in interval:
+            # Extract first interval from comma-separated string
+            self.interval = interval.split(',')[0].strip()
+            logger.debug(f"Extracted first interval '{self.interval}' from comma-separated string '{interval}'")
+        else:
+            self.interval = interval
+        
         self.sampler_name = sampler_name
         self.early_stop_patience = early_stop_patience
         self.seed_params = seed_params

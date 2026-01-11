@@ -297,7 +297,9 @@ class WalkForwardBacktester:
                 fold_threshold,
                 use_discrete_signals
             )
-            if metrics.classification_samples >= self.min_classification_samples:
+            # Filter folds based on both classification samples and minimum trades
+            if (metrics.classification_samples >= self.min_classification_samples and 
+                metrics.total_trades >= self.min_trades_per_fold):
                 fold_metrics.append(metrics)
                 all_trades.extend(metrics.trades)
         
