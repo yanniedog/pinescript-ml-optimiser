@@ -1529,6 +1529,7 @@ class OptimizationProgressTracker:
         self.original_params = {}  # Original config's parameters
         self.best_objective = None
         self.best_time = None
+        self.best_trial_number = None  # Trial number that achieved the best objective
         # Full history with params: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params_dict)
         self.improvement_history = []
     
@@ -1566,15 +1567,17 @@ class OptimizationProgressTracker:
         self.start_time = time.time()
         self.best_objective = None
         self.best_time = None
+        self.best_trial_number = None
         self.improvement_history = []
     
-    def update(self, objective: float, params: Dict[str, Any] = None) -> Optional[dict]:
+    def update(self, objective: float, params: Dict[str, Any] = None, trial_number: Optional[int] = None) -> Optional[dict]:
         """
         Update with a new objective value. Returns improvement info if this is a new best.
         
         Args:
             objective: The objective score for this trial
             params: The parameter configuration that achieved this objective
+            trial_number: The trial number (for tracking which trial is best)
         
         Returns:
             dict with improvement info if new best, None otherwise
@@ -1595,6 +1598,7 @@ class OptimizationProgressTracker:
         if self.best_objective is None:
             self.best_objective = objective
             self.best_time = current_time
+            self.best_trial_number = trial_number
             # Record first trial vs baseline
             pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
             avg_rate = pct_vs_baseline / elapsed if elapsed > 0 else 0
@@ -1611,22 +1615,33 @@ class OptimizationProgressTracker:
                 'elapsed_seconds': elapsed,
                 'time_since_last_best': 0,
                 'is_first': True,
+                'trial_number': trial_number,
+                'best_trial_number': trial_number,
                 'params': params.copy() if params else {}
             }
         
         if objective > self.best_objective:
+            # Store old values before updating
+            old_objective = self.best_objective
+            old_best_trial = self.best_trial_number
+            
             # Calculate improvement as % vs ORIGINAL CONFIG (baseline)
             pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
             improvement_rate_pct = pct_vs_baseline / elapsed if elapsed > 0 else 0  # %/sec
             
             # Calculate marginal improvement as % of previous best, per second
             time_since_last_best = current_time - self.best_time
-            pct_improvement_marginal = ((objective - self.best_objective) / self.best_objective * 100) if self.best_objective > 0 else 0
+            pct_improvement_marginal = ((objective - old_objective) / old_objective * 100) if old_objective > 0 else 0
             marginal_rate_pct = pct_improvement_marginal / time_since_last_best if time_since_last_best > 0 else 0  # %/sec
+            
+            # Update best values
+            self.best_objective = objective
+            self.best_time = current_time
+            self.best_trial_number = trial_number
             
             result = {
                 'new_objective': objective,
-                'old_objective': self.best_objective,
+                'old_objective': old_objective,
                 'baseline_objective': self.baseline_objective,
                 'pct_improvement_total': pct_vs_baseline,  # vs original config
                 'improvement_rate_pct': improvement_rate_pct,  # %/sec average vs original
@@ -1635,13 +1650,14 @@ class OptimizationProgressTracker:
                 'elapsed_seconds': elapsed,
                 'time_since_last_best': time_since_last_best,
                 'is_first': False,
+                'trial_number': trial_number,
+                'best_trial_number': trial_number,
+                'previous_best_trial_number': old_best_trial,
                 'params': params.copy() if params else {}
             }
             
             # Store: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
             self.improvement_history.append((elapsed, objective, pct_vs_baseline, improvement_rate_pct, marginal_rate_pct, params.copy() if params else {}))
-            self.best_objective = objective
-            self.best_time = current_time
             
             return result
         
@@ -2274,6 +2290,7 @@ class PineOptimizer:
         trial_metrics = {
             "total_trials": self.trial_count,
             "trials_per_second": trials_per_second,
+            "objective_best": avg_objective,  # Include objective score for each trial
         }
         if self.realtime_plotter:
             self.realtime_plotter.record_trial_progress(
@@ -2284,7 +2301,7 @@ class PineOptimizer:
             )
 
         # Track best and report improvement rate vs original config
-        improvement_info = self.progress_tracker.update(avg_objective, params)
+        improvement_info = self.progress_tracker.update(avg_objective, params, trial_number=self.trial_count)
         progress_logged = False
         if improvement_info:
             elapsed = improvement_info['elapsed_seconds']
@@ -2334,9 +2351,10 @@ class PineOptimizer:
             if improvement_info.get('is_first'):
                 # First trial
                 avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
+                best_trial = improvement_info.get('best_trial_number', self.trial_count)
                 logger.info(
                     f"Trial {self.trial_count}: FIRST = {avg_objective:.4f} "
-                    f"({sign}{pct_vs_original:.2f}% vs original)"
+                    f"({sign}{pct_vs_original:.2f}% vs original) | BEST TRIAL: {best_trial}"
                 )
                 if avg_rate is not None and moving_avg is not None:
                     logger.info(
@@ -2348,11 +2366,15 @@ class PineOptimizer:
                 avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
                 marginal_rate_pct = improvement_info['marginal_rate_pct']
                 time_since_last = improvement_info['time_since_last_best']
+                best_trial = improvement_info.get('best_trial_number', self.trial_count)
+                previous_best_trial = improvement_info.get('previous_best_trial_number')
                 
                 logger.info(
                     f"Trial {self.trial_count}: NEW BEST = {avg_objective:.4f} "
-                    f"({sign}{pct_vs_original:.2f}% vs original) | {elapsed_str} | rate: {rate_pct:+.3f}%/s"
+                    f"({sign}{pct_vs_original:.2f}% vs original) | {elapsed_str} | rate: {rate_pct:+.3f}%/s | BEST TRIAL: {best_trial}"
                 )
+                if previous_best_trial is not None:
+                    logger.info(f"  -> Previous best was Trial {previous_best_trial}")
                 if avg_rate is not None and moving_avg is not None:
                     logger.info(
                         f"  -> Avg rate: {avg_rate:+.3f}%/s | Moving avg ({self.improvement_rate_window}): "
@@ -2379,9 +2401,11 @@ class PineOptimizer:
             self._last_progress_log_time = now
         
         if not progress_logged and (now - self._last_progress_log_time) >= self._progress_log_interval:
+            best_trial = self.progress_tracker.best_trial_number
+            best_trial_str = f" | BEST: Trial {best_trial}" if best_trial is not None else ""
             logger.info(
                 f"Trial {self.trial_count}: total={self.trial_count} | trials/sec={trials_per_second:.2f} | "
-                f"objective={avg_objective:.4f} | elapsed={elapsed_since_start:.1f}s"
+                f"objective={avg_objective:.4f} | elapsed={elapsed_since_start:.1f}s{best_trial_str}"
             )
             self._last_progress_log_time = now
 
