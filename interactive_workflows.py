@@ -672,9 +672,9 @@ def run_matrix_optimization(dm: DataManager):
             print("[ERROR] Please enter P, T, or S.")
     else:
         while True:
-            per_combo_input = input("Minutes per combination? [10]: ").strip()
+            per_combo_input = input("Minutes per combination? [5]: ").strip()
             if not per_combo_input:
-                per_combo_minutes = 10.0
+                per_combo_minutes = 5.0
                 break
             try:
                 per_combo_minutes = float(per_combo_input)
