@@ -956,20 +956,14 @@ class WalkForwardBacktester:
         
         # Determine classification threshold
         # Handle case where no valid training threshold was found
-        # Use neutral threshold (median of test scores) to avoid bias from 0.0 threshold
+        # Use 0.0 as neutral threshold to avoid lookahead bias (using test median would leak future info)
         if threshold is None:
-            if len(scores) > 0:
-                classification_threshold = float(np.median(scores))
-                logger.warning(
-                    f"Using neutral threshold (median={classification_threshold:.4f}) for classification "
-                    f"in fold (test_start={test_start}, test_end={effective_end}) because no valid "
-                    f"training threshold was found. This may bias classification metrics."
-                )
-            else:
-                classification_threshold = 0.0
-                logger.warning(
-                    f"No test scores available for classification in fold. Using threshold=0.0."
-                )
+            classification_threshold = 0.0
+            logger.warning(
+                f"Using neutral threshold (0.0) for classification in fold "
+                f"(test_start={test_start}, test_end={effective_end}) because no valid "
+                f"training threshold was found."
+            )
         else:
             classification_threshold = threshold
         

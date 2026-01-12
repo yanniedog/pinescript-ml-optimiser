@@ -2,11 +2,22 @@
 Progress tracking for the optimizer.
 """
 
+import sys
+import os
 import time
 import logging
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _supports_ansi() -> bool:
+    """Check if terminal supports ANSI escape codes."""
+    if sys.platform == 'win32':
+        # Windows Terminal and modern terminals set these env vars
+        return os.environ.get('TERM') == 'xterm' or os.environ.get('WT_SESSION') is not None
+    # Unix-like systems: check if stdout is a TTY
+    return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
 
 class OptimizationProgressTracker:
     """Track and report progressive improvement during optimization.
@@ -53,9 +64,13 @@ class OptimizationProgressTracker:
         else:
             params_str = "N/A"
         
-        # Use ANSI bold escape code for terminal output
-        BOLD = '\033[1m'
-        RESET = '\033[0m'
+        # Use ANSI bold escape code for terminal output (only if supported)
+        if _supports_ansi():
+            BOLD = '\033[1m'
+            RESET = '\033[0m'
+        else:
+            BOLD = ''
+            RESET = ''
         logger.info(f"Baseline objective (original config): {BOLD}{baseline_objective:.4f}{RESET}")
         logger.info(f"Original parameters: {params_str}")
     

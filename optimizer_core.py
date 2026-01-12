@@ -689,10 +689,12 @@ class PineOptimizer:
             if self._baseline_objective is not None and best_obj is not None:
                 delta = best_obj - self._baseline_objective
                 delta_str = f" (Δ{delta:+.4f})"
+            # Format best_trial properly (N/A if None)
+            best_trial_str = str(best_trial) if best_trial is not None else "N/A"
             logger.info(
                 f"Trial {self.trial_count}: trials/sec={trials_per_second:.2f} | "
                 f"best={best_obj_str}{delta_str} | this={avg_objective:.4f} | "
-                f"elapsed={elapsed_since_start:.1f}s | BEST: Trial {best_trial}"
+                f"elapsed={elapsed_since_start:.1f}s | BEST: Trial {best_trial_str}"
             )
             self._last_progress_log_time = now
 
@@ -1171,6 +1173,12 @@ class PineOptimizer:
         # Filter out empty metrics and None values
         valid_metrics = [m for m in all_metrics if m is not None and m.total_trades > 0]
         if not valid_metrics:
+            return BacktestMetrics()
+        
+        # Reject if ANY symbol has MCC < -0.1 (significantly worse than random)
+        # This prevents aggregation from hiding per-asset failures
+        if any(m.mcc < -0.1 for m in valid_metrics):
+            logger.warning("Rejecting aggregation: one or more symbols has MCC < -0.1 (worse than random)")
             return BacktestMetrics()
         
         total_tp = sum(m.tp for m in valid_metrics)

@@ -181,6 +181,7 @@ class RealtimeBestPlotter:
             self._fig.tight_layout()
             self._fig.show()
             self._fig.canvas.draw()
+            self._plt.pause(0.01)  # Required for Windows interactivity
             self._fig.canvas.mpl_connect("pick_event", self._on_pick)
             self._fig.canvas.mpl_connect("key_press_event", self._on_key_press)
             self._enabled = True
@@ -421,6 +422,7 @@ class RealtimeBestPlotter:
                 # Toggle
                 visible = not artist.get_visible()
                 artist.set_visible(visible)
+            self._update_legend()  # Update legend to reflect visibility changes
             self._redraw()
 
     def start_indicator(self, indicator_name: str) -> None:
@@ -809,9 +811,19 @@ class PlotlyRealtimePlotter:
 
         def build_options():
             with self._lock:
-                indicators = sorted({m["indicator"] for m in self._line_meta.values() if m["indicator"]})
-                symbols = sorted({m["symbol"] for m in self._line_meta.values() if m["symbol"]})
-                timeframes = sorted({m["timeframe"] for m in self._line_meta.values() if m["timeframe"]})
+                # Filter out [trials] suffix labels that clutter the filter dropdowns
+                indicators = sorted({
+                    m["indicator"] for m in self._line_meta.values() 
+                    if m["indicator"] and not m["indicator"].endswith("[trials]")
+                })
+                symbols = sorted({
+                    m["symbol"] for m in self._line_meta.values() 
+                    if m["symbol"] and not m["symbol"].endswith("[trials]")
+                })
+                timeframes = sorted({
+                    m["timeframe"] for m in self._line_meta.values() 
+                    if m["timeframe"] and not m["timeframe"].endswith("[trials]")
+                })
             self._last_options = {
                 "indicator": indicators,
                 "symbol": symbols,
@@ -1121,7 +1133,10 @@ class PlotlyRealtimePlotter:
                 params = point.get("text", "")
                 y_val = point.get("y", "")
                 x_val = point.get("x", "")
-                return f"Combo: {combo} | Params: {params} | Y: {y_val:.4f} | X: {x_val:.4f}"
+                # Handle non-numeric values gracefully
+                y_str = f"{y_val:.4f}" if isinstance(y_val, (int, float)) else str(y_val)
+                x_str = f"{x_val:.4f}" if isinstance(x_val, (int, float)) else str(x_val)
+                return f"Combo: {combo} | Params: {params} | Y: {y_str} | X: {x_str}"
             except Exception:
                 return "Click a line to reveal the exact combo and values."
 

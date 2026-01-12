@@ -74,9 +74,31 @@ class OutputGenerator:
                 weeks = days / 7
                 return f"{horizon_bars} bars ({weeks:.1f} weeks)"
     
+    def _safe_date_str(self, dt) -> str:
+        """Safely format a date, handling None and NaT (pandas Not-a-Time)."""
+        if dt is None:
+            return "N/A"
+        if hasattr(dt, 'strftime'):
+            try:
+                # Check for pandas NaT
+                import pandas as pd
+                if pd.isna(dt):
+                    return "N/A"
+                return dt.strftime('%Y-%m-%d')
+            except (ValueError, AttributeError, TypeError):
+                return "N/A"
+        return "N/A"
+    
     def _format_date_range(self, start: datetime, end: datetime) -> str:
         """Format date range for display."""
-        return f"{start.strftime('%Y-%m-%d %H:%M:%S')} to {end.strftime('%Y-%m-%d %H:%M:%S')}"
+        start_str = self._safe_date_str(start)
+        end_str = self._safe_date_str(end)
+        if start_str == "N/A" or end_str == "N/A":
+            return "N/A"
+        try:
+            return f"{start.strftime('%Y-%m-%d %H:%M:%S')} to {end.strftime('%Y-%m-%d %H:%M:%S')}"
+        except (ValueError, AttributeError, TypeError):
+            return "N/A"
     
     def _calculate_bar_percentage(self, used: int, total: int) -> float:
         """Calculate percentage of bars used."""
@@ -804,7 +826,11 @@ class OutputGenerator:
             for symbol in sorted(opt.data_usage_info.keys()):
                 for timeframe in sorted(opt.data_usage_info[symbol].keys()):
                     usage = opt.data_usage_info[symbol][timeframe]
-                    date_range_str = f"{usage.date_range[0].strftime('%Y-%m-%d')} to {usage.date_range[1].strftime('%Y-%m-%d')}"
+                    # Handle None or invalid date_range
+                    if usage.date_range and usage.date_range[0] and usage.date_range[1]:
+                        date_range_str = f"{self._safe_date_str(usage.date_range[0])} to {self._safe_date_str(usage.date_range[1])}"
+                    else:
+                        date_range_str = "N/A"
                     train_pct = self._calculate_bar_percentage(usage.total_train_bars, usage.total_bars)
                     test_pct = self._calculate_bar_percentage(usage.total_test_bars, usage.total_bars)
                     embargo_pct = self._calculate_bar_percentage(usage.total_embargo_bars, usage.total_bars)
@@ -817,11 +843,16 @@ class OutputGenerator:
                 for timeframe in sorted(opt.data_usage_info[symbol].keys()):
                     usage = opt.data_usage_info[symbol][timeframe]
                     tf_display = timeframe if timeframe else opt.interval
+                    # Safely format date range
+                    if usage.date_range and usage.date_range[0] and usage.date_range[1]:
+                        detailed_date_range = self._format_date_range(usage.date_range[0], usage.date_range[1])
+                    else:
+                        detailed_date_range = "N/A"
                     report_lines.extend([
                         "",
                         f"  Detailed Breakdown: {symbol} @ {tf_display}",
                         f"    Total bars: {usage.total_bars:,}",
-                        f"    Date range: {self._format_date_range(usage.date_range[0], usage.date_range[1])}",
+                        f"    Date range: {detailed_date_range}",
                         f"    Walk-forward folds: {usage.n_folds}",
                         f"    Train ratio: {usage.train_ratio:.1%}",
                         f"    Embargo period: {usage.embargo_bars} bars",
@@ -834,8 +865,13 @@ class OutputGenerator:
                     for fold in usage.folds:
                         train_range = f"{fold['train_start']}-{fold['train_end']-1}"
                         test_range = f"{fold['test_start']}-{fold['test_end']-1}"
-                        train_date_range = f"{fold['train_start_date'].strftime('%Y-%m-%d')} to {fold['train_end_date'].strftime('%Y-%m-%d')}" if fold['train_start_date'] and fold['train_end_date'] else "N/A"
-                        test_date_range = f"{fold['test_start_date'].strftime('%Y-%m-%d')} to {fold['test_end_date'].strftime('%Y-%m-%d')}" if fold['test_start_date'] and fold['test_end_date'] else "N/A"
+                        # Use safe date formatting for fold dates (handles None and NaT)
+                        train_start_str = self._safe_date_str(fold.get('train_start_date'))
+                        train_end_str = self._safe_date_str(fold.get('train_end_date'))
+                        test_start_str = self._safe_date_str(fold.get('test_start_date'))
+                        test_end_str = self._safe_date_str(fold.get('test_end_date'))
+                        train_date_range = f"{train_start_str} to {train_end_str}" if train_start_str != "N/A" and train_end_str != "N/A" else "N/A"
+                        test_date_range = f"{test_start_str} to {test_end_str}" if test_start_str != "N/A" and test_end_str != "N/A" else "N/A"
                         train_pct = self._calculate_bar_percentage(fold['train_bars'], usage.total_bars)
                         test_pct = self._calculate_bar_percentage(fold['test_bars'], usage.total_bars)
                         report_lines.append(f"    {fold['fold_num']:<6} {train_range:<20} {train_date_range:<35} {test_range:<20} {test_date_range:<35} {fold['embargo_bars']:<10} {train_pct:<9.1f}% {test_pct:<9.1f}%")

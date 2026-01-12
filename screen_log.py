@@ -18,7 +18,11 @@ class TeeWriter:
             return 0
         if isinstance(data, (bytes, bytearray)):
             data = data.decode("utf-8", errors="replace")
-        self._stream.write(data)
+        try:
+            self._stream.write(data)
+        except UnicodeEncodeError:
+            # Fallback to ASCII-safe representation for terminals that can't handle unicode
+            self._stream.write(data.encode('ascii', errors='replace').decode('ascii'))
         self._log_file.write(data)
         return len(data)
 

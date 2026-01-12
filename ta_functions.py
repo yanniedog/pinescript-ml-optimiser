@@ -228,45 +228,25 @@ def lowest(src: ArrayLike, length: int) -> np.ndarray:
 
 
 def highest_bars(src: ArrayLike, length: int) -> np.ndarray:
-    """Bars since highest value - ta.highestbars(src, length) - Vectorized implementation."""
+    """Bars since highest value - ta.highestbars(src, length) - Vectorized O(n) implementation."""
     arr = ensure_array(src)
-    n = len(arr)
-    result = np.zeros(n)
-    
-    # Use rolling argmax via pandas for efficiency
     series = pd.Series(arr)
-    rolling_max = series.rolling(window=length, min_periods=1).max()
-    
-    # For each position, find how many bars back the max occurred
-    for i in range(n):
-        start = max(0, i - length + 1)
-        window = arr[start:i + 1]
-        if len(window) > 0:
-            # Find position of max within window
-            max_pos = np.argmax(window)
-            # Convert to bars back (negative)
-            result[i] = -(len(window) - 1 - max_pos)
-    
-    return result
+    # Use rolling with argmax - returns negative offset (bars back) to the highest value
+    result = series.rolling(window=length, min_periods=1).apply(
+        lambda x: -(len(x) - 1 - np.argmax(x)), raw=True
+    )
+    return result.values
 
 
 def lowest_bars(src: ArrayLike, length: int) -> np.ndarray:
-    """Bars since lowest value - ta.lowestbars(src, length) - Vectorized implementation."""
+    """Bars since lowest value - ta.lowestbars(src, length) - Vectorized O(n) implementation."""
     arr = ensure_array(src)
-    n = len(arr)
-    result = np.zeros(n)
-    
-    # For each position, find how many bars back the min occurred
-    for i in range(n):
-        start = max(0, i - length + 1)
-        window = arr[start:i + 1]
-        if len(window) > 0:
-            # Find position of min within window
-            min_pos = np.argmin(window)
-            # Convert to bars back (negative)
-            result[i] = -(len(window) - 1 - min_pos)
-    
-    return result
+    series = pd.Series(arr)
+    # Use rolling with argmin - returns negative offset (bars back) to the lowest value
+    result = series.rolling(window=length, min_periods=1).apply(
+        lambda x: -(len(x) - 1 - np.argmin(x)), raw=True
+    )
+    return result.values
 
 
 # =============================================================================
