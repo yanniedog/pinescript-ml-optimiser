@@ -911,8 +911,8 @@ class WalkForwardBacktester:
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
         else:
             sig = indicator_result.combined_signal[test_start:effective_end]
-            # Use consistent threshold (0.1) for both correct and total_sigs
-            trading_threshold = 0.1
+            # Use same threshold (0.3) as trading entry logic for consistency
+            trading_threshold = 0.3
             correct = np.sum(((sig > trading_threshold) & (test_returns > 0) & valid_mask) | 
                            ((sig < -trading_threshold) & (test_returns < 0) & valid_mask))
             total_sigs = np.sum(((sig > trading_threshold) | (sig < -trading_threshold)) & valid_mask)
