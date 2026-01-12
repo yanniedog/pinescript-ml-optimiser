@@ -44,10 +44,20 @@ INTERVAL_NAMES = {
 
 
 class DataManager:
+    """
+    Binance data manager with efficient caching and memory management.
+    Optimized for Windows Surface laptops with limited RAM.
+    """
+    # Class-level cache for sharing across instances
+    _shared_cache = {}
+    _cache_access_times = {}
+    _max_cache_size = 10  # Max number of datasets to keep in memory
+    
     def __init__(self, data_dir: str = "historical_data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
-        self._cache = {}
+        self._cache = DataManager._shared_cache  # Use shared cache
+        self._access_times = DataManager._cache_access_times
         self._usdt_symbols_cache = None
     
     def get_csv_path(self, symbol: str, interval: str = "1h") -> Path:
@@ -204,19 +214,59 @@ class DataManager:
         return df
     
     def load_symbol(self, symbol: str, interval: str = "1h") -> pd.DataFrame:
-        """Load historical data for a symbol from CSV."""
+        """Load historical data for a symbol from CSV with LRU caching."""
+        import time
         cache_key = f"{symbol}_{interval}"
+        
+        # Check cache first
         if cache_key in self._cache:
+            # Update access time for LRU
+            self._access_times[cache_key] = time.time()
             return self._cache[cache_key]
         
         csv_path = self.get_csv_path(symbol, interval)
         if not csv_path.exists():
             raise FileNotFoundError(f"Data file not found: {csv_path}")
         
-        df = pd.read_csv(csv_path, parse_dates=['timestamp'])
+        # Evict oldest entries if cache is full (LRU eviction)
+        self._evict_if_needed()
+        
+        # Load with optimized settings for memory efficiency
+        df = pd.read_csv(
+            csv_path, 
+            parse_dates=['timestamp'],
+            dtype={
+                'open': 'float32',  # Use float32 instead of float64
+                'high': 'float32',
+                'low': 'float32', 
+                'close': 'float32',
+                'volume': 'float32'
+            }
+        )
+        
+        # Store in cache with access time
         self._cache[cache_key] = df
+        self._access_times[cache_key] = time.time()
         logger.info(f"Loaded {symbol} {interval}: {len(df):,} candles")
         return df
+    
+    def _evict_if_needed(self):
+        """Evict least recently used cache entries if cache is full."""
+        if len(self._cache) >= self._max_cache_size:
+            # Find the oldest entry
+            if self._access_times:
+                oldest_key = min(self._access_times, key=self._access_times.get)
+                if oldest_key in self._cache:
+                    del self._cache[oldest_key]
+                if oldest_key in self._access_times:
+                    del self._access_times[oldest_key]
+                logger.debug(f"Evicted {oldest_key} from cache (LRU)")
+    
+    def clear_cache(self):
+        """Clear all cached data to free memory."""
+        DataManager._shared_cache.clear()
+        DataManager._cache_access_times.clear()
+        logger.info("Data cache cleared")
     
     def download_multiple(self, symbols: List[str], interval: str = "1h", force: bool = False) -> Dict[str, pd.DataFrame]:
         """Download data for multiple symbols."""

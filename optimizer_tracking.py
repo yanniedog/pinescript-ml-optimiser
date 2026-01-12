@@ -14,7 +14,11 @@ class OptimizationProgressTracker:
     Uses the ORIGINAL CONFIG's performance as baseline, not the first trial.
     This means early trials may show negative improvement until ML finds
     something better than the original.
+    
+    Memory-optimized for long-running optimizations.
     """
+    
+    MAX_HISTORY_SIZE = 200  # Limit history to prevent memory bloat
     
     def __init__(self):
         self.start_time = None
@@ -152,9 +156,27 @@ class OptimizationProgressTracker:
             # Store: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
             self.improvement_history.append((elapsed, objective, pct_vs_baseline, improvement_rate_pct, marginal_rate_pct, params.copy() if params else {}))
             
+            # Trim history if it gets too long (keep first 10 and last N-10 entries)
+            if len(self.improvement_history) > self.MAX_HISTORY_SIZE:
+                self._trim_history()
+            
             return result
         
         return None
+    
+    def _trim_history(self):
+        """Trim history to prevent memory bloat while preserving key data points."""
+        if len(self.improvement_history) <= self.MAX_HISTORY_SIZE:
+            return
+        
+        # Keep first 10 entries (early history) and most recent entries
+        keep_early = 10
+        keep_total = self.MAX_HISTORY_SIZE
+        keep_recent = keep_total - keep_early
+        
+        first_entries = self.improvement_history[:keep_early]
+        recent_entries = self.improvement_history[-keep_recent:]
+        self.improvement_history = first_entries + recent_entries
     
     def get_summary(self) -> str:
         """Get a summary of the improvement trajectory vs original config."""

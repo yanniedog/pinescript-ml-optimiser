@@ -23,7 +23,7 @@ from interactive_ui import _input_with_go_back
 builtins.input = _input_with_go_back
 
 from screen_log import enable_screen_log
-from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES, print_available_data
+from data_manager import DataManager, VALID_INTERVALS, INTERVAL_NAMES
 from interactive_types import GoBack
 from interactive_ui import handle_go_back, ask_yes_no, get_pine_files, display_pine_menu, get_user_choice, split_choice_input, find_pine_directories, display_indicator_catalog, choose_indicator_directory
 from interactive_config import configure_trial_controls, TRIAL_CONTROL_OPTIONS, apply_trial_overrides, _get_trial_overrides
@@ -58,29 +58,47 @@ def main_menu():
 """)
         print("  Enter 'B' at any prompt to return to the previous menu (main menu only).")
         try:
-            choice = input("  Select option: ").strip().lower()
+            user_input = input("  Select option: ")
+            choice = user_input.strip().lower() if user_input else ""
         except GoBack:
             print("  [INFO] Already at the main menu.")
             continue
-        
-        if choice == '1':
-            run_optimization(dm)
-        elif choice == '2':
-            download_new_data(dm)
-        elif choice == '3':
-            display_data_status(dm)
-            input("\n  Press Enter to continue...")
-        elif choice == '4':
-            run_batch_optimization(dm)
-        elif choice == '5':
-            run_matrix_optimization(dm)
-        elif choice == '6':
-            configure_trial_controls()
-        elif choice == 'q':
-            print("\nGoodbye!")
+        except (EOFError, KeyboardInterrupt) as e:
+            print("\n\nExiting...")
             break
-        else:
-            print("\n  [ERROR] Invalid option. Please enter 1, 2, 3, 4, 5, or Q.")
+        except Exception as e:
+            # If this is actually an EOFError that wasn't caught by the specific handler, handle it
+            if isinstance(e, (EOFError, KeyboardInterrupt)):
+                print("\n\nExiting...")
+                break
+            print(f"\n  [ERROR] Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+        
+        try:
+            if choice == '1':
+                run_optimization(dm)
+            elif choice == '2':
+                download_new_data(dm)
+            elif choice == '3':
+                display_data_status(dm)
+                input("\n  Press Enter to continue...")
+            elif choice == '4':
+                run_batch_optimization(dm)
+            elif choice == '5':
+                run_matrix_optimization(dm)
+            elif choice == '6':
+                configure_trial_controls()
+            elif choice == 'q':
+                print("\nGoodbye!")
+                break
+            else:
+                print("\n  [ERROR] Invalid option. Please enter 1, 2, 3, 4, 5, or Q.")
+        except Exception as e:
+            print(f"\n  [ERROR] Error executing option {choice}: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def main():

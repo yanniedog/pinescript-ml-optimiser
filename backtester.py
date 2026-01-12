@@ -174,10 +174,9 @@ class WalkForwardBacktester:
         # Filter horizons that cannot fit inside any fold's training window
         self.forecast_horizons = self._filter_forecast_horizons(self.forecast_horizons)
 
-        # Pre-calculate future returns for different horizons
+        # Lazy-load future returns - only calculate when needed
         self._future_returns = {}
-        for h in self.forecast_horizons:
-            self._future_returns[h] = self._calculate_future_returns(h)
+        self._future_returns_calculated = set()
     
     def _calculate_future_returns(self, horizon: int) -> np.ndarray:
         """
@@ -188,6 +187,13 @@ class WalkForwardBacktester:
         future_close[-horizon:] = np.nan
         returns = (future_close - self.close) / self.close * 100
         return returns
+    
+    def _get_future_returns(self, horizon: int) -> np.ndarray:
+        """Get future returns for a horizon, calculating lazily if not cached."""
+        if horizon not in self._future_returns_calculated:
+            self._future_returns[horizon] = self._calculate_future_returns(horizon)
+            self._future_returns_calculated.add(horizon)
+        return self._future_returns[horizon]
     
     def _create_folds(self) -> List[WalkForwardFold]:
         """Create walk-forward validation folds."""
@@ -472,11 +478,21 @@ class WalkForwardBacktester:
         indicator_result: IndicatorResult,
         horizon: int,
         start_idx: int,
-        end_idx: int
+        end_idx: int,
+        use_discrete_signals: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Build binary labels and scores for classification from a data slice."""
-        future_returns = self._future_returns[horizon][start_idx:end_idx]
-        scores = indicator_result.combined_signal[start_idx:end_idx]
+        future_returns = self._get_future_returns(horizon)[start_idx:end_idx]
+        
+        if use_discrete_signals:
+            # Convert buy/sell signals to scores: buy=+1.0, sell=-1.0, neither=0.0
+            buy_signals = indicator_result.buy_signals[start_idx:end_idx]
+            sell_signals = indicator_result.sell_signals[start_idx:end_idx]
+            scores = np.where(buy_signals, 1.0, np.where(sell_signals, -1.0, 0.0))
+        else:
+            # Use combined signal (directional)
+            scores = indicator_result.combined_signal[start_idx:end_idx]
+        
         valid = ~np.isnan(future_returns) & ~np.isnan(scores) & (future_returns != 0)
         if not np.any(valid):
             return np.array([], dtype=int), np.array([], dtype=float)
@@ -596,7 +612,8 @@ class WalkForwardBacktester:
                 indicator_result,
                 horizon,
                 start_idx=start_idx,
-                end_idx=end_idx
+                end_idx=end_idx,
+                use_discrete_signals=use_discrete_signals
             )
             threshold, mcc = self._select_mcc_threshold(scores, labels)
             # Only update if we have valid data (non-empty and non-degenerate)
@@ -645,7 +662,7 @@ class WalkForwardBacktester:
             start_idx: Optional start index to restrict calculation (default: 0)
             end_idx: Optional end index to restrict calculation (default: end of data)
         """
-        future_returns = self._future_returns[horizon]
+        future_returns = self._get_future_returns(horizon)
         
         # Apply data range restrictions if provided
         if start_idx is None:
@@ -724,7 +741,7 @@ class WalkForwardBacktester:
         if train_range is None:
             return 0.0
         train_start, train_end = train_range
-        train_returns = self._future_returns[horizon][train_start:train_end]
+        train_returns = self._get_future_returns(horizon)[train_start:train_end]
         train_returns = train_returns[~np.isnan(train_returns)]
 
         if len(train_returns) < 50:
@@ -738,7 +755,7 @@ class WalkForwardBacktester:
         if effective_end <= fold.test_start:
             return 0.0
 
-        test_returns = self._future_returns[horizon][fold.test_start:effective_end]
+        test_returns = self._get_future_returns(horizon)[fold.test_start:effective_end]
         valid_mask = ~np.isnan(test_returns)
 
         if not np.any(valid_mask):
@@ -806,7 +823,7 @@ class WalkForwardBacktester:
             )
         
         trades = []
-        future_returns = self._future_returns[horizon]
+        future_returns = self._get_future_returns(horizon)
         
         if use_discrete_signals:
             # Trade on discrete buy/sell signals
@@ -933,7 +950,8 @@ class WalkForwardBacktester:
             indicator_result,
             horizon,
             start_idx=test_start,
-            end_idx=effective_end
+            end_idx=effective_end,
+            use_discrete_signals=use_discrete_signals
         )
         
         # Determine classification threshold

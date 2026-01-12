@@ -602,16 +602,19 @@ class PlotlyRealtimePlotter(RealtimeBestPlotter):
     """
     Realtime plotter using Plotly (browser-based).
     Starts a local server and updates a dashboard.
+    Optimized for Windows Surface with proper threading.
     """
     def __init__(self):
         super().__init__()
         self._server_thread = None
         self._port = 8050
         self._app = None
-        self._data_lock = threading.Lock()
+        self._data_lock = threading.RLock()  # Use RLock for Windows compatibility
         self._pending_updates = []
         self._host = "127.0.0.1"
         self._url = f"http://{self._host}:{self._port}"
+        self._shutdown_event = threading.Event()
+        self._max_data_points = 500  # Limit data for memory efficiency
 
     def _ensure_ready(self) -> bool:
         if self._init_attempted:
@@ -708,20 +711,53 @@ class PlotlyRealtimePlotter(RealtimeBestPlotter):
             return False
 
     def _run_server(self):
-        # Suppress Flask banner
+        # Suppress Flask banner and configure for Windows
         import logging
         log = logging.getLogger('werkzeug')
         log.setLevel(logging.ERROR)
-        self._app.run_server(debug=False, port=self._port, host=self._host, use_reloader=False)
+        
+        try:
+            # Use threaded=True for better Windows compatibility
+            self._app.run_server(
+                debug=False, 
+                port=self._port, 
+                host=self._host, 
+                use_reloader=False,
+                threaded=True  # Better for Windows
+            )
+        except Exception as e:
+            if not self._shutdown_event.is_set():
+                logger.error(f"Plotly server error: {e}")
+    
+    def shutdown(self):
+        """Gracefully shutdown the plotter."""
+        self._shutdown_event.set()
+        self._enabled = False
 
-    # Override update methods to use lock
+    # Override update methods to use lock with data limiting
     def update(self, indicator_name, best_objective, metrics, params, trial_number=0):
         with self._data_lock:
             super().update(indicator_name, best_objective, metrics, params, trial_number)
+            # Limit data points per series for memory efficiency
+            self._trim_series_data()
 
     def record_trial_progress(self, combo_label, trial_number, elapsed_seconds, metrics):
         with self._data_lock:
             super().record_trial_progress(combo_label, trial_number, elapsed_seconds, metrics)
+            self._trim_series_data()
+    
+    def _trim_series_data(self):
+        """Trim series data to prevent memory bloat on long runs."""
+        for label, series in self._series.items():
+            if len(series.get("x", [])) > self._max_data_points:
+                # Keep only the most recent data points
+                series["x"] = series["x"][-self._max_data_points:]
+                if "trials" in series:
+                    series["trials"] = series["trials"][-self._max_data_points:]
+                if "params" in series:
+                    series["params"] = series["params"][-self._max_data_points:]
+                for key in series.get("metrics", {}):
+                    series["metrics"][key] = series["metrics"][key][-self._max_data_points:]
 
 
 _REALTIME_PLOTTER = None

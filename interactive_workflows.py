@@ -80,17 +80,28 @@ def backup_previous_outputs():
         return
 
     backup_root = Path("backup")
-    backup_root.mkdir(parents=True, exist_ok=True)
+    try:
+        backup_root.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     backup_dir = backup_root / timestamp
-    backup_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise
 
     for path in existing_sources:
         dest = backup_dir / path.name
-        if path.is_dir():
-            shutil.copytree(path, dest)
-        else:
-            shutil.copy2(path, dest)
+        try:
+            if path.is_dir():
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(path, dest)
+            else:
+                shutil.copy2(path, dest)
+        except Exception as e:
+            raise
 
     run_info = {}
     summary_dir = Path("optimized_outputs") / "summary"
@@ -448,10 +459,10 @@ def run_batch_optimization(dm: DataManager):
         if outputs:
             # Safely get LAST_PINE_PATH - getattr returns None if attribute exists but is None
             last_path = getattr(optimize_module, "LAST_PINE_PATH", None)
-            indicator_name = (result.best_metrics and last_path and last_path.stem) or pine_file.stem
             if result.best_metrics is None or result.original_metrics is None:
                 print(f"[WARNING] Missing metrics for {pine_file.name}; skipping result serialization.")
                 continue
+            indicator_name = (last_path and last_path.stem) or pine_file.stem
             results.append({
                 "indicator_name": indicator_name,
                 "file_name": pine_file.name,

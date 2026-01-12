@@ -3,4 +3,8 @@ pandas>=2.0.0
 optuna>=3.4.0
 requests>=2.31.0
 matplotlib>=3.7.0
-
+# Plotly/Dash for interactive charts (optional but recommended)
+plotly>=5.18.0
+dash>=2.14.0
+# Performance optimization
+psutil>=5.9.0

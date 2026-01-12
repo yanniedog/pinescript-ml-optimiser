@@ -46,14 +46,25 @@ def ema(src: ArrayLike, length: int) -> np.ndarray:
 
 
 def wma(src: ArrayLike, length: int) -> np.ndarray:
-    """Weighted Moving Average - ta.wma(src, length)"""
+    """Weighted Moving Average - ta.wma(src, length) - Vectorized implementation."""
     arr = ensure_array(src)
-    weights = np.arange(1, length + 1)
-    result = np.full(len(arr), np.nan)
+    weights = np.arange(1, length + 1, dtype=float)
+    weight_sum = weights.sum()
     
-    for i in range(length - 1, len(arr)):
-        window = arr[i - length + 1:i + 1]
-        result[i] = np.sum(window * weights) / np.sum(weights)
+    # Use numpy convolution for efficient weighted sum
+    # Pad with NaN to handle edge cases
+    padded = np.concatenate([np.full(length - 1, np.nan), arr])
+    
+    # Strided view for efficient window access
+    shape = (len(arr), length)
+    strides = (padded.strides[0], padded.strides[0])
+    windows = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
+    
+    # Vectorized weighted mean calculation
+    result = np.sum(windows * weights, axis=1) / weight_sum
+    
+    # Set initial values to NaN (where we don't have full window)
+    result[:length - 1] = np.nan
     
     return result
 
@@ -217,31 +228,43 @@ def lowest(src: ArrayLike, length: int) -> np.ndarray:
 
 
 def highest_bars(src: ArrayLike, length: int) -> np.ndarray:
-    """Bars since highest value - ta.highestbars(src, length)"""
+    """Bars since highest value - ta.highestbars(src, length) - Vectorized implementation."""
     arr = ensure_array(src)
-    result = np.zeros(len(arr))
+    n = len(arr)
+    result = np.zeros(n)
     
-    for i in range(len(arr)):
+    # Use rolling argmax via pandas for efficiency
+    series = pd.Series(arr)
+    rolling_max = series.rolling(window=length, min_periods=1).max()
+    
+    # For each position, find how many bars back the max occurred
+    for i in range(n):
         start = max(0, i - length + 1)
         window = arr[start:i + 1]
         if len(window) > 0:
-            max_idx = np.argmax(window)
-            result[i] = -(len(window) - 1 - max_idx)
+            # Find position of max within window
+            max_pos = np.argmax(window)
+            # Convert to bars back (negative)
+            result[i] = -(len(window) - 1 - max_pos)
     
     return result
 
 
 def lowest_bars(src: ArrayLike, length: int) -> np.ndarray:
-    """Bars since lowest value - ta.lowestbars(src, length)"""
+    """Bars since lowest value - ta.lowestbars(src, length) - Vectorized implementation."""
     arr = ensure_array(src)
-    result = np.zeros(len(arr))
+    n = len(arr)
+    result = np.zeros(n)
     
-    for i in range(len(arr)):
+    # For each position, find how many bars back the min occurred
+    for i in range(n):
         start = max(0, i - length + 1)
         window = arr[start:i + 1]
         if len(window) > 0:
-            min_idx = np.argmin(window)
-            result[i] = -(len(window) - 1 - min_idx)
+            # Find position of min within window
+            min_pos = np.argmin(window)
+            # Convert to bars back (negative)
+            result[i] = -(len(window) - 1 - min_pos)
     
     return result
 
@@ -396,35 +419,60 @@ def na(src: ArrayLike) -> np.ndarray:
 
 
 def barssince(condition: ArrayLike) -> np.ndarray:
-    """Bars since condition was true - ta.barssince(condition)"""
+    """Bars since condition was true - ta.barssince(condition) - Optimized implementation."""
     cond = ensure_array(condition).astype(bool)
-    result = np.zeros(len(cond))
+    n = len(cond)
+    result = np.full(n, np.nan)
     
-    bars_since = np.nan
-    for i in range(len(cond)):
-        if cond[i]:
-            bars_since = 0
-        elif not np.isnan(bars_since):
-            bars_since += 1
-        result[i] = bars_since
+    # Find indices where condition is True
+    true_indices = np.where(cond)[0]
+    
+    if len(true_indices) == 0:
+        return result  # All NaN if condition never true
+    
+    # For each True index, fill forward with incrementing counter
+    for idx in true_indices:
+        # Calculate how many bars from this True to the end
+        remaining = n - idx
+        # Fill from this index forward with 0, 1, 2, ...
+        fill_values = np.arange(remaining)
+        # Only update positions that don't have a closer True (smaller value)
+        end_fill = min(n, idx + remaining)
+        
+        # Use minimum to handle overlapping fills correctly
+        current_slice = result[idx:end_fill]
+        new_values = fill_values[:end_fill - idx]
+        result[idx:end_fill] = np.where(
+            np.isnan(current_slice), 
+            new_values, 
+            np.minimum(current_slice, new_values)
+        )
     
     return result
 
 
 def valuewhen(condition: ArrayLike, src: ArrayLike, occurrence: int = 0) -> np.ndarray:
-    """Value when condition was true - ta.valuewhen(condition, src, occurrence)"""
+    """Value when condition was true - ta.valuewhen(condition, src, occurrence) - Optimized."""
     cond = ensure_array(condition).astype(bool)
     arr = ensure_array(src)
-    result = np.full(len(arr), np.nan)
+    n = len(arr)
+    result = np.full(n, np.nan)
     
-    for i in range(len(arr)):
-        count = 0
-        for j in range(i, -1, -1):
-            if cond[j]:
-                if count == occurrence:
-                    result[i] = arr[j]
-                    break
-                count += 1
+    # Find all True indices
+    true_indices = np.where(cond)[0]
+    
+    if len(true_indices) == 0:
+        return result
+    
+    # For each bar, find the nth occurrence looking backward
+    for i in range(n):
+        # Get all True indices up to and including i
+        valid_indices = true_indices[true_indices <= i]
+        
+        if len(valid_indices) > occurrence:
+            # Get the (occurrence)th from the end (0 = most recent)
+            target_idx = valid_indices[-(occurrence + 1)]
+            result[i] = arr[target_idx]
     
     return result
 

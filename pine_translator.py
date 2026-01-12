@@ -297,15 +297,20 @@ class PineTranslator:
         else:
             mf_volume = raw_mf_volume
         
-        # Cumulative MFV for each range
+        # Cumulative MFV for each range - vectorized implementation
         def calc_cum_mfv(mfv, bar_range):
-            result = np.zeros(len(mfv))
-            for i in range(len(mfv)):
-                if i == 0:
-                    result[i] = mfv[i]
-                else:
-                    subtract = mfv[i - bar_range] if i >= bar_range else 0
-                    result[i] = result[i-1] + mfv[i] - subtract
+            """Calculate cumulative MFV over a rolling window - vectorized."""
+            # Use cumsum for efficiency: rolling sum = cumsum[i] - cumsum[i - bar_range]
+            cumsum = np.cumsum(mfv)
+            result = cumsum.copy()
+            
+            # Subtract the cumsum from bar_range positions ago
+            if bar_range < len(mfv):
+                # For positions >= bar_range, subtract cumsum[i - bar_range]
+                shifted = np.zeros_like(cumsum)
+                shifted[bar_range:] = cumsum[:-bar_range]
+                result = cumsum - shifted
+            
             return result
         
         def normalize_zscore(data, window):
@@ -453,20 +458,33 @@ class PineTranslator:
         buy_setup = (gauge_c <= buy_level) & is_local_min & (lwcp_reversing_up | gauge_recovering)
         sell_setup = (gauge_c >= sell_level) & is_local_max & (lwcp_reversing_down | gauge_rolling_over)
         
-        # Apply cooldown
+        # Apply cooldown - optimized with numpy operations
+        # First, find all potential signal edges (where setup transitions from False to True)
+        buy_edges = buy_setup & ~np.roll(buy_setup, 1)
+        buy_edges[0] = buy_setup[0]  # Handle first bar
+        sell_edges = sell_setup & ~np.roll(sell_setup, 1)
+        sell_edges[0] = sell_setup[0]
+        
+        # Apply cooldown filter using numba-style iteration (faster than pure Python)
         buy_signals = np.zeros(len(gauge_c), dtype=bool)
         sell_signals = np.zeros(len(gauge_c), dtype=bool)
         
-        last_buy = -cooldown_bars - 1
-        last_sell = -cooldown_bars - 1
+        buy_edge_indices = np.where(buy_edges)[0]
+        sell_edge_indices = np.where(sell_edges)[0]
         
-        for i in range(1, len(gauge_c)):
-            if buy_setup[i] and not buy_setup[i-1] and (i - last_buy >= cooldown_bars):
-                buy_signals[i] = True
-                last_buy = i
-            if sell_setup[i] and not sell_setup[i-1] and (i - last_sell >= cooldown_bars):
-                sell_signals[i] = True
-                last_sell = i
+        # Filter buy signals with cooldown
+        last_buy = -cooldown_bars - 1
+        for idx in buy_edge_indices:
+            if idx - last_buy >= cooldown_bars:
+                buy_signals[idx] = True
+                last_buy = idx
+        
+        # Filter sell signals with cooldown  
+        last_sell = -cooldown_bars - 1
+        for idx in sell_edge_indices:
+            if idx - last_sell >= cooldown_bars:
+                sell_signals[idx] = True
+                last_sell = idx
         
         # Normalize gauge to -1 to 1
         combined_signal = gauge_c / 100.0

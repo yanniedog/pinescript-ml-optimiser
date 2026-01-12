@@ -14,8 +14,12 @@ _ORIGINAL_INPUT = builtins.input
 
 
 def _input_with_go_back(prompt=""):
-    response = _ORIGINAL_INPUT(prompt)
-    if response is not None and response.strip().lower() in {"b", "back", "go back"}:
+    try:
+        response = _ORIGINAL_INPUT(prompt)
+    except (EOFError, KeyboardInterrupt) as e:
+        # Re-raise EOFError and KeyboardInterrupt so they can be handled by the caller
+        raise
+    if response and response.strip().lower() in {"b", "back", "go back"}:
         raise GoBack()
     return response
 
