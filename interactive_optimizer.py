@@ -600,6 +600,8 @@ def calculate_objective_score(metrics) -> float:
 
 
 def _serialize_metrics(metrics):
+    if metrics is None:
+        return {}
     return {
         "total_trades": metrics.total_trades,
         "winning_trades": metrics.winning_trades,
@@ -632,12 +634,16 @@ def _baseline_objective(result) -> float:
         return 0.0
     baseline = getattr(result, "baseline_objective", None)
     if baseline is None or baseline == 0.0:
+        if result.original_metrics is None:
+            return 0.0
         baseline = calculate_objective_score(result.original_metrics)
     return baseline
 
 
 def _is_improved_result(result) -> bool:
     if result is None:
+        return False
+    if result.best_metrics is None:
         return False
     best_obj = calculate_objective_score(result.best_metrics)
     baseline_obj = _baseline_objective(result)
@@ -1492,6 +1498,10 @@ def run_batch_optimization(dm: DataManager):
             print(f"[INFO] No improvement for {pine_file.name}; keeping baseline outputs.")
 
         metrics = result.best_metrics
+        if metrics is None:
+            print(f"[WARNING] No metrics available for {pine_file.name}; skipping ranking.")
+            continue
+        
         score = calculate_objective_score(metrics)
         rankings.append({
             "file": pine_file.name,
@@ -1510,6 +1520,9 @@ def run_batch_optimization(dm: DataManager):
             # Safely get LAST_PINE_PATH - getattr returns None if attribute exists but is None
             last_path = getattr(optimize_module, "LAST_PINE_PATH", None)
             indicator_name = (result.best_metrics and last_path and last_path.stem) or pine_file.stem
+            if result.best_metrics is None or result.original_metrics is None:
+                print(f"[WARNING] Missing metrics for {pine_file.name}; skipping result serialization.")
+                continue
             results.append({
                 "indicator_name": indicator_name,
                 "file_name": pine_file.name,
@@ -1841,6 +1854,10 @@ def run_matrix_optimization(dm: DataManager):
         if not improved:
             skipped_no_improvement += 1
             print(f"[INFO] No improvement for {pine_file.name} {symbol} @ {interval}; keeping baseline outputs.")
+
+        if result.best_metrics is None or result.original_metrics is None:
+            print(f"[WARNING] Missing metrics for {pine_file.name} {symbol} @ {interval}; skipping result.")
+            continue
 
         output_tag = _safe_tag(f"{symbol}_{interval}")
         outputs = generate_outputs(parse_result, result, str(pine_file), output_tag=output_tag)

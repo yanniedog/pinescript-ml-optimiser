@@ -1992,6 +1992,16 @@ class PineOptimizer:
             for symbol, timeframes_dict in self.data.items():
                 for timeframe, df in timeframes_dict.items():
                     key = (symbol, timeframe)
+                    # #region agent log
+                    import json
+                    log_path = Path(".cursor/debug.log")
+                    try:
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"location": "optimizer.py:1995", "message": "Creating backtester", "data": {"symbol": symbol, "timeframe": timeframe, "df_len": len(df), "df_empty": df.empty, "has_required_cols": all(c in df.columns for c in ['timestamp', 'open', 'high', 'low', 'close', 'volume'])}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "E"}) + "\n")
+                    except Exception as e:
+                        logger.debug(f"Debug log write failed: {e}")
+                    # #endregion
                     self.translators[key] = PineTranslator(parse_result, df)
                     backtester_kwargs = self._get_backtester_config(timeframe, df)
                     self.backtesters[key] = WalkForwardBacktester(df, **backtester_kwargs)
@@ -1999,6 +2009,16 @@ class PineOptimizer:
         else:
             # Single-timeframe structure: {symbol: DataFrame}
             for symbol, df in self.data.items():
+                # #region agent log
+                import json
+                log_path = Path(".cursor/debug.log")
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"location": "optimizer.py:2010", "message": "Creating backtester", "data": {"symbol": symbol, "df_len": len(df), "df_empty": df.empty, "has_required_cols": all(c in df.columns for c in ['timestamp', 'open', 'high', 'low', 'close', 'volume'])}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "E"}) + "\n")
+                except Exception as e:
+                    logger.debug(f"Debug log write failed: {e}")
+                # #endregion
                 self.translators[symbol] = PineTranslator(parse_result, df)
                 backtester_kwargs = self._get_backtester_config(self.interval, df)
                 self.backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
@@ -2256,21 +2276,55 @@ class PineOptimizer:
         Returns:
             (key, metrics, objective) or (key, None, None) on failure
         """
+        # #region agent log
+        import json
+        log_path = Path(".cursor/debug.log")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"location": "optimizer.py:2251", "message": "_evaluate_symbol entry", "data": {"key": str(key)}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+        except Exception as e:
+            logger.debug(f"Debug log write failed: {e}")
+        # #endregion
         translator = self.translators[key]
         backtester = self.backtesters[key]
         
         try:
             # Run indicator with trial params
             indicator_result = translator.run_indicator(params)
+            # #region agent log
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"location": "optimizer.py:2288", "message": "After run_indicator", "data": {"indicator_result_is_none": indicator_result is None}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+            except Exception as e:
+                logger.debug(f"Debug log write failed: {e}")
+            # #endregion
             
             # Evaluate performance
             metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
+            # #region agent log
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"location": "optimizer.py:2297", "message": "After evaluate_indicator", "data": {"metrics_is_none": metrics is None}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+            except Exception as e:
+                logger.debug(f"Debug log write failed: {e}")
+            # #endregion
 
             # Calculate objective
             obj = backtester.calculate_objective(metrics)
             
             return (key, metrics, obj)
         except Exception as e:
+            # #region agent log
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({"location": "optimizer.py:2307", "message": "Exception in _evaluate_symbol", "data": {"key": str(key), "error": str(e)}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "C"}) + "\n")
+            except Exception as e2:
+                logger.debug(f"Debug log write failed: {e2}")
+            # #endregion
             logger.debug(f"Trial failed for {key}: {e}")
             return (key, None, None)
     
@@ -2349,6 +2403,16 @@ class PineOptimizer:
         trials_per_second = self.trial_count / elapsed_for_rate if elapsed_for_rate else 0.0
         
         # Compute full aggregated metrics for every trial (not just improvements)
+        # #region agent log
+        import json
+        log_path = Path(".cursor/debug.log")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"location": "optimizer.py:2394", "message": "Before _aggregate_metrics", "data": {"metrics_list_len": len(metrics_list), "has_none": any(m is None for m in metrics_list)}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+        except Exception as e:
+            logger.debug(f"Debug log write failed: {e}")
+        # #endregion
         aggregated_metrics = self._aggregate_metrics(metrics_list)
         metrics_map = _metrics_from_backtest(aggregated_metrics)
         metrics_map["objective_best"] = avg_objective
@@ -2885,6 +2949,16 @@ class PineOptimizer:
     
     def _calculate_avg_objective(self, per_symbol_metrics: Dict[str, Any]) -> float:
         """Calculate average objective score using backtester settings."""
+        # #region agent log
+        import json
+        log_path = Path(".cursor/debug.log")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"location": "optimizer.py:2936", "message": "_calculate_avg_objective entry", "data": {"is_multi_timeframe": self.is_multi_timeframe, "metrics_count": len(per_symbol_metrics)}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+        except Exception as e:
+            logger.debug(f"Debug log write failed: {e}")
+        # #endregion
         total_objective = 0.0
         count = 0
 
@@ -2893,14 +2967,30 @@ class PineOptimizer:
                 for timeframe, metrics in tf_dict.items():
                     key = (symbol, timeframe)
                     backtester = self.backtesters.get(key)
-                    if backtester is None:
+                    # #region agent log
+                    try:
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps({"location": "optimizer.py:2954", "message": "Processing metrics", "data": {"symbol": symbol, "timeframe": timeframe, "metrics_is_none": metrics is None, "backtester_is_none": backtester is None}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+                    except Exception as e:
+                        logger.debug(f"Debug log write failed: {e}")
+                    # #endregion
+                    if backtester is None or metrics is None:
                         continue
                     total_objective += backtester.calculate_objective(metrics)
                     count += 1
         else:
             for symbol, metrics in per_symbol_metrics.items():
                 backtester = self.backtesters.get(symbol)
-                if backtester is None:
+                # #region agent log
+                try:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(json.dumps({"location": "optimizer.py:2965", "message": "Processing metrics", "data": {"symbol": symbol, "metrics_is_none": metrics is None, "backtester_is_none": backtester is None}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+                except Exception as e:
+                    logger.debug(f"Debug log write failed: {e}")
+                # #endregion
+                if backtester is None or metrics is None:
                     continue
                 total_objective += backtester.calculate_objective(metrics)
                 count += 1
@@ -2913,11 +3003,30 @@ class PineOptimizer:
     
     def _aggregate_metrics(self, all_metrics: List[BacktestMetrics]) -> BacktestMetrics:
         """Aggregate metrics from multiple symbols/timeframes into a single BacktestMetrics."""
+        # #region agent log
+        import json
+        log_path = Path(".cursor/debug.log")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"location": "optimizer.py:2984", "message": "_aggregate_metrics entry", "data": {"all_metrics_len": len(all_metrics) if all_metrics else 0, "has_none": any(m is None for m in all_metrics) if all_metrics else False}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except Exception as e:
+            logger.debug(f"Debug log write failed: {e}")
+        # #endregion
         if not all_metrics:
             return BacktestMetrics()
         
-        # Filter out empty metrics
-        valid_metrics = [m for m in all_metrics if m.total_trades > 0]
+        # Filter out empty metrics and None values
+        # #region agent log
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a", encoding="utf-8") as f:
+                none_count = sum(1 for m in all_metrics if m is None)
+                f.write(json.dumps({"location": "optimizer.py:2998", "message": "Before filtering", "data": {"none_count": none_count, "total_count": len(all_metrics)}, "timestamp": time.time() * 1000, "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except Exception as e:
+            logger.debug(f"Debug log write failed: {e}")
+        # #endregion
+        valid_metrics = [m for m in all_metrics if m is not None and m.total_trades > 0]
         if not valid_metrics:
             return BacktestMetrics()
         
