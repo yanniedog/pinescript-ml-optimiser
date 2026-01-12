@@ -4,6 +4,7 @@ UI components for the optimizer, including keyboard monitoring and realtime plot
 
 import sys
 import time
+import math
 import threading
 import logging
 import socket
@@ -1195,6 +1196,10 @@ class PlotlyRealtimePlotter:
         """Update plot with new best objective."""
         if not self._ensure_ready():
             return
+        
+        # Filter out rejected trials (-inf from hard cutoffs)
+        if not math.isfinite(best_objective):
+            return
 
         with self._lock:
             current_time = time.time()
@@ -1224,6 +1229,11 @@ class PlotlyRealtimePlotter:
     ) -> None:
         """Track trial progress as a separate '[trials]' series."""
         if not self._ensure_ready():
+            return
+        
+        # Filter out rejected trials (-inf from hard cutoffs)
+        obj_best = metrics.get("objective_best")
+        if obj_best is not None and not math.isfinite(obj_best):
             return
 
         with self._lock:

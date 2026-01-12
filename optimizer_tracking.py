@@ -5,6 +5,7 @@ Progress tracking for the optimizer.
 import sys
 import os
 import time
+import math
 import logging
 from typing import Dict, Any, List, Optional
 
@@ -100,6 +101,10 @@ class OptimizationProgressTracker:
             - marginal_rate_pct: % improvement from last best trial, per second since last best
               (recent rate - if this drops, you're seeing diminishing returns)
         """
+        # Filter out rejected trials (-inf from hard cutoffs)
+        if not math.isfinite(objective):
+            return None
+        
         current_time = time.time()
         elapsed = current_time - self.start_time
         

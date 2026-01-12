@@ -7,12 +7,14 @@ import time
 import shutil
 import json
 import zipfile
+import logging
 from pathlib import Path
 from data_manager import DataManager
 import optimize_indicator as optimize_module
 from pine_parser import parse_pine_script
-from optimizer import optimize_indicator as run_optimizer
+from optimizer import optimize_indicator as run_optimizer, get_optimizable_params
 from output_generator import generate_outputs
+from hybrid_indicator import HybridIndicatorGenerator, create_hybrid_from_results
 
 from interactive_ui import (
     handle_go_back,
@@ -52,6 +54,8 @@ from interactive_reports import (
     write_unified_report,
     write_matrix_reports
 )
+
+logger = logging.getLogger(__name__)
 
 BACKUP_DONE = False
 
@@ -269,6 +273,260 @@ def sort_rankings(rankings: list) -> list:
     return sorted(rankings, key=lambda r: r.get("score", 0), reverse=True)
 
 
+def generate_and_optimize_hybrid(
+    results: list,
+    dm: DataManager,
+    options: dict,
+    hybrid_timeout: float,
+    symbol: str = None,
+    interval: str = None,
+    voting_method: str = "majority",
+    n_top: int = 5,
+    min_score: float = 0.0,
+) -> tuple:
+    """
+    Generate a hybrid indicator from optimization results and run optimization on it.
+    
+    IMPORTANT: All indicators in the hybrid MUST be optimized against the same 
+    symbol and timeframe combination. This function will filter results to only
+    include those matching the specified symbol/interval context.
+    
+    Args:
+        results: List of optimization result dictionaries
+        dm: DataManager instance
+        options: Optimization options
+        hybrid_timeout: Timeout in seconds for hybrid optimization
+        symbol: Symbol context for the hybrid (required for filtering)
+        interval: Interval/timeframe context for the hybrid (required for filtering)
+        voting_method: Voting method for ensemble
+        n_top: Number of top indicators to include
+        min_score: Minimum score threshold
+        
+    Returns:
+        Tuple of (ranking_entry, result_entry, hybrid_file_path) or (None, None, None) if failed
+    """
+    # Filter to only successful results with metrics
+    valid_results = [r for r in results if r.get("best_metrics") and r.get("improved", True)]
+    
+    # CRITICAL: Filter results to only those matching the same symbol and interval
+    # Hybrid indicators must only combine indicators optimized on the same data
+    if symbol or interval:
+        filtered_results = []
+        for r in valid_results:
+            result_symbol = r.get("symbol", r.get("datasets_used", [""])[0] if r.get("datasets_used") else "")
+            result_interval = r.get("interval", "")
+            
+            # Check symbol match (if specified)
+            symbol_match = True
+            if symbol:
+                if isinstance(result_symbol, list):
+                    symbol_match = symbol in result_symbol or symbol == "ALL"
+                else:
+                    symbol_match = (result_symbol == symbol) or (symbol == "ALL")
+            
+            # Check interval match (if specified)
+            interval_match = True
+            if interval:
+                interval_match = (result_interval == interval)
+            
+            if symbol_match and interval_match:
+                filtered_results.append(r)
+        
+        if len(filtered_results) < len(valid_results):
+            logger.info(f"Filtered results for hybrid: {len(valid_results)} -> {len(filtered_results)} (symbol={symbol}, interval={interval})")
+        
+        valid_results = filtered_results
+    
+    if len(valid_results) < 2:
+        logger.info(f"Not enough valid results ({len(valid_results)}) to generate hybrid indicator")
+        return None, None, None
+    
+    # Generate hybrid indicator
+    try:
+        hybrid_result = create_hybrid_from_results(
+            valid_results,
+            output_dir="pinescripts",
+            n_top=n_top,
+            min_score=min_score,
+            voting_method=voting_method,
+            symbol=symbol,
+            interval=interval,
+        )
+    except Exception as e:
+        logger.error(f"Failed to generate hybrid indicator: {e}")
+        return None, None, None
+    
+    if hybrid_result is None:
+        logger.info("Could not generate hybrid indicator (insufficient qualifying indicators)")
+        return None, None, None
+    
+    hybrid_file, metadata = hybrid_result
+    hybrid_name = metadata.get("name", "Hybrid_Ensemble")
+    
+    print(f"\n{'='*70}")
+    print(f"HYBRID INDICATOR GENERATED: {hybrid_name}")
+    print(f"  Combined {metadata.get('indicator_count', 0)} top-performing indicators")
+    print(f"  Voting method: {voting_method}")
+    print("="*70)
+    
+    # Parse the hybrid indicator
+    try:
+        parse_result = parse_pine_script(str(hybrid_file))
+    except Exception as e:
+        logger.error(f"Failed to parse hybrid indicator: {e}")
+        return None, None, hybrid_file
+    
+    # Check if the hybrid has enough optimizable parameters
+    optimizable_params = get_optimizable_params(parse_result.parameters)
+    if len(optimizable_params) < 2:
+        logger.info(f"Hybrid indicator has only {len(optimizable_params)} optimizable params, skipping optimization")
+        # Return basic entry without optimization
+        ranking_entry = {
+            "file": hybrid_file.name,
+            "score": 0.0,
+            "profit_factor": 0.0,
+            "win_rate": 0.0,
+            "directional_accuracy": 0.0,
+            "sharpe_ratio": 0.0,
+            "max_drawdown": 0.0,
+            "mcc": 0.0,
+            "roc_auc": 0.5,
+            "improvement_pf": 0.0,
+            "is_hybrid": True,
+        }
+        result_entry = {
+            "indicator_name": hybrid_name,
+            "file_name": hybrid_file.name,
+            "is_hybrid": True,
+            "hybrid_metadata": metadata,
+            "output_pine": str(hybrid_file),
+            "skipped": True,
+            "skip_reason": "insufficient_params",
+        }
+        return ranking_entry, result_entry, hybrid_file
+    
+    # Load data for optimization
+    opt_interval = interval or options.get('interval', '1h')
+    opt_symbols = options.get('symbols', '').split(',') if options.get('symbols') else None
+    
+    data = {}
+    if opt_symbols:
+        for sym in opt_symbols:
+            sym = sym.strip().upper()
+            if not sym.endswith('USDT'):
+                sym = sym + 'USDT'
+            try:
+                data[sym] = dm.load_symbol(sym, opt_interval)
+            except Exception:
+                continue
+    else:
+        # Use all available symbols for the interval
+        available_symbols = dm.get_available_symbols(opt_interval)
+        for sym in available_symbols[:10]:  # Limit to 10 symbols for hybrid
+            try:
+                data[sym] = dm.load_symbol(sym, opt_interval)
+            except Exception:
+                continue
+    
+    if not data:
+        logger.error("No data available for hybrid optimization")
+        return None, None, hybrid_file
+    
+    print(f"\nOptimizing hybrid indicator...")
+    print(f"  Timeout: {hybrid_timeout/60:.1f} minutes")
+    print(f"  Symbols: {', '.join(data.keys())}")
+    print(f"  Interval: {opt_interval}")
+    
+    # Calculate adaptive stall settings
+    min_runtime = min(30, hybrid_timeout // 4)
+    stall_time = min(60, hybrid_timeout // 3)
+    
+    combo_label = f"{hybrid_name}:{','.join(data.keys())}@{opt_interval}"
+    
+    run_kwargs = {
+        "interval": opt_interval,
+        "max_trials": None,
+        "timeout_seconds": hybrid_timeout,
+        "min_runtime_seconds": min_runtime,
+        "stall_seconds": stall_time,
+        "improvement_rate_floor": 0.01,
+        "indicator_label": combo_label,
+    }
+    apply_trial_overrides(run_kwargs)
+    
+    # Run optimization
+    try:
+        result = run_optimizer(parse_result, data, **run_kwargs)
+    except KeyboardInterrupt:
+        print("\n\nHybrid optimization interrupted by user.")
+        return None, None, hybrid_file
+    except Exception as e:
+        logger.error(f"Hybrid optimization failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, hybrid_file
+    
+    if result.best_metrics is None:
+        logger.warning("Hybrid optimization returned no metrics")
+        return None, None, hybrid_file
+    
+    # Generate outputs for hybrid
+    improved = _is_improved_result(result)
+    output_tag = _safe_tag(f"hybrid_{symbol or 'all'}_{opt_interval}")
+    outputs = generate_outputs(parse_result, result, str(hybrid_file), output_tag=output_tag)
+    
+    metrics = result.best_metrics
+    score = calculate_objective_score(metrics)
+    
+    ranking_entry = {
+        "file": hybrid_file.name,
+        "score": score,
+        "profit_factor": metrics.profit_factor,
+        "win_rate": metrics.win_rate,
+        "directional_accuracy": metrics.directional_accuracy,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "mcc": metrics.mcc,
+        "roc_auc": metrics.roc_auc,
+        "improvement_pf": result.improvement_pf,
+        "is_hybrid": True,
+    }
+    
+    result_entry = {
+        "indicator_name": hybrid_name,
+        "file_name": hybrid_file.name,
+        "is_hybrid": True,
+        "hybrid_metadata": metadata,
+        "output_pine": outputs.get("pine_script"),
+        "output_report": outputs.get("report"),
+        "optimization_time": result.optimization_time,
+        "n_trials": result.n_trials,
+        "objective_best": score,
+        "baseline_objective": _baseline_objective(result),
+        "improved": improved,
+        "best_metrics": _serialize_metrics(result.best_metrics),
+        "original_metrics": _serialize_metrics(result.original_metrics),
+        "original_params": result.original_params,
+        "best_params": result.best_params,
+        "per_symbol_metrics": _serialize_per_symbol_metrics(result.per_symbol_metrics),
+        "data_usage_info": _serialize_data_usage_info(result.data_usage_info),
+        "datasets_used": result.datasets_used,
+        "interval": opt_interval,
+        "config": {
+            "strategy": getattr(result, "strategy", "tpe"),
+            "sampler": getattr(result, "sampler_name", "tpe"),
+            "timeout_seconds": getattr(result, "timeout_seconds", 0),
+            "max_trials": getattr(result, "max_trials", None),
+            "voting_method": voting_method,
+            "source_indicator_count": metadata.get("indicator_count", 0),
+        },
+    }
+    
+    print(f"\n[OK] Hybrid indicator optimization complete: score={score:.4f}, MCC={metrics.mcc:.3f}")
+    
+    return ranking_entry, result_entry, hybrid_file
+
+
 @handle_go_back("[INFO] Returning to main menu.")
 def run_batch_optimization(dm: DataManager):
     """Run optimization across all indicators in a directory with ranking."""
@@ -474,6 +732,14 @@ def run_batch_optimization(dm: DataManager):
                 print(f"[WARNING] Missing metrics for {pine_file.name}; skipping result serialization.")
                 continue
             indicator_name = (last_path and last_path.stem) or pine_file.stem
+            
+            # Get symbols used for this optimization
+            opt_symbols = options.get('symbols', '')
+            if opt_symbols:
+                symbols_list = [s.strip().upper() for s in opt_symbols.split(',')]
+            else:
+                symbols_list = result.datasets_used if result.datasets_used else []
+            
             results.append({
                 "indicator_name": indicator_name,
                 "file_name": pine_file.name,
@@ -491,7 +757,9 @@ def run_batch_optimization(dm: DataManager):
                 "per_symbol_metrics": _serialize_per_symbol_metrics(result.per_symbol_metrics),
                 "data_usage_info": _serialize_data_usage_info(result.data_usage_info),
                 "datasets_used": result.datasets_used,
-                "interval": result.interval,
+                # Store the symbol and interval context for hybrid filtering
+                "symbol": ",".join(symbols_list) if symbols_list else "ALL",
+                "interval": options.get('interval', result.interval or '1h'),
                 "config": {
                     "strategy": getattr(result, "strategy", "tpe"),
                     "sampler": getattr(result, "sampler_name", "tpe"),
@@ -512,6 +780,56 @@ def run_batch_optimization(dm: DataManager):
         print("\nNo successful optimizations to rank.")
         return
     
+    # =========================================================================
+    # HYBRID INDICATOR GENERATION AND OPTIMIZATION
+    # =========================================================================
+    # After all individual indicators have been optimized, create a hybrid 
+    # indicator combining the best performers and optimize it.
+    # 
+    # IMPORTANT: All indicators in a hybrid MUST be optimized against the same
+    # symbol and timeframe combination. In batch mode, all indicators share
+    # the same options (symbols, interval), so we use those for hybrid context.
+    
+    # Get the common symbol and interval used for all optimizations
+    common_interval = options.get("interval", "1h")
+    common_symbols = options.get("symbols", "")
+    
+    if len(results) >= 2:
+        print("\n" + "="*70)
+        print("  CREATING HYBRID INDICATOR FROM OPTIMIZED INDICATORS")
+        print(f"  (All indicators optimized on: {common_symbols or 'all symbols'} @ {common_interval})")
+        print("="*70)
+        
+        # Calculate hybrid timeout (use average of per-indicator timeouts, or 2 minutes minimum)
+        hybrid_timeout = max(120, sum(per_indicator_budgets) / len(per_indicator_budgets) if per_indicator_budgets else 120)
+        
+        # Use "ALL" as symbol context since batch mode may use multiple symbols
+        hybrid_symbol = common_symbols.split(",")[0].strip() if common_symbols else "ALL"
+        
+        hybrid_ranking, hybrid_result, hybrid_file = generate_and_optimize_hybrid(
+            results,
+            dm,
+            options,
+            hybrid_timeout=hybrid_timeout,
+            symbol=hybrid_symbol,  # Match the common symbol context
+            interval=common_interval,  # Match the common interval
+            voting_method="majority",
+            n_top=min(5, len(results)),  # Use up to 5 indicators
+            min_score=0.0,
+        )
+        
+        if hybrid_ranking:
+            rankings.append(hybrid_ranking)
+            print(f"\n[OK] Hybrid indicator added to rankings")
+        
+        if hybrid_result:
+            # Tag hybrid with the same symbol/interval context
+            hybrid_result["symbol"] = hybrid_symbol
+            hybrid_result["interval"] = common_interval
+            results.append(hybrid_result)
+    else:
+        print("\n[INFO] Skipping hybrid generation (need at least 2 successful optimizations)")
+    
     rankings = sort_rankings(rankings)
     
     print("\n" + "="*70)
@@ -520,11 +838,17 @@ def run_batch_optimization(dm: DataManager):
     print("  Rank  Score  MCC   AUC   PF    Win%  DirAcc  Sharpe  Drawdown  Indicator")
     print("  ----  -----  ----  ----  ----  ----- ------  ------  --------  ---------")
     for idx, row in enumerate(rankings, 1):
+        indicator_name = row['file']
+        if row.get('is_hybrid'):
+            indicator_name = f"[HYBRID] {indicator_name}"
         print(
             f"  {idx:>4}  {row['score']:.3f}  {row['mcc']:.3f}  {row['roc_auc']:.3f}  "
             f"{row['profit_factor']:.2f}  {row['win_rate']*100:>5.1f}  {row['directional_accuracy']*100:>6.1f}  "
-            f"{row['sharpe_ratio']:>6.2f}  {row['max_drawdown']:>8.2f}  {row['file']}"
+            f"{row['sharpe_ratio']:>6.2f}  {row['max_drawdown']:>8.2f}  {indicator_name}"
         )
+    
+    # Count hybrids
+    hybrid_count = sum(1 for r in rankings if r.get('is_hybrid'))
     
     # Unified summary outputs
     run_info = {
@@ -541,6 +865,7 @@ def run_batch_optimization(dm: DataManager):
         "total_indicators": len(pine_files),
         "eligible_indicators": len(eligible_files),
         "skipped_no_improvement": skipped_no_improvement,
+        "hybrid_indicators_generated": hybrid_count,
     }
     summary_dir = Path("optimized_outputs") / "summary"
     write_unified_report(
@@ -842,8 +1167,81 @@ def run_matrix_optimization(dm: DataManager):
         print("\nNo successful optimizations to report.")
         return
 
+    # =========================================================================
+    # HYBRID INDICATOR GENERATION AND OPTIMIZATION (MATRIX MODE)
+    # =========================================================================
+    # Generate hybrid indicators for each unique symbol-timeframe combination.
+    # 
+    # IMPORTANT: Hybrids can ONLY combine indicators optimized against the SAME
+    # symbol and timeframe. This ensures apples-to-apples comparison.
+    
     intervals = sorted(set(interval for _, interval in datasets))
     symbols = sorted(set(symbol for symbol, _ in datasets))
+    
+    hybrid_results = []
+    hybrid_count = 0
+    
+    # Group results by symbol-interval for per-combo hybrids
+    # Only indicators with the SAME symbol AND interval can be combined
+    combo_groups = {}
+    for r in results:
+        if r.get("best_metrics") and r.get("improved", True):
+            key = (r.get("symbol", ""), r.get("interval", ""))
+            if key not in combo_groups:
+                combo_groups[key] = []
+            combo_groups[key].append(r)
+    
+    # Generate hybrids ONLY for combinations with at least 2 successful optimizations
+    # Each hybrid is specific to one symbol-interval pair
+    for (combo_symbol, combo_interval), combo_results in combo_groups.items():
+        if len(combo_results) < 2:
+            logger.info(f"Skipping hybrid for {combo_symbol}@{combo_interval}: only {len(combo_results)} indicator(s)")
+            continue
+        
+        print(f"\n{'='*70}")
+        print(f"  CREATING HYBRID FOR: {combo_symbol} @ {combo_interval}")
+        print(f"  (Combining {len(combo_results)} indicators optimized on same symbol/timeframe)")
+        print("="*70)
+        
+        # Calculate hybrid timeout (average of per-combo timeouts)
+        hybrid_timeout = max(120, per_combo_seconds if per_combo_seconds else 120)
+        
+        # Build options for this combo
+        combo_options = {
+            "interval": combo_interval,
+            "symbols": combo_symbol,
+        }
+        
+        hybrid_ranking, hybrid_result, hybrid_file = generate_and_optimize_hybrid(
+            combo_results,
+            dm,
+            combo_options,
+            hybrid_timeout=hybrid_timeout,
+            symbol=combo_symbol,  # MUST match the source indicators' symbol
+            interval=combo_interval,  # MUST match the source indicators' interval
+            voting_method="majority",
+            n_top=min(5, len(combo_results)),
+            min_score=0.0,
+        )
+        
+        if hybrid_result:
+            # Add combo context to hybrid result
+            hybrid_result["symbol"] = combo_symbol
+            hybrid_result["interval"] = combo_interval
+            results.append(hybrid_result)
+            hybrid_results.append(hybrid_result)
+            hybrid_count += 1
+            print(f"[OK] Hybrid indicator for {combo_symbol}@{combo_interval} added to results")
+    
+    # NOTE: We intentionally do NOT create an "overall hybrid" that combines
+    # indicators from different symbols/timeframes. Hybrids must only combine
+    # indicators optimized on the same data for valid comparison.
+    
+    if hybrid_count > 0:
+        print(f"\n[INFO] Generated {hybrid_count} hybrid indicator(s) (one per symbol/timeframe combination)")
+    elif combo_groups:
+        print(f"\n[INFO] No hybrids generated (each symbol/timeframe combo needs at least 2 optimized indicators)")
+    
     run_info = {
         "indicator_directory": str(indicator_dir),
         "intervals": intervals,
@@ -864,6 +1262,7 @@ def run_matrix_optimization(dm: DataManager):
         "selected_indicators": len(selected_indicators),
         "skipped_no_improvement": skipped_no_improvement,
         "errors": errors,
+        "hybrid_indicators_generated": hybrid_count,
     }
 
     summary_dir = Path("optimized_outputs") / "summary"

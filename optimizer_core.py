@@ -520,6 +520,7 @@ class PineOptimizer:
             total_objective = 0.0
             symbol_count = 0
             metrics_list = []
+            has_rejection = False
             
             # Use ThreadPoolExecutor for parallel evaluation
             max_workers = min(len(symbol_keys), self.n_jobs * 2)  # Allow more workers for symbol evaluation
@@ -534,21 +535,34 @@ class PineOptimizer:
                 for future in as_completed(future_to_key):
                     key, metrics, obj = future.result()
                     if metrics is not None and obj is not None:
-                        total_objective += obj
-                        symbol_count += 1
-                        metrics_list.append(metrics)
+                        # Check for hard cutoff rejection (-inf)
+                        if not math.isfinite(obj):
+                            has_rejection = True
+                        else:
+                            total_objective += obj
+                            symbol_count += 1
+                            metrics_list.append(metrics)
         else:
             # Sequential evaluation for single symbol (no overhead)
             total_objective = 0.0
             symbol_count = 0
             metrics_list = []
+            has_rejection = False
             
             for key in symbol_keys:
                 key_result, metrics, obj = self._evaluate_symbol(key, params)
                 if metrics is not None and obj is not None:
-                    total_objective += obj
-                    symbol_count += 1
-                    metrics_list.append(metrics)
+                    # Check for hard cutoff rejection (-inf)
+                    if not math.isfinite(obj):
+                        has_rejection = True
+                    else:
+                        total_objective += obj
+                        symbol_count += 1
+                        metrics_list.append(metrics)
+        
+        # If any symbol was rejected by hard cutoffs, reject the entire trial
+        if has_rejection:
+            return float('-inf')
         
         # Early pruning check - report once at the end
         if symbol_count > 0 and self.trial_count > self.pruning_warmup_trials:
@@ -558,7 +572,7 @@ class PineOptimizer:
                 raise optuna.TrialPruned()
         
         if symbol_count == 0:
-            return 0.0
+            return float('-inf')
         
         avg_objective = total_objective / symbol_count
         now = time.time()
@@ -1145,20 +1159,29 @@ class PineOptimizer:
         )
 
     def _calculate_avg_objective(self, symbol_metrics: Dict[str, Any]) -> float:
-        """Calculate average objective across all symbols/timeframes."""
+        """Calculate average objective across all symbols/timeframes.
+        
+        If any symbol returns -inf (hard cutoff rejection), returns -inf.
+        """
         objectives = []
         if self.is_multi_timeframe:
             for tf_dict in symbol_metrics.values():
                 for m in tf_dict.values():
                     if m:
-                        objectives.append(calculate_objective_score(m))
+                        obj = calculate_objective_score(m)
+                        if not math.isfinite(obj):
+                            return float('-inf')  # Hard cutoff rejection
+                        objectives.append(obj)
         else:
             for m in symbol_metrics.values():
                 if m:
-                    objectives.append(calculate_objective_score(m))
+                    obj = calculate_objective_score(m)
+                    if not math.isfinite(obj):
+                        return float('-inf')  # Hard cutoff rejection
+                    objectives.append(obj)
         
         if not objectives:
-            return 0.0
+            return float('-inf')
         return sum(objectives) / len(objectives)
     
     def _calculate_overall_objective(self, metrics: BacktestMetrics) -> float:

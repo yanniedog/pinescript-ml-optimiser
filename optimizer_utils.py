@@ -11,9 +11,9 @@ from backtester import BacktestMetrics
 logger = logging.getLogger(__name__)
 
 _METRIC_DEFS = {
-    "objective_best": {"label": "Objective (avg)"},
-    "objective_delta": {"label": "Objective Delta"},
-    "objective_overall": {"label": "Objective (overall)"},
+    "objective_best": {"label": "MCC (avg across symbols)"},
+    "objective_delta": {"label": "MCC Delta vs Original"},
+    "objective_overall": {"label": "MCC (aggregated)"},
     "profit_factor": {"label": "Profit Factor"},
     "win_rate": {"label": "Win Rate"},
     "directional_accuracy": {"label": "Directional Accuracy"},

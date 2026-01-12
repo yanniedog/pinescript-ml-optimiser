@@ -143,7 +143,9 @@ class WalkForwardBacktester:
         train_ratio: float = 0.6,
         min_trades_per_fold: int = 10,
         forecast_horizons: Optional[List[int]] = None,
-        min_classification_samples: int = 50
+        min_classification_samples: Optional[int] = None,
+        min_samples_proportion: float = 0.005,
+        min_samples_floor: int = 100
     ):
         """
         Initialize backtester.
@@ -154,19 +156,34 @@ class WalkForwardBacktester:
             embargo_bars: Bars to exclude between train/test (prevents leakage)
             train_ratio: Ratio of data for training in each fold
             min_trades_per_fold: Minimum trades required for valid fold
+            min_classification_samples: Fixed minimum samples (overrides proportion-based calculation)
+            min_samples_proportion: Proportion of total bars for dynamic threshold (default 0.5%)
+            min_samples_floor: Absolute minimum samples regardless of proportion (default 100)
         """
         self.df = df
         self.n_folds = n_folds
         self.embargo_bars = embargo_bars
         self.train_ratio = train_ratio
         self.min_trades_per_fold = min_trades_per_fold
-        self.min_classification_samples = min_classification_samples
         self.forecast_horizons = forecast_horizons or self.FORECAST_HORIZONS
         
         self.close = df['close'].values
         self.high = df['high'].values
         self.low = df['low'].values
         self.length = len(df)
+        
+        # Calculate dynamic min_classification_samples based on dataset size
+        if min_classification_samples is not None:
+            # Use fixed value if explicitly provided
+            self.min_classification_samples = min_classification_samples
+        else:
+            # Dynamic: max(floor, proportion * total_bars)
+            proportional_min = int(self.length * min_samples_proportion)
+            self.min_classification_samples = max(min_samples_floor, proportional_min)
+            logger.debug(
+                f"Dynamic min_classification_samples: {self.min_classification_samples} "
+                f"(floor={min_samples_floor}, {min_samples_proportion:.1%} of {self.length} bars)"
+            )
 
         # Create folds before filtering horizons so we can size horizons to training windows
         self.folds = self._create_folds()
