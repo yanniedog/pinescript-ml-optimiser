@@ -286,8 +286,6 @@ class WalkForwardBacktester:
                 use_discrete_signals,
                 fold=fold  # Pass fold to restrict to training data only
             )
-            fold_horizons.append(fold_best_horizon)
-            fold_thresholds.append(fold_threshold)
             
             # Evaluate test data using the horizon selected from training data
             metrics = self._evaluate_fold(
@@ -301,6 +299,8 @@ class WalkForwardBacktester:
             if (metrics.classification_samples >= self.min_classification_samples and 
                 metrics.total_trades >= self.min_trades_per_fold):
                 fold_metrics.append(metrics)
+                fold_horizons.append(fold_best_horizon)
+                fold_thresholds.append(fold_threshold)
                 all_trades.extend(metrics.trades)
         
         if not fold_metrics:
