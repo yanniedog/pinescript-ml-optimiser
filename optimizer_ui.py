@@ -27,7 +27,8 @@ from optimizer_utils import (
     _metric_label, 
     _compute_rate_series, 
     _METRIC_KEYS,
-    _format_param_value
+    _format_param_value,
+    _format_params
 )
 
 logger = logging.getLogger(__name__)
@@ -599,166 +600,621 @@ class RealtimeBestPlotter:
         )
 
 
-class PlotlyRealtimePlotter(RealtimeBestPlotter):
-    """
-    Realtime plotter using Plotly (browser-based).
-    Starts a local server and updates a dashboard.
-    Optimized for Windows Surface with proper threading.
-    """
+class PlotlyRealtimePlotter:
+    """Realtime plot using Plotly Dash with filter controls."""
+
     def __init__(self):
-        super().__init__()
-        self._server_thread = None
-        self._port = 8050
+        self._init_attempted = False
+        self._enabled = False
         self._app = None
-        self._data_lock = threading.RLock()  # Use RLock for Windows compatibility
-        self._pending_updates = []
-        self._host = "127.0.0.1"
-        self._url = f"http://{self._host}:{self._port}"
-        self._shutdown_event = threading.Event()
-        self._max_data_points = 500  # Limit data for memory efficiency
+        self._port = None
+        self._thread = None
+        self._start_times = {}
+        self._series = {}
+        self._baseline_values = {}
+        self._line_meta = {}
+        self._max_points = 300
+        self._lock = threading.Lock()
+        self._opened = False
+        self._last_options = {"indicator": [], "symbol": [], "timeframe": []}
+        self._default_y_metric = "objective_delta"
+        self._default_x_mode = "elapsed"
+        self._default_band_metric = "objective_overall"
+
+    def _parse_label(self, label: str):
+        indicator = label
+        symbol = ""
+        timeframe = ""
+        if ":" in label:
+            indicator, remainder = label.split(":", 1)
+            if "@" in remainder:
+                symbol, timeframe = remainder.split("@", 1)
+            else:
+                symbol = remainder
+        return indicator.strip(), symbol.strip(), timeframe.strip()
+
+    def _register_line(self, label: str) -> None:
+        indicator, symbol, timeframe = self._parse_label(label)
+        self._line_meta[label] = {
+            "indicator": indicator,
+            "symbol": symbol.upper(),
+            "timeframe": timeframe.lower()
+        }
+
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def _wait_for_server(self, url: str, timeout_s: float = 5.0) -> bool:
+        import urllib.request
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=1) as resp:
+                    if resp.status == 200:
+                        return True
+            except Exception:
+                time.sleep(0.2)
+        return False
 
     def _ensure_ready(self) -> bool:
         if self._init_attempted:
             return self._enabled
         self._init_attempted = True
-        
         try:
-            import dash
-            from dash import dcc, html
-            from dash.dependencies import Input, Output
-            import plotly.graph_objs as go
-        except ImportError as exc:
-            logger.info("Plotly plotter disabled (dash/plotly not installed): %s", exc)
-            self._enabled = False
-            return False
-
-        try:
-            # Find free port
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind((self._host, 0))
-            self._port = sock.getsockname()[1]
-            sock.close()
-            self._url = f"http://{self._host}:{self._port}"
-
-            self._app = dash.Dash(__name__, update_title=None)
-            self._app.layout = html.Div([
-                html.H3("Pine Script Optimization Progress"),
-                html.Div([
-                    html.Label("Metric:"),
-                    dcc.Dropdown(
-                        id='metric-select',
-                        options=[{'label': _metric_label(k), 'value': k} for k in _METRIC_KEYS],
-                        value='objective_delta',
-                        clearable=False
-                    ),
-                ], style={'width': '300px', 'display': 'inline-block'}),
-                dcc.Graph(id='live-graph', animate=False),
-                dcc.Interval(
-                    id='graph-update',
-                    interval=2000, # 2s update
-                    n_intervals=0
-                )
-            ])
-
-            @self._app.callback(
-                Output('live-graph', 'figure'),
-                [Input('graph-update', 'n_intervals'),
-                 Input('metric-select', 'value')]
-            )
-            def update_graph_scatter(n, metric_key):
-                with self._data_lock:
-                    traces = []
-                    for label, series in self._series.items():
-                        if "[trials]" in label: 
-                            continue # Skip high-freq trial data for now
-                        
-                        y_data = series.get("metrics", {}).get(metric_key, [])
-                        if not y_data:
-                            continue
-                            
-                        x_data = series.get("x", [])
-                        
-                        traces.append(go.Scatter(
-                            x=list(x_data),
-                            y=list(y_data),
-                            name=label,
-                            mode='lines+markers',
-                            hovertext=[str(p) for p in series.get("params", [])]
-                        ))
-                    
-                    layout = go.Layout(
-                        xaxis={'title': 'Elapsed Time (s)'},
-                        yaxis={'title': _metric_label(metric_key)},
-                        margin={'l': 40, 'b': 40, 't': 10, 'r': 0},
-                        hovermode='closest',
-                        showlegend=True
-                    )
-                    return {'data': traces, 'layout': layout}
-
-            # Run server in thread
-            logger.info(f"Starting Plotly dashboard at {self._url}")
-            self._server_thread = threading.Thread(target=self._run_server, daemon=True)
-            self._server_thread.start()
-            
-            # Open browser
-            webbrowser.open(self._url)
-            
-            self._enabled = True
-            return True
-            
+            from dash import Dash, dcc, html, Input, Output, State, ctx
+            from dash.dependencies import ALL
+            import plotly.graph_objects as go
         except Exception as exc:
-            logger.info("Plotly plotter disabled (init error): %s", exc)
+            logger.info("Plotly realtime plot disabled (dash/plotly not available): %s", exc)
             self._enabled = False
             return False
+
+        self._port = self._find_free_port()
+        self._app = Dash(__name__)
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        logging.getLogger("dash").setLevel(logging.ERROR)
+        self._app.logger.setLevel(logging.ERROR)
+        metric_options = [{"label": _metric_label(key), "value": key} for key in _METRIC_KEYS]
+
+        self._app.layout = html.Div(
+            style={
+                "fontFamily": "Helvetica, Arial, sans-serif",
+                "padding": "12px",
+                "backgroundColor": "#f7f7f7"
+            },
+            children=[
+                html.Div(
+                    style={"marginBottom": "8px"},
+                    children=[
+                        html.H3("Optimization Metric Explorer", style={"margin": "0 0 6px 0"}),
+                        html.Div(
+                            "Filter by indicator, symbol, timeframe, and metric bands.",
+                            style={"fontSize": "12px", "color": "#555"}
+                        ),
+                    ],
+                ),
+                html.Div(
+                    style={"display": "grid", "gap": "8px", "marginBottom": "8px", "gridTemplateColumns": "2fr 2fr 2fr auto"},
+                    children=[
+                        dcc.Dropdown(
+                            id="indicator-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Indicators"
+                        ),
+                        dcc.Dropdown(
+                            id="symbol-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Symbols"
+                        ),
+                        dcc.Dropdown(
+                            id="timeframe-filter",
+                            options=[],
+                            multi=True,
+                            placeholder="Timeframes"
+                        ),
+                        html.Button("Clear Filters", id="clear-filters", n_clicks=0),
+                    ],
+                ),
+                html.Div(
+                    style={"display": "grid", "gap": "8px", "marginBottom": "8px", "gridTemplateColumns": "2fr 1fr 2fr 1fr 1fr"},
+                    children=[
+                        dcc.Dropdown(
+                            id="y-metric",
+                            options=metric_options,
+                            value=self._default_y_metric,
+                            clearable=False
+                        ),
+                         dcc.Dropdown(
+                             id="x-axis",
+                             options=[
+                                 {"label": "Elapsed (s)", "value": "elapsed"},
+                                 {"label": "Improvement rate (/s)", "value": "rate"},
+                                 {"label": "Trial #", "value": "trial"},
+                                 {"label": "Trials/sec (running rate)", "value": "trials_per_second"},
+                             ],
+                             value=self._default_x_mode,
+                             clearable=False
+                         ),
+                        dcc.Dropdown(
+                            id="band-metric",
+                            options=metric_options,
+                            value=self._default_band_metric,
+                            clearable=True,
+                            placeholder="Band metric"
+                        ),
+                        dcc.Input(
+                            id="band-min",
+                            type="number",
+                            placeholder="Band min",
+                            debounce=True
+                        ),
+                        dcc.Input(
+                            id="band-max",
+                            type="number",
+                            placeholder="Band max",
+                            debounce=True
+                        ),
+                    ],
+                ),
+                dcc.Graph(
+                    id="objective-graph",
+                    config={"displayModeBar": True, "responsive": True},
+                    style={"height": "72vh"}
+                ),
+                dcc.Store(id="hidden-series", data=[]),
+                html.Div(
+                    id="legend-box",
+                    style={
+                        "marginTop": "8px",
+                        "padding": "6px 8px",
+                        "backgroundColor": "#ffffff",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "fontSize": "12px",
+                        "maxHeight": "140px",
+                        "overflowY": "auto"
+                    },
+                    children="Legend: no series yet."
+                ),
+                html.Div(
+                    id="click-details",
+                    style={
+                        "marginTop": "8px",
+                        "padding": "8px 10px",
+                        "backgroundColor": "#ffffff",
+                        "border": "1px solid #e0e0e0",
+                        "borderRadius": "6px",
+                        "fontSize": "12px"
+                    },
+                    children="Click a line to reveal the exact combo and values."
+                ),
+                dcc.Interval(id="update-interval", interval=1000, n_intervals=0),
+            ],
+        )
+
+        def build_options():
+            with self._lock:
+                indicators = sorted({m["indicator"] for m in self._line_meta.values() if m["indicator"]})
+                symbols = sorted({m["symbol"] for m in self._line_meta.values() if m["symbol"]})
+                timeframes = sorted({m["timeframe"] for m in self._line_meta.values() if m["timeframe"]})
+            self._last_options = {
+                "indicator": indicators,
+                "symbol": symbols,
+                "timeframe": timeframes
+            }
+            return (
+                [{"label": v, "value": v} for v in indicators],
+                [{"label": v, "value": v} for v in symbols],
+                [{"label": v, "value": v} for v in timeframes],
+            )
+
+        def _last_non_none(lst):
+            """Return the last non-None value in a list, or None if all None."""
+            for val in reversed(lst):
+                if val is not None:
+                    return val
+            return None
+
+        def build_figure(indicators, symbols, timeframes, y_metric, x_mode, band_metric, band_min, band_max, hidden):
+            from optimizer_utils import _METRIC_DEFS
+            with self._lock:
+                series = {
+                    k: {
+                        "x": list(v.get("x", [])),
+                        "metrics": {mk: list(mv) for mk, mv in v.get("metrics", {}).items()},
+                        "params": list(v.get("params", [])),
+                        "trials": list(v.get("trials", [])),
+                    }
+                    for k, v in self._series.items()
+                }
+                meta = dict(self._line_meta)
+                baselines = {k: dict(v) for k, v in self._baseline_values.items()}
+
+            indicators = set(indicators or [])
+            symbols = set(symbols or [])
+            timeframes = set(timeframes or [])
+            if y_metric not in _METRIC_DEFS:
+                y_metric = self._default_y_metric
+            if x_mode not in ("elapsed", "rate", "trial", "trials_per_second"):
+                x_mode = self._default_x_mode
+            if band_metric not in _METRIC_DEFS:
+                band_metric = None
+            band_enabled = band_metric is not None and (band_min is not None or band_max is not None)
+
+            fig = go.Figure()
+            hidden_set = set(hidden or [])
+            visible_labels = []
+            for label, points in series.items():
+                meta_info = meta.get(label, {})
+                if indicators and meta_info.get("indicator") not in indicators:
+                    continue
+                if symbols and meta_info.get("symbol") not in symbols:
+                    continue
+                if timeframes and meta_info.get("timeframe") not in timeframes:
+                    continue
+
+                x_elapsed = points.get("x", [])
+                trial_vals = points.get("trials", [])
+                y_vals = points.get("metrics", {}).get(y_metric, [])
+                params_vals = points.get("params", [])
+                if x_mode == "trial":
+                    if not trial_vals:
+                        continue
+                    x_vals = trial_vals
+                elif x_mode == "trials_per_second":
+                    x_vals = points.get("metrics", {}).get("trials_per_second", [])
+                    if not x_vals:
+                        continue
+                else:
+                    x_vals = x_elapsed
+                if not x_vals:
+                    continue
+                if not y_vals:
+                    continue
+                if len(params_vals) < len(x_vals):
+                    params_vals = params_vals + ["N/A"] * (len(x_vals) - len(params_vals))
+                elif len(params_vals) > len(x_vals):
+                    params_vals = params_vals[-len(x_vals):]
+
+                if band_enabled:
+                    band_vals = points.get("metrics", {}).get(band_metric, [])
+                    latest_band = _last_non_none(band_vals)
+                    if latest_band is None:
+                        continue
+                    if band_min is not None and latest_band < band_min:
+                        continue
+                    if band_max is not None and latest_band > band_max:
+                        continue
+
+                visible_labels.append(label)
+
+                if x_mode == "rate":
+                    baseline_val = baselines.get(label, {}).get(y_metric)
+                    x_vals = _compute_rate_series(x_vals, y_vals, baseline_val)
+
+                if x_mode == "rate":
+                    x_label = "rate_per_s"
+                elif x_mode == "trial":
+                    x_label = "trial"
+                elif x_mode == "trials_per_second":
+                    x_label = "trials_per_second"
+                else:
+                    x_label = "elapsed_s"
+                fig.add_trace(
+                    go.Scatter(
+                        x=x_vals,
+                        y=y_vals,
+                        mode="lines+markers",
+                        name=label,
+                        uid=label,
+                        customdata=[label] * len(x_vals),
+                        text=params_vals,
+                        line={"width": 2.5},
+                        marker={"size": 6, "opacity": 0.15},
+                        visible="legendonly" if label in hidden_set else True,
+                        hovertemplate=(
+                            "combo=%{customdata}<br>"
+                            "params=%{text}<br>"
+                            f"{_metric_label(y_metric)}=%{{y:.4f}}<br>"
+                            f"{x_label}=%{{x:.4f}}<extra></extra>"
+                        )
+                    )
+                )
+
+            if x_mode == "rate":
+                x_title = f"Improvement rate ({_metric_label(y_metric)} / s)"
+            elif x_mode == "trial":
+                x_title = "Trial #"
+            elif x_mode == "trials_per_second":
+                x_title = "Trials/sec"
+            else:
+                x_title = "Elapsed (s)"
+            fig.update_layout(
+                template="plotly_white",
+                margin={"l": 40, "r": 10, "t": 30, "b": 40},
+                showlegend=False,
+                hovermode="closest",
+                hoverdistance=50,
+                spikedistance=50,
+                uirevision="keep"
+            )
+            fig.update_xaxes(title=x_title)
+            fig.update_yaxes(title=_metric_label(y_metric))
+            return fig, visible_labels
+
+        @self._app.callback(
+            Output("objective-graph", "figure"),
+            Output("indicator-filter", "options"),
+            Output("symbol-filter", "options"),
+            Output("timeframe-filter", "options"),
+            Output("indicator-filter", "value"),
+            Output("symbol-filter", "value"),
+            Output("timeframe-filter", "value"),
+            Output("band-min", "value"),
+            Output("band-max", "value"),
+            Output("legend-box", "children"),
+            Input("update-interval", "n_intervals"),
+            Input("indicator-filter", "value"),
+            Input("symbol-filter", "value"),
+            Input("timeframe-filter", "value"),
+            Input("clear-filters", "n_clicks"),
+            Input("y-metric", "value"),
+            Input("x-axis", "value"),
+            Input("band-metric", "value"),
+            Input("band-min", "value"),
+            Input("band-max", "value"),
+            Input("hidden-series", "data"),
+        )
+        def update_plot(
+            _,
+            indicator_vals,
+            symbol_vals,
+            timeframe_vals,
+            clear_clicks,
+            y_metric,
+            x_mode,
+            band_metric,
+            band_min,
+            band_max,
+            hidden_series
+        ):
+            if ctx.triggered_id == "clear-filters":
+                indicator_vals = []
+                symbol_vals = []
+                timeframe_vals = []
+                band_min = None
+                band_max = None
+
+            indicator_opts, symbol_opts, timeframe_opts = build_options()
+
+            indicator_vals = [v for v in (indicator_vals or []) if v in self._last_options["indicator"]]
+            symbol_vals = [v for v in (symbol_vals or []) if v in self._last_options["symbol"]]
+            timeframe_vals = [v for v in (timeframe_vals or []) if v in self._last_options["timeframe"]]
+
+            fig, visible_labels = build_figure(
+                indicator_vals,
+                symbol_vals,
+                timeframe_vals,
+                y_metric,
+                x_mode,
+                band_metric,
+                band_min,
+                band_max,
+                hidden_series
+            )
+            if visible_labels:
+                hidden_set = set(hidden_series or [])
+                legend_children = []
+                for label in visible_labels:
+                    is_hidden = label in hidden_set
+                    legend_children.append(
+                        html.Button(
+                            label,
+                            id={"type": "legend-item", "label": label},
+                            n_clicks=0,
+                            **{"data-label": label},
+                            style={
+                                "display": "block",
+                                "width": "100%",
+                                "textAlign": "left",
+                                "border": "none",
+                                "background": "none",
+                                "padding": "2px 0",
+                                "cursor": "pointer",
+                                "color": "#999" if is_hidden else "#222"
+                            }
+                        )
+                    )
+            else:
+                legend_children = "Legend: no series match the filters."
+            return (
+                fig,
+                indicator_opts,
+                symbol_opts,
+                timeframe_opts,
+                indicator_vals,
+                symbol_vals,
+                timeframe_vals,
+                band_min,
+                band_max,
+                legend_children,
+            )
+
+        @self._app.callback(
+            Output("hidden-series", "data"),
+            Input({"type": "legend-item", "label": ALL}, "n_clicks"),
+            State("hidden-series", "data"),
+        )
+        def toggle_hidden_series(_, hidden_series):
+            if not ctx.triggered_id or not isinstance(ctx.triggered_id, dict):
+                return hidden_series or []
+            triggered = ctx.triggered[0] if ctx.triggered else None
+            clicks = triggered.get("value") if triggered else None
+            if not clicks:
+                return hidden_series or []
+            label = ctx.triggered_id.get("label")
+            if not label:
+                return hidden_series or []
+            hidden = list(hidden_series or [])
+            if label in hidden:
+                hidden.remove(label)
+            else:
+                hidden.append(label)
+            return hidden
+
+        @self._app.callback(
+            Output("click-details", "children"),
+            Input("objective-graph", "clickData"),
+            Input("objective-graph", "hoverData"),
+        )
+        def show_click_details(click_data, hover_data):
+            prop_id = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+            if prop_id.endswith("clickData") and click_data:
+                source = click_data
+            elif prop_id.endswith("hoverData") and hover_data:
+                source = hover_data
+            else:
+                return "Click a line to reveal the exact combo and values."
+            try:
+                point = source["points"][0]
+                combo = point.get("customdata", "unknown")
+                params = point.get("text", "")
+                y_val = point.get("y", "")
+                x_val = point.get("x", "")
+                return f"Combo: {combo} | Params: {params} | Y: {y_val:.4f} | X: {x_val:.4f}"
+            except Exception:
+                return "Click a line to reveal the exact combo and values."
+
+        # Start server thread
+        self._thread = threading.Thread(target=self._run_server, daemon=True)
+        self._thread.start()
+
+        # Wait for server to start, then open browser
+        url = f"http://127.0.0.1:{self._port}"
+        if self._wait_for_server(url):
+            if not self._opened:
+                webbrowser.open(url)
+                self._opened = True
+            logger.info(f"Plotly dashboard running at {url}")
+            self._enabled = True
+        else:
+            logger.warning("Plotly server failed to start in time.")
+            self._enabled = False
+
+        return self._enabled
 
     def _run_server(self):
-        # Suppress Flask banner and configure for Windows
-        import logging
-        log = logging.getLogger('werkzeug')
-        log.setLevel(logging.ERROR)
-        
         try:
-            # Use threaded=True for better Windows compatibility
-            self._app.run_server(
-                debug=False, 
-                port=self._port, 
-                host=self._host, 
+            self._app.run(
+                debug=False,
+                port=self._port,
+                host="127.0.0.1",
                 use_reloader=False,
-                threaded=True  # Better for Windows
+                threaded=True
             )
         except Exception as e:
-            if not self._shutdown_event.is_set():
-                logger.error(f"Plotly server error: {e}")
-    
+            logger.error(f"Plotly server error: {e}")
+
+    def start_indicator(self, indicator_name: str) -> None:
+        """Register start time for an indicator."""
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            if indicator_name not in self._start_times:
+                self._start_times[indicator_name] = time.time()
+
+    def set_baseline(self, indicator_name: str, baseline_objective: float) -> None:
+        """Set baseline objective for an indicator."""
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            self._baseline_values.setdefault(indicator_name, {})["objective_best"] = baseline_objective
+
+    def set_baseline_metrics(self, indicator_name: str, metrics: Dict[str, float]) -> None:
+        """Set all baseline metrics."""
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            self._baseline_values[indicator_name] = metrics.copy()
+
+    def update(
+        self,
+        indicator_name: str,
+        best_objective: float,
+        metrics: Dict[str, float],
+        params: Dict[str, Any],
+        trial_number: int = 0
+    ) -> None:
+        """Update plot with new best objective."""
+        if not self._ensure_ready():
+            return
+
+        with self._lock:
+            current_time = time.time()
+            elapsed = current_time - self._start_times.get(indicator_name, current_time)
+
+            self._register_line(indicator_name)
+
+            # Update series data
+            if indicator_name not in self._series:
+                self._series[indicator_name] = {"x": [], "metrics": {}, "params": [], "trials": []}
+
+            series = self._series[indicator_name]
+            series["x"].append(elapsed)
+            series.setdefault("trials", []).append(trial_number)
+            series.setdefault("params", []).append(_format_params(params))
+
+            for key in _METRIC_KEYS:
+                val = metrics.get(key)
+                series.setdefault("metrics", {}).setdefault(key, []).append(val)
+
+            # Limit points to avoid slowdown
+            if len(series["x"]) > self._max_points:
+                series["x"] = series["x"][-self._max_points:]
+                series["trials"] = series["trials"][-self._max_points:]
+                series["params"] = series["params"][-self._max_points:]
+                for key in _METRIC_KEYS:
+                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
+
+    def record_trial_progress(
+        self,
+        combo_label: str,
+        trial_number: int,
+        elapsed_seconds: float,
+        metrics: Dict[str, float]
+    ) -> None:
+        """Track trial progress as a separate '[trials]' series."""
+        if not self._ensure_ready():
+            return
+
+        with self._lock:
+            progress_label = f"{combo_label} [trials]"
+            self._register_line(progress_label)
+
+            series = self._series.setdefault(
+                progress_label,
+                {"x": [], "metrics": {}, "params": [], "trials": []}
+            )
+            series["x"].append(elapsed_seconds)
+            series.setdefault("trials", []).append(trial_number)
+            series.setdefault("params", []).append(f"trial={trial_number}")
+            for key in _METRIC_KEYS:
+                series.setdefault("metrics", {}).setdefault(key, []).append(metrics.get(key))
+
+            if len(series["x"]) > self._max_points:
+                series["x"] = series["x"][-self._max_points:]
+                series["trials"] = series["trials"][-self._max_points:]
+                series["params"] = series["params"][-self._max_points:]
+                for key in _METRIC_KEYS:
+                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
+
     def shutdown(self):
         """Gracefully shutdown the plotter."""
-        self._shutdown_event.set()
         self._enabled = False
-
-    # Override update methods to use lock with data limiting
-    def update(self, indicator_name, best_objective, metrics, params, trial_number=0):
-        with self._data_lock:
-            super().update(indicator_name, best_objective, metrics, params, trial_number)
-            # Limit data points per series for memory efficiency
-            self._trim_series_data()
-
-    def record_trial_progress(self, combo_label, trial_number, elapsed_seconds, metrics):
-        with self._data_lock:
-            super().record_trial_progress(combo_label, trial_number, elapsed_seconds, metrics)
-            self._trim_series_data()
-    
-    def _trim_series_data(self):
-        """Trim series data to prevent memory bloat on long runs."""
-        for label, series in self._series.items():
-            if len(series.get("x", [])) > self._max_data_points:
-                # Keep only the most recent data points
-                series["x"] = series["x"][-self._max_data_points:]
-                if "trials" in series:
-                    series["trials"] = series["trials"][-self._max_data_points:]
-                if "params" in series:
-                    series["params"] = series["params"][-self._max_data_points:]
-                for key in series.get("metrics", {}):
-                    series["metrics"][key] = series["metrics"][key][-self._max_data_points:]
 
 
 _REALTIME_PLOTTER = None
