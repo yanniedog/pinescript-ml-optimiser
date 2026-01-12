@@ -2347,17 +2347,22 @@ class PineOptimizer:
         elapsed_since_start = max(now - self.start_time if self.start_time else 0.0, 0.0)
         elapsed_for_rate = max(elapsed_since_start, 1e-6)
         trials_per_second = self.trial_count / elapsed_for_rate if elapsed_for_rate else 0.0
-        trial_metrics = {
-            "total_trials": self.trial_count,
-            "trials_per_second": trials_per_second,
-            "objective_best": avg_objective,  # Include objective score for each trial
-        }
+        
+        # Compute full aggregated metrics for every trial (not just improvements)
+        aggregated_metrics = self._aggregate_metrics(metrics_list)
+        metrics_map = _metrics_from_backtest(aggregated_metrics)
+        metrics_map["objective_best"] = avg_objective
+        metrics_map["objective_overall"] = calculate_objective_score(aggregated_metrics)
+        metrics_map["total_trials"] = self.trial_count
+        metrics_map["trials_per_second"] = trials_per_second
+        
+        # Use complete metrics_map for trial progress tracking
         if self.realtime_plotter:
             self.realtime_plotter.record_trial_progress(
                 self.indicator_name,
                 self.trial_count,
                 elapsed_since_start,
-                trial_metrics
+                metrics_map
             )
 
         # Track best and report improvement rate vs original config
@@ -2369,18 +2374,14 @@ class PineOptimizer:
             rate_pct = improvement_info['improvement_rate_pct']
             baseline = improvement_info['baseline_objective']
 
-            aggregated_metrics = self._aggregate_metrics(metrics_list)
-            metrics_map = _metrics_from_backtest(aggregated_metrics)
-            metrics_map["objective_best"] = avg_objective
-            metrics_map["objective_overall"] = calculate_objective_score(aggregated_metrics)
+            # Reuse already-computed metrics_map (no need to recompute)
 
             if self.realtime_plotter:
                 params_for_plot = {
                     p.name: params.get(p.name)
                     for p in self.optimizable_params
                 }
-                metrics_map["total_trials"] = self.trial_count
-                metrics_map["trials_per_second"] = trials_per_second
+                # metrics_map already has total_trials and trials_per_second from earlier computation
                 self.realtime_plotter.update(
                     self.indicator_name,
                     avg_objective,
