@@ -479,26 +479,27 @@ class RealtimeBestPlotter:
             for key in _METRIC_KEYS:
                 series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
-        # Update Plot Line
-        x_vals, y_vals = self._get_series_xy(indicator_name)
-        
-        if indicator_name not in self._lines:
-            color = self._get_indicator_color(indicator_name.split(":")[0])
-            line, = self._ax.plot(
-                x_vals, 
-                y_vals, 
-                label=indicator_name,
-                color=color,
-                marker='o',
-                markersize=4,
-                picker=5  # Enable picking
-            )
-            self._lines[indicator_name] = line
-        else:
-            self._lines[indicator_name].set_data(x_vals, y_vals)
+        # Update Plot Line (only if matplotlib _ax is available)
+        if self._ax is not None:
+            x_vals, y_vals = self._get_series_xy(indicator_name)
             
-        self._best_objectives[indicator_name] = best_objective
-        self._redraw()
+            if indicator_name not in self._lines:
+                color = self._get_indicator_color(indicator_name.split(":")[0])
+                line, = self._ax.plot(
+                    x_vals, 
+                    y_vals, 
+                    label=indicator_name,
+                    color=color,
+                    marker='o',
+                    markersize=4,
+                    picker=5  # Enable picking
+                )
+                self._lines[indicator_name] = line
+            else:
+                self._lines[indicator_name].set_data(x_vals, y_vals)
+                
+            self._best_objectives[indicator_name] = best_objective
+            self._redraw()
 
     def record_trial_progress(
         self,

@@ -1395,28 +1395,28 @@ class OutputGenerator:
         var chartData = """ + chart_json + """;
         var layout = """ + layout_json + """;
         
-        if (chartData.length > 0) {{
-            Plotly.newPlot('objective-graph', chartData, layout, {{responsive: true}});
+        if (chartData.length > 0) {
+            Plotly.newPlot('objective-graph', chartData, layout, {responsive: true});
             
             // Create legend buttons
             var legendBox = document.getElementById('legend-box');
-            chartData.forEach(function(trace, index) {{
+            chartData.forEach(function(trace, index) {
                 var button = document.createElement('button');
                 button.className = 'legend-button';
                 button.setAttribute('data-label', trace.name || 'Trace ' + index);
                 button.textContent = trace.name || 'Trace ' + index;
-                button.onclick = function() {{
+                button.onclick = function() {
                     var visibility = chartData[index].visible === false ? true : false;
-                    var update = {{visible: visibility}};
+                    var update = {visible: visibility};
                     Plotly.restyle('objective-graph', update, index);
                     this.classList.toggle('hidden');
-                }};
+                };
                 legendBox.appendChild(button);
-            }});
-        }} else {{
+            });
+        } else {
             document.getElementById('objective-graph').innerHTML = 
                 '<p style="text-align: center; color: #999; padding: 50px;">No optimization history data available.</p>';
-        }}
+        }
     </script>
     <script src=\"""" + js_path + """\"></script>
 </body>
