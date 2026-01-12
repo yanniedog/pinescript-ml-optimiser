@@ -609,9 +609,9 @@ def run_matrix_optimization(dm: DataManager):
     print("  [1] Total minutes split across all combinations")
     print("  [2] Minutes per combination (each combination gets full time)")
     while True:
-        budget_input = input("  Choose option [1]: ").strip()
+        budget_input = input("  Choose option [2]: ").strip()
         if not budget_input:
-            budget_input = "1"
+            budget_input = "2"
         if budget_input in ["1", "2"]:
             break
         print("[ERROR] Please enter 1 or 2")
@@ -672,9 +672,9 @@ def run_matrix_optimization(dm: DataManager):
             print("[ERROR] Please enter P, T, or S.")
     else:
         while True:
-            per_combo_input = input("Minutes per combination? [3]: ").strip()
+            per_combo_input = input("Minutes per combination? [10]: ").strip()
             if not per_combo_input:
-                per_combo_minutes = 3.0
+                per_combo_minutes = 10.0
                 break
             try:
                 per_combo_minutes = float(per_combo_input)

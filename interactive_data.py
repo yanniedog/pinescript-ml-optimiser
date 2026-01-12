@@ -217,9 +217,11 @@ def select_datasets_for_matrix(dm: DataManager):
         interval_name = INTERVAL_NAMES.get(interval, interval)
         print(f"  {interval_name} ({interval}): {len(symbols)} symbols")
 
-    use_all = ask_yes_no("\nUse all available datasets? [Y/n]: ", default=True)
+    use_all = ask_yes_no("\nUse all available datasets? [y/N]: ", default=False)
     if not use_all:
-        intervals_input = input("Intervals (comma/space-separated, Enter for all): ").strip()
+        intervals_input = input("Intervals (comma/space-separated, Enter for all) [1h]: ").strip()
+        if not intervals_input:
+            intervals_input = "1h"
         symbols_input = input("Symbols (comma/space-separated, Enter for all): ").strip()
 
         intervals = None
