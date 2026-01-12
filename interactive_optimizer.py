@@ -80,6 +80,72 @@ def apply_trial_overrides(target: dict):
             target[key] = value
 
 
+def _combo_key_from_row(row: dict):
+    """Build a unique key for an indicator-symbol-interval combination."""
+    return (row.get("file_name"), row.get("symbol"), row.get("interval"))
+
+
+def _load_matrix_rows(summary_path: Path, source_root: Path):
+    """Load cached matrix rows from a summary JSON and associate them with the source."""
+    if not summary_path.exists():
+        return {}
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    matrix = payload.get("matrix") or []
+    entries = {}
+    for row in matrix:
+        key = _combo_key_from_row(row)
+        if not all(key):
+            continue
+        entries[key] = (row, source_root)
+    return entries
+
+
+def _collect_cached_combos():
+    """Collect previously run combinations from current outputs and backups."""
+    combos = {}
+    summary_dir = Path("optimized_outputs") / "summary"
+    combos.update(_load_matrix_rows(summary_dir / "unified_optimization_matrix.json", Path.cwd()))
+
+    backup_root = Path("backup")
+    if not backup_root.exists():
+        return combos
+    for backup_dir in sorted(p for p in backup_root.iterdir() if p.is_dir()):
+        summary_path = backup_dir / "optimized_outputs" / "summary" / "unified_optimization_matrix.json"
+        combos.update(_load_matrix_rows(summary_path, backup_dir))
+    return combos
+
+
+def _restore_cached_outputs(row: dict, source_root: Path) -> bool:
+    """Copy cached output files from a known source to the current workspace."""
+    success = True
+    for key in ("output_pine", "output_report"):
+        rel_path = row.get(key)
+        if not rel_path:
+            success = False
+            continue
+        src_path = (source_root / rel_path).resolve()
+        dest_path = Path(rel_path)
+        if not src_path.exists():
+            print(f"[CACHE] Missing cached file for {rel_path} at {src_path}")
+            success = False
+            continue
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if dest_path.exists():
+                src_stat = src_path.stat()
+                dest_stat = dest_path.stat()
+                if dest_stat.st_mtime >= src_stat.st_mtime:
+                    continue
+            shutil.copy2(src_path, dest_path)
+        except Exception as exc:
+            print(f"[CACHE] Failed to restore {rel_path}: {exc}")
+            success = False
+    return success
+
+
 def _prompt_trial_setting(prompt: str, current, cast, validator, invalid_msg: str):
     """Helper to prompt for trial control values (int/float)."""
     while True:
@@ -1628,7 +1694,32 @@ def run_matrix_optimization(dm: DataManager):
     print(f"  - Early stop: disabled (uses full timeout per combo)")
     print(f"  - Press Q anytime to stop early and use current best results")
 
-    results = []
+    total_combo_entries = list(zip(combos, per_combo_budgets))
+    total_combo_count = len(total_combo_entries)
+    cached_combos = _collect_cached_combos()
+    active_entries = []
+    reused_rows = []
+    for (pine_file, symbol, interval), combo_timeout in total_combo_entries:
+        key = (pine_file.name, symbol, interval)
+        cached = cached_combos.get(key)
+        if cached:
+            row, source_root = cached
+            if _restore_cached_outputs(row, source_root):
+                row["reused"] = True
+                reused_rows.append(row)
+                print(f"[CACHE] Reusing cached result for {pine_file.name} {symbol} @ {interval}")
+                continue
+        active_entries.append(((pine_file, symbol, interval), combo_timeout))
+
+    combos = [entry[0] for entry in active_entries]
+    per_combo_budgets = [entry[1] for entry in active_entries]
+
+    if reused_rows and not combos:
+        print("\n[INFO] All requested combinations already optimized; no new runs will be executed.")
+    elif reused_rows:
+        print(f"\n[INFO] {len(reused_rows)} cached combination(s) reused; {len(combos)} new combination(s) will be optimized.")
+
+    results = reused_rows.copy()
     skipped_no_improvement = 0
     errors = 0
     data_cache = {}
@@ -1728,8 +1819,10 @@ def run_matrix_optimization(dm: DataManager):
         "intervals": intervals,
         "symbols": symbols,
         "datasets": len(datasets),
-        "combo_total": len(combos),
+        "combo_total": total_combo_count,
         "combo_run": len(combos),
+        "combo_cached": len(reused_rows),
+        "combo_new": len(combos),
         "budget_mode": budget_mode,
         "total_timeout_seconds": total_seconds,
         "timeout_seconds_per_combo_min": min(per_combo_budgets) if per_combo_budgets else 0,

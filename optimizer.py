@@ -59,6 +59,8 @@ _METRIC_DEFS = {
     "improvement_over_random": {"label": "Improvement vs Random"},
     "tail_capture_rate": {"label": "Tail Capture Rate"},
     "consistency_score": {"label": "Consistency Score"},
+    "total_trials": {"label": "Total Trials"},
+    "trials_per_second": {"label": "Trials/sec"},
 }
 _METRIC_KEYS = list(_METRIC_DEFS.keys())
 
@@ -255,7 +257,7 @@ class RealtimeBestPlotter:
         self._line_meta = {}
         self._y_metric = "objective_delta"
         self._x_mode = "elapsed"
-        self._x_modes = ["elapsed", "rate", "trial"]
+        self._x_modes = ["elapsed", "rate", "trial", "trials_per_second"]
         self._band_metric = None
         self._band_min = None
         self._band_max = None
@@ -363,6 +365,8 @@ class RealtimeBestPlotter:
             x_label = f"Improvement rate ({_metric_label(self._y_metric)} / s)"
         elif self._x_mode == "trial":
             x_label = "Trial #"
+        elif self._x_mode == "trials_per_second":
+            x_label = "Trials / second"
         else:
             x_label = "Elapsed time (s)"
         self._ax.set_xlabel(x_label)
@@ -379,6 +383,8 @@ class RealtimeBestPlotter:
             x_vals = _compute_rate_series(x_vals, y_vals, baseline)
         elif self._x_mode == "trial":
             x_vals = series.get("trials", [])
+        elif self._x_mode == "trials_per_second":
+            x_vals = series.get("metrics", {}).get("trials_per_second", [])
         return x_vals, y_vals
 
     def _refresh_lines(self) -> None:
@@ -387,6 +393,70 @@ class RealtimeBestPlotter:
             line.set_data(x_vals, y_vals)
         self._update_axis_labels()
         self._redraw(force=True)
+
+    def record_trial_progress(
+        self,
+        combo_label: str,
+        trial_number: int,
+        elapsed_seconds: float,
+        metrics: Dict[str, float]
+    ) -> None:
+        """Track trial progress as a separate '[trials]' series."""
+        if not self._ensure_ready():
+            return
+
+        progress_label = f"{combo_label} [trials]"
+        indicator, symbol, timeframe = self._parse_label(combo_label)
+        meta = {
+            "indicator": indicator.lower(),
+            "symbol": symbol.lower(),
+            "timeframe": timeframe.lower()
+        }
+        self._line_meta[progress_label] = meta
+
+        series = self._series.setdefault(
+            progress_label,
+            {"x": [], "metrics": {}, "params": [], "trials": []}
+        )
+        series["x"].append(elapsed_seconds)
+        series.setdefault("trials", []).append(trial_number)
+        series.setdefault("params", []).append(f"trial={trial_number}")
+        for key in _METRIC_KEYS:
+            series["metrics"].setdefault(key, []).append(metrics.get(key))
+
+        if len(series["x"]) > self._max_points:
+            trim = len(series["x"]) - self._max_points
+            series["x"] = series["x"][trim:]
+            series["trials"] = series["trials"][trim:]
+            series["params"] = series["params"][trim:]
+            for key in _METRIC_KEYS:
+                series["metrics"][key] = series["metrics"][key][trim:]
+
+        line = self._lines.get(progress_label)
+        if line is None:
+            color = self._get_indicator_color(indicator)
+            (line,) = self._ax.plot(
+                [],
+                [],
+                marker='o',
+                linestyle='--',
+                linewidth=1.2,
+                markersize=3,
+                label=progress_label,
+                color=color,
+                alpha=0.7
+            )
+            self._lines[progress_label] = line
+            line.set_picker(5)
+            line.set_visible(self._line_matches_filter(progress_label))
+            self._refresh_legend(force=True)
+        else:
+            line.set_visible(self._line_matches_filter(progress_label))
+
+        x_vals, y_vals = self._get_series_xy(progress_label)
+        line.set_data(x_vals, y_vals)
+        self._update_axis_labels()
+        self._redraw()
 
     def _set_band_filter(self, metric: Optional[str], band_min: Optional[float], band_max: Optional[float]) -> None:
         self._band_metric = metric
@@ -577,6 +647,41 @@ class RealtimeBestPlotter:
         elif mode == "timeframe":
             self._filters["timeframe"] = {value.lower()}
         self._apply_filters()
+
+    def record_trial_progress(
+        self,
+        combo_label: str,
+        trial_number: int,
+        elapsed_seconds: float,
+        metrics: Dict[str, float]
+    ) -> None:
+        """Track trial progress for Plotly updates."""
+        progress_label = f"{combo_label} [trials]"
+        indicator, symbol, timeframe = self._parse_label(combo_label)
+        meta = {
+            "indicator": indicator.lower(),
+            "symbol": symbol.lower(),
+            "timeframe": timeframe.lower()
+        }
+        self._line_meta[progress_label] = meta
+
+        series = self._series.setdefault(
+            progress_label,
+            {"x": [], "metrics": {}, "params": [], "trials": []}
+        )
+        series["x"].append(elapsed_seconds)
+        series.setdefault("trials", []).append(trial_number)
+        series.setdefault("params", []).append(f"trial={trial_number}")
+        for key in _METRIC_KEYS:
+            series["metrics"].setdefault(key, []).append(metrics.get(key))
+
+        if len(series["x"]) > self._max_points:
+            trim = len(series["x"]) - self._max_points
+            series["x"] = series["x"][trim:]
+            series["trials"] = series["trials"][trim:]
+            series["params"] = series["params"][trim:]
+            for key in _METRIC_KEYS:
+                series["metrics"][key] = series["metrics"][key][trim:]
 
     def _prompt_metric(self) -> None:
         try:
@@ -902,16 +1007,17 @@ class PlotlyRealtimePlotter:
                             value=self._default_y_metric,
                             clearable=False
                         ),
-                        dcc.Dropdown(
-                            id="x-axis",
-                            options=[
-                                {"label": "Elapsed (s)", "value": "elapsed"},
-                                {"label": "Improvement rate (/s)", "value": "rate"},
-                                {"label": "Trial #", "value": "trial"},
-                            ],
-                            value=self._default_x_mode,
-                            clearable=False
-                        ),
+                         dcc.Dropdown(
+                             id="x-axis",
+                             options=[
+                                 {"label": "Elapsed (s)", "value": "elapsed"},
+                                 {"label": "Improvement rate (/s)", "value": "rate"},
+                                 {"label": "Trial #", "value": "trial"},
+                                 {"label": "Trials/sec (running rate)", "value": "trials_per_second"},
+                             ],
+                             value=self._default_x_mode,
+                             clearable=False
+                         ),
                         dcc.Dropdown(
                             id="band-metric",
                             options=metric_options,
@@ -1030,6 +1136,10 @@ class PlotlyRealtimePlotter:
                     if not trial_vals:
                         continue
                     x_vals = trial_vals
+                elif x_mode == "trials_per_second":
+                    x_vals = points.get("metrics", {}).get("trials_per_second", [])
+                    if not x_vals:
+                        continue
                 else:
                     x_vals = x_elapsed
                 if not x_vals:
@@ -1061,6 +1171,8 @@ class PlotlyRealtimePlotter:
                     x_label = "rate_per_s"
                 elif x_mode == "trial":
                     x_label = "trial"
+                elif x_mode == "trials_per_second":
+                    x_label = "trials_per_second"
                 else:
                     x_label = "elapsed_s"
                 fig.add_trace(
@@ -1345,6 +1457,43 @@ class PlotlyRealtimePlotter:
                 series["trials"] = series["trials"][-self._max_points:]
             if indicator_name not in self._line_meta:
                 self._register_line(indicator_name)
+
+    def record_trial_progress(
+        self,
+        combo_label: str,
+        trial_number: int,
+        elapsed_seconds: float,
+        metrics: Dict[str, float]
+    ) -> None:
+        """Track trial progress as a separate '[trials]' series."""
+        if not self._ensure_ready():
+            return
+        with self._lock:
+            progress_label = f"{combo_label} [trials]"
+            indicator, symbol, timeframe = self._parse_label(combo_label)
+            meta = {
+                "indicator": indicator.lower(),
+                "symbol": symbol.upper(),
+                "timeframe": timeframe.lower()
+            }
+            self._line_meta[progress_label] = meta
+
+            series = self._series.setdefault(
+                progress_label,
+                {"x": [], "metrics": {}, "params": [], "trials": []}
+            )
+            series["x"].append(elapsed_seconds)
+            series.setdefault("trials", []).append(trial_number)
+            series.setdefault("params", []).append(f"trial={trial_number}")
+            for key in _METRIC_KEYS:
+                series["metrics"].setdefault(key, []).append(metrics.get(key))
+
+            if len(series["x"]) > self._max_points:
+                series["x"] = series["x"][-self._max_points:]
+                series["trials"] = series["trials"][-self._max_points:]
+                series["params"] = series["params"][-self._max_points:]
+                for key in _METRIC_KEYS:
+                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
 
 _REALTIME_PLOTTER = None
@@ -1816,10 +1965,11 @@ class PineOptimizer:
         self.user_stopped = False
         self.last_improvement_trial = None
         self.last_improvement_time = None
-        self._plot_initialized = False
         self._baseline_metrics = None
         self._baseline_objective = None
         self._baseline_metrics_map = {}
+        self._progress_log_interval = 5.0
+        self._last_progress_log_time = 0.0
 
     def _parse_interval_seconds(self, interval: str) -> Optional[int]:
         """Convert interval string (e.g., 1h, 4h, 1d) to seconds."""
@@ -2042,9 +2192,25 @@ class PineOptimizer:
             return 0.0
         
         avg_objective = total_objective / symbol_count
+        now = time.time()
+        elapsed_since_start = max(now - self.start_time if self.start_time else 0.0, 0.0)
+        elapsed_for_rate = max(elapsed_since_start, 1e-6)
+        trials_per_second = self.trial_count / elapsed_for_rate if elapsed_for_rate else 0.0
+        trial_metrics = {
+            "total_trials": self.trial_count,
+            "trials_per_second": trials_per_second,
+        }
+        if self.realtime_plotter:
+            self.realtime_plotter.record_trial_progress(
+                self.indicator_name,
+                self.trial_count,
+                elapsed_since_start,
+                trial_metrics
+            )
 
         # Track best and report improvement rate vs original config
         improvement_info = self.progress_tracker.update(avg_objective, params)
+        progress_logged = False
         if improvement_info:
             elapsed = improvement_info['elapsed_seconds']
             pct_vs_original = improvement_info['pct_improvement_total']
@@ -2061,12 +2227,8 @@ class PineOptimizer:
                     p.name: params.get(p.name)
                     for p in self.optimizable_params
                 }
-                if not self._plot_initialized:
-                    self.realtime_plotter.start_indicator(self.indicator_name)
-                    self.realtime_plotter.set_baseline(self.indicator_name, baseline)
-                    if self._baseline_metrics_map:
-                        self.realtime_plotter.set_baseline_metrics(self.indicator_name, self._baseline_metrics_map)
-                    self._plot_initialized = True
+                metrics_map["total_trials"] = self.trial_count
+                metrics_map["trials_per_second"] = trials_per_second
                 self.realtime_plotter.update(
                     self.indicator_name,
                     avg_objective,
@@ -2138,7 +2300,16 @@ class PineOptimizer:
             self.best_objective = avg_objective
             self.last_improvement_trial = self.trial_count
             self.last_improvement_time = time.time()
+            progress_logged = True
+            self._last_progress_log_time = now
         
+        if not progress_logged and (now - self._last_progress_log_time) >= self._progress_log_interval:
+            logger.info(
+                f"Trial {self.trial_count}: total={self.trial_count} | trials/sec={trials_per_second:.2f} | "
+                f"objective={avg_objective:.4f} | elapsed={elapsed_since_start:.1f}s"
+            )
+            self._last_progress_log_time = now
+
         return avg_objective
     
     def optimize(self) -> OptimizationResult:
@@ -2174,7 +2345,12 @@ class PineOptimizer:
         self._baseline_metrics_map = _metrics_from_backtest(original_metrics)
         self._baseline_metrics_map["objective_best"] = original_objective
         self._baseline_metrics_map["objective_overall"] = calculate_objective_score(original_metrics)
-        
+        if self.realtime_plotter:
+            self.realtime_plotter.start_indicator(self.indicator_name)
+            self.realtime_plotter.set_baseline(self.indicator_name, original_objective)
+            if self._baseline_metrics_map:
+                self.realtime_plotter.set_baseline_metrics(self.indicator_name, self._baseline_metrics_map)
+
         self.start_time = time.time()
         self.trial_count = 0
         self.best_objective = 0.0
@@ -2183,7 +2359,6 @@ class PineOptimizer:
         # Start progress tracking with original config as baseline
         self.progress_tracker.set_baseline(original_objective, self.original_params)
         self.progress_tracker.start()
-        self._plot_initialized = False
         self.last_improvement_trial = 0
         # Don't start the stall timer until the first improvement completes (1m data can take a while per trial).
         self.last_improvement_time = None
