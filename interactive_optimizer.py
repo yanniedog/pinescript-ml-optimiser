@@ -65,6 +65,8 @@ TRIAL_CONTROL_OPTIONS = {
     "min_runtime_seconds": None,
     "stall_seconds": None,
     "improvement_rate_floor": None,
+    "n_jobs": None,
+    "fast_evaluation": None,
 }
 
 
@@ -180,6 +182,8 @@ def configure_trial_controls():
     print("  Set 'max trials' to cap the search, 'min runtime' to prevent early exits,")
     print("  'stall timeout' to delay the no-improvement guard, and 'improvement floor'")
     print("  to tune how sensitive the optimizer is to slowing progress.")
+    print("  Set 'n_jobs' for parallel trial execution (default: auto, min(4, cpu_count)).")
+    print("  Set 'fast_evaluation' to use reduced forecast horizons for faster optimization.")
 
     TRIAL_CONTROL_OPTIONS["max_trials"] = _prompt_trial_setting(
         "Max trials",
@@ -209,6 +213,45 @@ def configure_trial_controls():
         lambda v: True,
         "Enter a number."
     )
+    
+    # n_jobs setting
+    import os
+    default_n_jobs = min(4, os.cpu_count() or 4)
+    while True:
+        default_str = f"[{default_n_jobs}]" if TRIAL_CONTROL_OPTIONS["n_jobs"] is None else f"[{TRIAL_CONTROL_OPTIONS['n_jobs']}]"
+        entry = input(f"  Parallel jobs (n_jobs) {default_str} (enter 'clear' to reset, blank to keep): ").strip()
+        if not entry:
+            break
+        if entry.lower() in {"clear", "none"}:
+            TRIAL_CONTROL_OPTIONS["n_jobs"] = None
+            break
+        try:
+            value = int(entry)
+            if value > 0:
+                TRIAL_CONTROL_OPTIONS["n_jobs"] = value
+                break
+            else:
+                print("  [ERROR] Enter a positive integer.")
+        except ValueError:
+            print(f"  [ERROR] Invalid number: '{entry}'")
+    
+    # fast_evaluation setting
+    while True:
+        current = TRIAL_CONTROL_OPTIONS["fast_evaluation"]
+        default_str = "[False]" if current is None else f"[{current}]"
+        entry = input(f"  Fast evaluation (reduced horizons) {default_str} (y/n, 'clear' to reset, blank to keep): ").strip().lower()
+        if not entry:
+            break
+        if entry in {"clear", "none"}:
+            TRIAL_CONTROL_OPTIONS["fast_evaluation"] = None
+            break
+        if entry in {"y", "yes", "true", "1"}:
+            TRIAL_CONTROL_OPTIONS["fast_evaluation"] = True
+            break
+        if entry in {"n", "no", "false", "0"}:
+            TRIAL_CONTROL_OPTIONS["fast_evaluation"] = False
+            break
+        print("  [ERROR] Please enter Y or N.")
 
     print("\n  Trial controls updated:")
     for label, key in [
@@ -216,9 +259,14 @@ def configure_trial_controls():
         ("Min runtime (sec)", "min_runtime_seconds"),
         ("Stall timeout (sec)", "stall_seconds"),
         ("Improvement rate floor", "improvement_rate_floor"),
+        ("Parallel jobs (n_jobs)", "n_jobs"),
+        ("Fast evaluation", "fast_evaluation"),
     ]:
         value = TRIAL_CONTROL_OPTIONS[key]
-        print(f"    {label}: {value if value is not None else 'none'}")
+        if key == "fast_evaluation" and value is not None:
+            print(f"    {label}: {value}")
+        else:
+            print(f"    {label}: {value if value is not None else 'none'}")
 
 
 def split_choice_input(raw: str):
@@ -523,6 +571,13 @@ def build_args(pine_file, options):
 
     if 'improvement_rate_floor' in options and options['improvement_rate_floor'] is not None:
         args.extend(['--improvement-rate-floor', str(options['improvement_rate_floor'])])
+
+    if 'n_jobs' in options and options['n_jobs'] is not None:
+        args.extend(['--n-jobs', str(options['n_jobs'])])
+
+    if 'fast_evaluation' in options and options['fast_evaluation'] is not None:
+        if options['fast_evaluation']:
+            args.append('--fast-evaluation')
 
     if 'symbols' in options:
         args.extend(['--symbols', options['symbols']])

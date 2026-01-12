@@ -14,6 +14,8 @@ import threading
 import socket
 import webbrowser
 import re
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1825,7 +1827,9 @@ class PineOptimizer:
         improvement_rate_window: int = 5,
         holdout_ratio: float = 0.2,
         holdout_gap_bars: Optional[int] = None,
-        indicator_label: Optional[str] = None
+        indicator_label: Optional[str] = None,
+        n_jobs: Optional[int] = None,
+        fast_evaluation: bool = False
     ):
         """
         Initialize optimizer.
@@ -1849,6 +1853,8 @@ class PineOptimizer:
             improvement_rate_window: Moving average window for improvement rate
             holdout_ratio: Fraction of data reserved for lockbox evaluation (0 disables)
             holdout_gap_bars: Purge bars between optimization and holdout (None = auto)
+            n_jobs: Number of parallel jobs for trial execution (None = auto: min(4, cpu_count()))
+            fast_evaluation: Use reduced forecast horizons for faster evaluation during optimization
         """
         self.parse_result = parse_result
         self.data = data
@@ -1885,6 +1891,17 @@ class PineOptimizer:
         self.holdout_data_frames = {}
         self.indicator_name = indicator_label or parse_result.indicator_name or "Indicator"
         self.realtime_plotter = get_realtime_plotter()
+        
+        # Parallelization settings
+        if n_jobs is None:
+            # Conservative default for Windows Surface laptops: min(4, cpu_count())
+            cpu_count = os.cpu_count() or 4
+            self.n_jobs = min(4, cpu_count)
+        else:
+            self.n_jobs = max(1, n_jobs)  # At least 1 job
+        
+        self.fast_evaluation = fast_evaluation
+        self._evaluation_lock = threading.Lock()  # For thread-safe progress tracking
         
         # Extract parameter info
         self.parameters = parse_result.parameters
@@ -2028,11 +2045,29 @@ class PineOptimizer:
             elif bar_seconds >= 14400:
                 min_trades_per_fold = 5
 
+        # Use reduced horizons for fast evaluation during optimization
+        horizons = self._forecast_horizons_for_interval(interval, length)
+        if self.fast_evaluation:
+            # Use subset of horizons: roughly every 3rd horizon for faster evaluation
+            # Keep first few and last few for coverage
+            if len(horizons) > 6:
+                step = max(1, len(horizons) // 6)
+                reduced = horizons[::step]
+                # Ensure we have first and last
+                if reduced[0] != horizons[0]:
+                    reduced.insert(0, horizons[0])
+                if reduced[-1] != horizons[-1]:
+                    reduced.append(horizons[-1])
+                horizons = sorted(set(reduced))
+            else:
+                # If already small, use all
+                horizons = horizons
+
         config = {
             "n_folds": n_folds,
             "embargo_bars": embargo_bars,
             "min_trades_per_fold": min_trades_per_fold,
-            "forecast_horizons": self._forecast_horizons_for_interval(interval, length),
+            "forecast_horizons": horizons,
         }
         if self.backtester_overrides:
             config.update(self.backtester_overrides)
@@ -2137,12 +2172,40 @@ class PineOptimizer:
         else:  # float
             return trial.suggest_float(param.name, float(min_val), float(max_val), step=float(step) if step else None)
     
+    def _evaluate_symbol(self, key: Any, params: Dict[str, Any]) -> Tuple[Any, Optional[BacktestMetrics], Optional[float]]:
+        """
+        Evaluate a single symbol/timeframe with given parameters.
+        Thread-safe helper for parallel evaluation.
+        
+        Returns:
+            (key, metrics, objective) or (key, None, None) on failure
+        """
+        translator = self.translators[key]
+        backtester = self.backtesters[key]
+        
+        try:
+            # Run indicator with trial params
+            indicator_result = translator.run_indicator(params)
+            
+            # Evaluate performance
+            metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
+
+            # Calculate objective
+            obj = backtester.calculate_objective(metrics)
+            
+            return (key, metrics, obj)
+        except Exception as e:
+            logger.debug(f"Trial failed for {key}: {e}")
+            return (key, None, None)
+    
     def _objective(self, trial: optuna.Trial) -> float:
         """
         Objective function for Optuna optimization.
         Returns a score to maximize (higher is better).
+        Uses parallel evaluation of symbols when multiple symbols are present.
         """
-        self.trial_count += 1
+        with self._evaluation_lock:
+            self.trial_count += 1
         
         # Check for user stop request
         if self.keyboard_monitor and self.keyboard_monitor.stop_requested:
@@ -2155,31 +2218,43 @@ class PineOptimizer:
             params[p.name] = self._suggest_param(trial, p)
         
         # Evaluate across all symbols/timeframes
-        total_objective = 0.0
-        symbol_count = 0
-        metrics_list = []
+        # Use parallel execution if multiple symbols, sequential if single symbol
+        symbol_keys = list(self.translators.keys())
         
-        for key in self.translators:
-            translator = self.translators[key]
-            backtester = self.backtesters[key]
+        if len(symbol_keys) > 1:
+            # Parallel evaluation for multiple symbols
+            total_objective = 0.0
+            symbol_count = 0
+            metrics_list = []
             
-            try:
-                # Run indicator with trial params
-                indicator_result = translator.run_indicator(params)
+            # Use ThreadPoolExecutor for parallel evaluation
+            max_workers = min(len(symbol_keys), self.n_jobs * 2)  # Allow more workers for symbol evaluation
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all symbol evaluations
+                future_to_key = {
+                    executor.submit(self._evaluate_symbol, key, params): key
+                    for key in symbol_keys
+                }
                 
-                # Evaluate performance
-                metrics = backtester.evaluate_indicator(indicator_result, use_discrete_signals=self.use_discrete_signals)
-
-                # Calculate objective
-                obj = backtester.calculate_objective(metrics)
-
-                total_objective += obj
-                symbol_count += 1
-                metrics_list.append(metrics)
-                
-            except Exception as e:
-                logger.debug(f"Trial failed for {key}: {e}")
-                continue
+                # Collect results as they complete
+                for future in as_completed(future_to_key):
+                    key, metrics, obj = future.result()
+                    if metrics is not None and obj is not None:
+                        total_objective += obj
+                        symbol_count += 1
+                        metrics_list.append(metrics)
+        else:
+            # Sequential evaluation for single symbol (no overhead)
+            total_objective = 0.0
+            symbol_count = 0
+            metrics_list = []
+            
+            for key in symbol_keys:
+                key_result, metrics, obj = self._evaluate_symbol(key, params)
+                if metrics is not None and obj is not None:
+                    total_objective += obj
+                    symbol_count += 1
+                    metrics_list.append(metrics)
         
         # Early pruning check - report once at the end
         if symbol_count > 0 and self.trial_count > self.pruning_warmup_trials:
@@ -2327,8 +2402,36 @@ class PineOptimizer:
             logger.info("Press Q at any time to stop optimization and use current best results")
         
         # Evaluate original config FIRST to establish baseline
+        # Always use full horizons for baseline evaluation (fair comparison)
         logger.info("Evaluating original config as baseline...")
-        original_per_symbol = self._evaluate_params_per_symbol(self.original_params)
+        if self.fast_evaluation:
+            # Temporarily disable fast_evaluation for baseline
+            original_fast_eval = self.fast_evaluation
+            self.fast_evaluation = False
+            
+            # Recreate backtesters with full horizons for baseline
+            full_horizon_backtesters = {}
+            if self.is_multi_timeframe:
+                for symbol, timeframes_dict in self.data.items():
+                    for timeframe, df in timeframes_dict.items():
+                        key = (symbol, timeframe)
+                        backtester_kwargs = self._get_backtester_config(timeframe, df)
+                        full_horizon_backtesters[key] = WalkForwardBacktester(df, **backtester_kwargs)
+            else:
+                for symbol, df in self.data.items():
+                    backtester_kwargs = self._get_backtester_config(self.interval, df)
+                    full_horizon_backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
+            
+            original_per_symbol = self._evaluate_params_per_symbol_for(
+                self.original_params,
+                self.translators,
+                full_horizon_backtesters
+            )
+            
+            # Restore fast_evaluation for optimization
+            self.fast_evaluation = original_fast_eval
+        else:
+            original_per_symbol = self._evaluate_params_per_symbol(self.original_params)
         
         # Aggregate metrics - handle both single and multi-timeframe structures
         if self.is_multi_timeframe:
@@ -2421,6 +2524,7 @@ class PineOptimizer:
                     self._objective,
                     n_trials=self.max_trials,
                     timeout=self.timeout_seconds,
+                    n_jobs=self.n_jobs,
                     show_progress_bar=False,
                     catch=(Exception,),
                     callbacks=[stop_callback] if self.keyboard_monitor else None
@@ -2448,12 +2552,42 @@ class PineOptimizer:
                 if p.name in study.best_params:
                     best_params_candidate[p.name] = study.best_params[p.name]
         
-        # Evaluate best params candidate (per-symbol/timeframe)
-        optimized_per_symbol = (
-            self._evaluate_params_per_symbol(best_params_candidate)
-            if study is not None
-            else original_per_symbol
-        )
+        # For final evaluation, use full horizons if fast_evaluation was used during optimization
+        # Create temporary backtesters with full horizons for accurate final evaluation
+        if self.fast_evaluation and study is not None:
+            # Temporarily disable fast_evaluation and recreate backtesters with full horizons
+            original_fast_eval = self.fast_evaluation
+            self.fast_evaluation = False
+            
+            # Recreate backtesters with full horizons
+            full_horizon_backtesters = {}
+            if self.is_multi_timeframe:
+                for symbol, timeframes_dict in self.data.items():
+                    for timeframe, df in timeframes_dict.items():
+                        key = (symbol, timeframe)
+                        backtester_kwargs = self._get_backtester_config(timeframe, df)
+                        full_horizon_backtesters[key] = WalkForwardBacktester(df, **backtester_kwargs)
+            else:
+                for symbol, df in self.data.items():
+                    backtester_kwargs = self._get_backtester_config(self.interval, df)
+                    full_horizon_backtesters[symbol] = WalkForwardBacktester(df, **backtester_kwargs)
+            
+            # Evaluate with full horizons
+            optimized_per_symbol = self._evaluate_params_per_symbol_for(
+                best_params_candidate,
+                self.translators,
+                full_horizon_backtesters
+            )
+            
+            # Restore fast_evaluation setting
+            self.fast_evaluation = original_fast_eval
+        else:
+            # Evaluate best params candidate (per-symbol/timeframe)
+            optimized_per_symbol = (
+                self._evaluate_params_per_symbol(best_params_candidate)
+                if study is not None
+                else original_per_symbol
+            )
         
         # Aggregate metrics - handle both single and multi-timeframe structures
         if self.is_multi_timeframe:
@@ -2908,7 +3042,7 @@ def optimize_indicator(
         parse_result: Parsed Pine Script
         data: Dict of symbol -> DataFrame
         interval: Timeframe/interval used (e.g., "1h", "4h", "1d")
-        **kwargs: Additional arguments for PineOptimizer
+        **kwargs: Additional arguments for PineOptimizer (including n_jobs, fast_evaluation)
         
     Returns:
         OptimizationResult
@@ -2918,7 +3052,7 @@ def optimize_indicator(
         result = _optimize_multi_fidelity(parse_result, data, interval, **kwargs)
     else:
         optimizer = PineOptimizer(parse_result, data, interval=interval, **kwargs)
-    result = optimizer.optimize()
+        result = optimizer.optimize()
     
     # Set interval in result
     result.interval = interval

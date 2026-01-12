@@ -145,6 +145,17 @@ Examples:
         help='Minimum improvement rate to continue (default: optimizer setting)'
     )
     parser.add_argument(
+        '--n-jobs',
+        type=int,
+        default=None,
+        help='Number of parallel jobs for trial execution (default: auto, min(4, cpu_count()))'
+    )
+    parser.add_argument(
+        '--fast-evaluation',
+        action='store_true',
+        help='Use reduced forecast horizons for faster evaluation during optimization'
+    )
+    parser.add_argument(
         '--holdout-ratio',
         type=float,
         default=0.2,
@@ -364,6 +375,10 @@ Examples:
             optimizer_kwargs['stall_seconds'] = args.stall_seconds
         if args.improvement_rate_floor is not None:
             optimizer_kwargs['improvement_rate_floor'] = args.improvement_rate_floor
+        if args.n_jobs is not None:
+            optimizer_kwargs['n_jobs'] = args.n_jobs
+        if args.fast_evaluation:
+            optimizer_kwargs['fast_evaluation'] = True
 
         optimization_result = optimize_indicator(
             parse_result,
