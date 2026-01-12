@@ -760,6 +760,17 @@ class PlotlyRealtimePlotter:
                         ),
                     ],
                 ),
+                html.Div(
+                    style={"display": "flex", "gap": "16px", "marginBottom": "8px", "alignItems": "center"},
+                    children=[
+                        dcc.Checklist(
+                            id="improving-mcc-only",
+                            options=[{"label": " Show only improving MCC values", "value": "improving_mcc"}],
+                            value=[],
+                            style={"fontSize": "13px"}
+                        ),
+                    ],
+                ),
                 dcc.Graph(
                     id="objective-graph",
                     config={"displayModeBar": True, "responsive": True},
@@ -819,7 +830,7 @@ class PlotlyRealtimePlotter:
                     return val
             return None
 
-        def build_figure(indicators, symbols, timeframes, y_metric, x_mode, band_metric, band_min, band_max, hidden):
+        def build_figure(indicators, symbols, timeframes, y_metric, x_mode, band_metric, band_min, band_max, hidden, improving_mcc_only=False):
             from optimizer_utils import _METRIC_DEFS
             with self._lock:
                 series = {
@@ -861,6 +872,8 @@ class PlotlyRealtimePlotter:
                 trial_vals = points.get("trials", [])
                 y_vals = points.get("metrics", {}).get(y_metric, [])
                 params_vals = points.get("params", [])
+                mcc_vals = points.get("metrics", {}).get("mcc", [])
+                
                 if x_mode == "trial":
                     if not trial_vals:
                         continue
@@ -889,6 +902,23 @@ class PlotlyRealtimePlotter:
                         continue
                     if band_max is not None and latest_band > band_max:
                         continue
+
+                # Filter for improving MCC values only
+                if improving_mcc_only and mcc_vals:
+                    improving_indices = [0]  # Always keep the first point
+                    best_mcc_so_far = mcc_vals[0] if mcc_vals[0] is not None else float('-inf')
+                    for i in range(1, len(mcc_vals)):
+                        if mcc_vals[i] is not None and mcc_vals[i] > best_mcc_so_far:
+                            improving_indices.append(i)
+                            best_mcc_so_far = mcc_vals[i]
+                    
+                    # Filter all arrays to only keep improving points
+                    if improving_indices:
+                        x_vals = [x_vals[i] for i in improving_indices if i < len(x_vals)]
+                        y_vals = [y_vals[i] for i in improving_indices if i < len(y_vals)]
+                        params_vals = [params_vals[i] for i in improving_indices if i < len(params_vals)]
+                        if not x_vals or not y_vals:
+                            continue
 
                 visible_labels.append(label)
 
@@ -968,6 +998,7 @@ class PlotlyRealtimePlotter:
             Input("band-min", "value"),
             Input("band-max", "value"),
             Input("hidden-series", "data"),
+            Input("improving-mcc-only", "value"),
         )
         def update_plot(
             _,
@@ -980,7 +1011,8 @@ class PlotlyRealtimePlotter:
             band_metric,
             band_min,
             band_max,
-            hidden_series
+            hidden_series,
+            improving_mcc_only
         ):
             if ctx.triggered_id == "clear-filters":
                 indicator_vals = []
@@ -995,6 +1027,9 @@ class PlotlyRealtimePlotter:
             symbol_vals = [v for v in (symbol_vals or []) if v in self._last_options["symbol"]]
             timeframe_vals = [v for v in (timeframe_vals or []) if v in self._last_options["timeframe"]]
 
+            # Check if improving MCC filter is enabled
+            show_improving_only = "improving_mcc" in (improving_mcc_only or [])
+
             fig, visible_labels = build_figure(
                 indicator_vals,
                 symbol_vals,
@@ -1004,7 +1039,8 @@ class PlotlyRealtimePlotter:
                 band_metric,
                 band_min,
                 band_max,
-                hidden_series
+                hidden_series,
+                improving_mcc_only=show_improving_only
             )
             if visible_labels:
                 hidden_set = set(hidden_series or [])
