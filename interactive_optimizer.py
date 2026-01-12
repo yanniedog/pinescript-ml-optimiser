@@ -924,7 +924,9 @@ def write_unified_report(summary_path: Path, json_path: Path, run_info: dict, re
         lines.append("")
         lines.append(f"{row['indicator_name']} ({row['file_name']})")
         lines.append(f"  Objective: {row['objective_best']:.4f} (baseline {row['baseline_objective']:.4f})")
-        lines.append(f"  Trials: {row['n_trials']} | Time: {row['optimization_time']:.1f}s")
+        trials_str = f"{row['n_trials']}" if row.get('n_trials') is not None else "N/A"
+        time_str = f"{row['optimization_time']:.1f}s" if row.get('optimization_time') is not None else "N/A"
+        lines.append(f"  Trials: {trials_str} | Time: {time_str}")
         lines.append(
             f"  MCC: {row['best_metrics'].get('mcc', 0):.3f} | "
             f"AUC: {row['best_metrics'].get('roc_auc', 0):.3f} | "
