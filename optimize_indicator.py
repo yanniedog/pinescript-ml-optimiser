@@ -282,19 +282,35 @@ Examples:
             # Multi-timeframe: {symbol: {timeframe: DataFrame}}
             data = {}
             for symbol in symbols:
-                data[symbol] = {}
+                symbol_data = {}
                 for interval in intervals:
                     if dm.symbol_exists(symbol, interval):
                         try:
-                            data[symbol][interval] = dm.load_symbol(symbol, interval)
-                            print(f"   [OK] {symbol} @ {interval}: {len(data[symbol][interval]):,} candles")
+                            symbol_data[interval] = dm.load_symbol(symbol, interval)
+                            print(f"   [OK] {symbol} @ {interval}: {len(symbol_data[interval]):,} candles")
                         except Exception as e:
                             print(f"   [WARN] Failed to load {symbol} @ {interval}: {e}")
+                # Only add symbol to data if at least one timeframe was successfully loaded
+                if symbol_data:
+                    data[symbol] = symbol_data
         
+        # Validation: check if data is empty or (for multi-timeframe) all nested dicts are empty
         if not data:
             print(f"Error: No historical data available for interval(s) '{args.interval}'.")
             print(f"       Run the interactive mode to download data first.")
             sys.exit(1)
+        
+        # Additional check for multi-timeframe: ensure at least one symbol has non-empty timeframes
+        if len(intervals) > 1:
+            has_valid_data = False
+            for symbol, timeframes_dict in data.items():
+                if timeframes_dict:
+                    has_valid_data = True
+                    break
+            if not has_valid_data:
+                print(f"Error: No historical data available for interval(s) '{args.interval}'.")
+                print(f"       Run the interactive mode to download data first.")
+                sys.exit(1)
         
         # Step 2: Parse Pine Script
         print_step(2, total_steps, "Parsing Pine Script parameters...")
