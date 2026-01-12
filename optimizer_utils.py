@@ -111,6 +111,131 @@ def _compute_rate_series(
     return rates
 
 
+def _lttb_downsample(
+    x_vals: List[float],
+    y_vals: List[Optional[float]],
+    target_points: int = 500
+) -> tuple:
+    """
+    Largest Triangle Three Buckets (LTTB) downsampling algorithm.
+    Preserves visual shape while reducing point count efficiently.
+    O(n) complexity, designed for time series visualization.
+    
+    Returns (downsampled_x, downsampled_y, downsampled_indices)
+    """
+    n = len(x_vals)
+    if n <= target_points or target_points < 3:
+        return x_vals, y_vals, list(range(n))
+    
+    # Replace None values with interpolated or 0 for algorithm
+    y_clean = []
+    last_valid = 0.0
+    for v in y_vals:
+        if v is None:
+            y_clean.append(last_valid)
+        else:
+            y_clean.append(v)
+            last_valid = v
+    
+    # Always keep first and last points
+    sampled_indices = [0]
+    
+    # Bucket size (excluding first and last)
+    bucket_size = (n - 2) / (target_points - 2)
+    
+    a = 0  # Previous selected point index
+    
+    for i in range(target_points - 2):
+        # Calculate bucket range
+        bucket_start = int((i + 1) * bucket_size) + 1
+        bucket_end = int((i + 2) * bucket_size) + 1
+        bucket_end = min(bucket_end, n - 1)
+        
+        # Calculate average point for next bucket (for triangle area)
+        next_bucket_start = bucket_end
+        next_bucket_end = int((i + 3) * bucket_size) + 1
+        next_bucket_end = min(next_bucket_end, n)
+        
+        if next_bucket_start >= n:
+            next_bucket_start = n - 1
+        if next_bucket_end > n:
+            next_bucket_end = n
+            
+        # Average of next bucket
+        avg_x = 0.0
+        avg_y = 0.0
+        count = max(1, next_bucket_end - next_bucket_start)
+        for j in range(next_bucket_start, next_bucket_end):
+            avg_x += x_vals[j]
+            avg_y += y_clean[j]
+        avg_x /= count
+        avg_y /= count
+        
+        # Find point in current bucket with max triangle area
+        max_area = -1.0
+        max_idx = bucket_start
+        
+        point_a_x = x_vals[a]
+        point_a_y = y_clean[a]
+        
+        for j in range(bucket_start, bucket_end):
+            # Triangle area (simplified, sign doesn't matter)
+            area = abs(
+                (point_a_x - avg_x) * (y_clean[j] - point_a_y) -
+                (point_a_x - x_vals[j]) * (avg_y - point_a_y)
+            )
+            if area > max_area:
+                max_area = area
+                max_idx = j
+        
+        sampled_indices.append(max_idx)
+        a = max_idx
+    
+    # Always include last point
+    sampled_indices.append(n - 1)
+    
+    # Build output arrays
+    out_x = [x_vals[i] for i in sampled_indices]
+    out_y = [y_vals[i] for i in sampled_indices]
+    
+    return out_x, out_y, sampled_indices
+
+
+def _downsample_series_for_plot(
+    series_data: Dict[str, Any],
+    metric_keys: List[str],
+    target_points: int = 500
+) -> Dict[str, Any]:
+    """
+    Downsample a full series for efficient plotting.
+    Preserves visual fidelity using LTTB algorithm.
+    Returns a new dict with downsampled arrays.
+    """
+    x_vals = series_data.get("x", [])
+    if len(x_vals) <= target_points:
+        return series_data  # No downsampling needed
+    
+    # Use objective_delta as primary for downsampling decisions
+    primary_y = series_data.get("metrics", {}).get("objective_delta", x_vals)
+    
+    _, _, indices = _lttb_downsample(x_vals, primary_y, target_points)
+    
+    # Build downsampled result
+    result = {
+        "x": [x_vals[i] for i in indices],
+        "trials": [series_data.get("trials", [])[i] for i in indices if i < len(series_data.get("trials", []))],
+        "params": [series_data.get("params", [])[i] for i in indices if i < len(series_data.get("params", []))],
+        "metrics": {}
+    }
+    
+    for key in metric_keys:
+        metric_vals = series_data.get("metrics", {}).get(key, [])
+        if metric_vals:
+            result["metrics"][key] = [metric_vals[i] for i in indices if i < len(metric_vals)]
+    
+    return result
+
+
 def get_optimizable_params(parameters: List[Parameter]) -> List[Parameter]:
     """Filter parameters to only those worth optimizing."""
     skip_keywords = ['show', 'display', 'color', 'style', 'size', 'line']

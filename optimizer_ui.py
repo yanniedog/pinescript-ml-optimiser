@@ -28,7 +28,8 @@ from optimizer_utils import (
     _compute_rate_series, 
     _METRIC_KEYS,
     _format_param_value,
-    _format_params
+    _format_params,
+    _downsample_series_for_plot
 )
 
 logger = logging.getLogger(__name__)
@@ -120,7 +121,7 @@ class RealtimeBestPlotter:
         self._min_draw_interval = 0.25
         self._last_autoscale_time = 0.0
         self._autoscale_interval = 1.0
-        self._max_points = 300
+        self._max_render_points = 500  # Points per line for efficient rendering (no storage limit)
         self._legend = None
         self._legend_enabled = True
         self._legend_max_lines = 25
@@ -250,15 +251,19 @@ class RealtimeBestPlotter:
         series = self._series.get(label)
         if not series:
             return [], []
-        x_vals = series.get("x", [])
-        y_vals = series.get("metrics", {}).get(self._y_metric, [])
+        
+        # Downsample for efficient rendering
+        downsampled = _downsample_series_for_plot(series, _METRIC_KEYS, self._max_render_points)
+        
+        x_vals = downsampled.get("x", [])
+        y_vals = downsampled.get("metrics", {}).get(self._y_metric, [])
         if self._x_mode == "rate":
             baseline = self._baseline_values.get(label, {}).get(self._y_metric)
             x_vals = _compute_rate_series(x_vals, y_vals, baseline)
         elif self._x_mode == "trial":
-            x_vals = series.get("trials", [])
+            x_vals = downsampled.get("trials", [])
         elif self._x_mode == "trials_per_second":
-            x_vals = series.get("metrics", {}).get("trials_per_second", [])
+            x_vals = downsampled.get("metrics", {}).get("trials_per_second", [])
         return x_vals, y_vals
 
     def _refresh_lines(self) -> None:
@@ -473,14 +478,6 @@ class RealtimeBestPlotter:
         for key in _METRIC_KEYS:
             val = metrics.get(key)
             series.setdefault("metrics", {}).setdefault(key, []).append(val)
-            
-        # Limit points to avoid slowdown
-        if len(series["x"]) > self._max_points:
-            series["x"] = series["x"][-self._max_points:]
-            series["trials"] = series["trials"][-self._max_points:]
-            series["params"] = series["params"][-self._max_points:]
-            for key in _METRIC_KEYS:
-                series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
         # Update Plot Line (only if matplotlib _ax is available)
         if self._ax is not None:
@@ -531,13 +528,6 @@ class RealtimeBestPlotter:
         series.setdefault("params", []).append(f"trial={trial_number}")
         for key in _METRIC_KEYS:
             series.setdefault("metrics", {}).setdefault(key, []).append(metrics.get(key))
-            
-        if len(series["x"]) > self._max_points:
-            series["x"] = series["x"][-self._max_points:]
-            series["trials"] = series["trials"][-self._max_points:]
-            series["params"] = series["params"][-self._max_points:]
-            for key in _METRIC_KEYS:
-                series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
     def _redraw(self, force: bool = False) -> None:
         """Redraw plot if interval passed."""
@@ -615,7 +605,7 @@ class PlotlyRealtimePlotter:
         self._series = {}
         self._baseline_values = {}
         self._line_meta = {}
-        self._max_points = 300
+        self._max_render_points = 500  # Points per line for efficient rendering (no storage limit)
         self._lock = threading.Lock()
         self._opened = False
         self._last_options = {"indicator": [], "symbol": [], "timeframe": []}
@@ -845,15 +835,17 @@ class PlotlyRealtimePlotter:
         def build_figure(indicators, symbols, timeframes, y_metric, x_mode, band_metric, band_min, band_max, hidden, improving_mcc_only=False):
             from optimizer_utils import _METRIC_DEFS
             with self._lock:
-                series = {
-                    k: {
+                # Copy and downsample series for efficient rendering
+                series = {}
+                for k, v in self._series.items():
+                    full_series = {
                         "x": list(v.get("x", [])),
                         "metrics": {mk: list(mv) for mk, mv in v.get("metrics", {}).items()},
                         "params": list(v.get("params", [])),
                         "trials": list(v.get("trials", [])),
                     }
-                    for k, v in self._series.items()
-                }
+                    # Downsample for rendering efficiency
+                    series[k] = _downsample_series_for_plot(full_series, _METRIC_KEYS, self._max_render_points)
                 meta = dict(self._line_meta)
                 baselines = {k: dict(v) for k, v in self._baseline_values.items()}
 
@@ -1223,14 +1215,6 @@ class PlotlyRealtimePlotter:
                 val = metrics.get(key)
                 series.setdefault("metrics", {}).setdefault(key, []).append(val)
 
-            # Limit points to avoid slowdown
-            if len(series["x"]) > self._max_points:
-                series["x"] = series["x"][-self._max_points:]
-                series["trials"] = series["trials"][-self._max_points:]
-                series["params"] = series["params"][-self._max_points:]
-                for key in _METRIC_KEYS:
-                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
-
     def record_trial_progress(
         self,
         combo_label: str,
@@ -1255,13 +1239,6 @@ class PlotlyRealtimePlotter:
             series.setdefault("params", []).append(f"trial={trial_number}")
             for key in _METRIC_KEYS:
                 series.setdefault("metrics", {}).setdefault(key, []).append(metrics.get(key))
-
-            if len(series["x"]) > self._max_points:
-                series["x"] = series["x"][-self._max_points:]
-                series["trials"] = series["trials"][-self._max_points:]
-                series["params"] = series["params"][-self._max_points:]
-                for key in _METRIC_KEYS:
-                    series["metrics"][key] = series["metrics"][key][-self._max_points:]
 
     def shutdown(self):
         """Gracefully shutdown the plotter."""
