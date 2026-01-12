@@ -6,6 +6,7 @@ import sys
 import time
 import shutil
 import json
+import zipfile
 from pathlib import Path
 from data_manager import DataManager
 import optimize_indicator as optimize_module
@@ -56,6 +57,7 @@ BACKUP_DONE = False
 
 
 def backup_previous_outputs():
+    """Backup previous outputs to a timestamped zip file (one per session)."""
     global BACKUP_DONE
     if BACKUP_DONE:
         return
@@ -84,25 +86,11 @@ def backup_previous_outputs():
         backup_root.mkdir(parents=True, exist_ok=True)
     except Exception as e:
         raise
+    
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    backup_dir = backup_root / timestamp
-    try:
-        backup_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        raise
+    backup_zip_path = backup_root / f"{timestamp}.zip"
 
-    for path in existing_sources:
-        dest = backup_dir / path.name
-        try:
-            if path.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(path, dest)
-            else:
-                shutil.copy2(path, dest)
-        except Exception as e:
-            raise
-
+    # Collect run info before creating zip
     run_info = {}
     summary_dir = Path("optimized_outputs") / "summary"
     for name in ("unified_optimization_matrix.json", "unified_optimization_results.json"):
@@ -120,10 +108,7 @@ def backup_previous_outputs():
         "source_paths": [str(p) for p in existing_sources],
         "run": run_info,
     }
-    (backup_dir / "backup_info.json").write_text(
-        json.dumps(info_payload, indent=2, default=_json_safe_value),
-        encoding="utf-8"
-    )
+    info_json_content = json.dumps(info_payload, indent=2, default=_json_safe_value)
 
     info_lines = [
         "Backup info",
@@ -137,7 +122,29 @@ def backup_previous_outputs():
             info_lines.append(f"{key}: {value}")
     else:
         info_lines.append("No prior run config found in summary JSON.")
-    (backup_dir / "backup_info.txt").write_text("\n".join(info_lines), encoding="utf-8")
+    info_txt_content = "\n".join(info_lines)
+
+    # Create the zip file
+    try:
+        with zipfile.ZipFile(backup_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add backup info files
+            zf.writestr("backup_info.json", info_json_content)
+            zf.writestr("backup_info.txt", info_txt_content)
+            
+            # Add all source directories/files
+            for path in existing_sources:
+                if path.is_dir():
+                    for file_path in path.rglob("*"):
+                        if file_path.is_file():
+                            arcname = str(file_path)
+                            zf.write(file_path, arcname)
+                elif path.is_file():
+                    zf.write(path, str(path))
+        
+        print(f"[BACKUP] Created backup: {backup_zip_path}")
+    except Exception as e:
+        print(f"[ERROR] Failed to create backup zip: {e}")
+        raise
 
     BACKUP_DONE = True
 
