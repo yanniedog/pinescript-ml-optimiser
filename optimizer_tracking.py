@@ -97,7 +97,12 @@ class OptimizationProgressTracker:
             self.best_time = current_time
             self.best_trial_number = trial_number
             # Record first trial vs baseline
-            pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
+            # Handle zero/negative baseline: show absolute delta when % is undefined
+            if abs(self.baseline_objective) > 1e-9:
+                pct_vs_baseline = ((objective - self.baseline_objective) / abs(self.baseline_objective) * 100)
+            else:
+                # Baseline is ~0, use objective value directly as "improvement" indicator
+                pct_vs_baseline = objective * 100 if objective != 0 else 0
             avg_rate = pct_vs_baseline / elapsed if elapsed > 0 else 0
             # Store: (elapsed, objective, pct_vs_baseline, avg_rate, marginal_rate, params)
             self.improvement_history.append((elapsed, objective, pct_vs_baseline, avg_rate, 0, params.copy() if params else {}))
@@ -123,7 +128,12 @@ class OptimizationProgressTracker:
             old_best_trial = self.best_trial_number
             
             # Calculate improvement as % vs ORIGINAL CONFIG (baseline)
-            pct_vs_baseline = ((objective - self.baseline_objective) / self.baseline_objective * 100) if self.baseline_objective > 0 else 0
+            # Handle zero/negative baseline: show absolute delta when % is undefined
+            if abs(self.baseline_objective) > 1e-9:
+                pct_vs_baseline = ((objective - self.baseline_objective) / abs(self.baseline_objective) * 100)
+            else:
+                # Baseline is ~0, use objective value directly as "improvement" indicator
+                pct_vs_baseline = objective * 100 if objective != 0 else 0
             improvement_rate_pct = pct_vs_baseline / elapsed if elapsed > 0 else 0  # %/sec
             
             # Calculate marginal improvement as % of previous best, per second

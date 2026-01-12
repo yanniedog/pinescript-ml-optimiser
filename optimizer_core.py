@@ -574,6 +574,12 @@ class PineOptimizer:
         metrics_map["total_trials"] = self.trial_count
         metrics_map["trials_per_second"] = trials_per_second
         
+        # Compute objective_delta (difference from baseline)
+        if self._baseline_objective is not None:
+            metrics_map["objective_delta"] = avg_objective - self._baseline_objective
+        else:
+            metrics_map["objective_delta"] = 0.0
+        
         # Use complete metrics_map for trial progress tracking
         if self.realtime_plotter:
             self.realtime_plotter.record_trial_progress(
@@ -677,10 +683,16 @@ class PineOptimizer:
         
         if not progress_logged and (now - self._last_progress_log_time) >= self._progress_log_interval:
             best_trial = self.progress_tracker.best_trial_number
-            best_trial_str = f" | BEST: Trial {best_trial}" if best_trial is not None else ""
+            best_obj = self.progress_tracker.best_objective
+            best_obj_str = f"{best_obj:.4f}" if best_obj is not None else "N/A"
+            delta_str = ""
+            if self._baseline_objective is not None and best_obj is not None:
+                delta = best_obj - self._baseline_objective
+                delta_str = f" (Δ{delta:+.4f})"
             logger.info(
-                f"Trial {self.trial_count}: total={self.trial_count} | trials/sec={trials_per_second:.2f} | "
-                f"objective={avg_objective:.4f} | elapsed={elapsed_since_start:.1f}s{best_trial_str}"
+                f"Trial {self.trial_count}: trials/sec={trials_per_second:.2f} | "
+                f"best={best_obj_str}{delta_str} | this={avg_objective:.4f} | "
+                f"elapsed={elapsed_since_start:.1f}s | BEST: Trial {best_trial}"
             )
             self._last_progress_log_time = now
 
