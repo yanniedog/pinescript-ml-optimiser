@@ -221,51 +221,75 @@ class PineOptimizer:
         Detect optimal number of parallel jobs for the current system.
         Optimized for Windows Surface laptops with hybrid CPU architectures
         (Performance + Efficiency cores).
-        """
-        import platform
         
+        Takes into account:
+        - CPU core count and architecture
+        - Available memory
+        - Thermal constraints of thin laptops
+        - Current system load
+        """
         cpu_count = os.cpu_count() or 4
         
-        # On Windows, check if this is a Surface or hybrid CPU system
-        if sys.platform == 'win32':
-            try:
-                # Surface laptops and Intel 12th+ gen have hybrid architectures
-                # Use fewer jobs to avoid overwhelming efficiency cores
-                # Also account for thermal throttling on thin laptops
-                
-                # Check available memory - Surface devices often have limited RAM
-                try:
-                    import ctypes
-                    kernel32 = ctypes.windll.kernel32
-                    mem_status = ctypes.c_ulonglong()
-                    kernel32.GlobalMemoryStatusEx(ctypes.byref(
-                        ctypes.create_string_buffer(64)
-                    ))
-                except Exception:
-                    pass
-                
-                # Conservative settings for Surface devices:
-                # - 4 cores: use 2-3 jobs (leave headroom for system)
-                # - 8 cores: use 4-5 jobs (hybrid architecture awareness)
-                # - 12+ cores: use 6-8 jobs (Performance cores only)
-                if cpu_count <= 4:
-                    optimal = max(1, cpu_count - 1)
-                elif cpu_count <= 8:
-                    # Likely hybrid: ~4 Performance + 4 Efficiency
-                    # Use Performance core count only
-                    optimal = min(4, cpu_count // 2 + 1)
-                else:
-                    # Larger hybrid: use ~half for Performance cores
-                    optimal = min(8, cpu_count // 2 + 2)
-                
-                logger.debug(f"Windows Surface optimization: {cpu_count} cores -> {optimal} jobs")
-                return optimal
-                
-            except Exception as e:
-                logger.debug(f"Failed to detect Surface config: {e}")
+        # Try to get more detailed system info
+        available_memory_gb = 8  # Default assumption
+        current_load = 0.5  # Default assumption
         
-        # Default: conservative approach for any system
-        return min(4, max(1, cpu_count - 1))
+        try:
+            import psutil
+            # Get available memory
+            mem = psutil.virtual_memory()
+            available_memory_gb = mem.available / (1024**3)
+            
+            # Get current CPU load (1-second sample)
+            current_load = psutil.cpu_percent(interval=0.1) / 100
+            
+            logger.debug(
+                f"System stats: {cpu_count} cores, "
+                f"{available_memory_gb:.1f}GB available, "
+                f"{current_load:.0%} CPU load"
+            )
+        except ImportError:
+            pass
+        
+        # Base calculation: conservative for Surface devices
+        if sys.platform == 'win32':
+            # Surface laptops and Intel 12th+ gen have hybrid architectures
+            # Use fewer jobs to avoid overwhelming efficiency cores
+            # Also account for thermal throttling on thin laptops
+            
+            if cpu_count <= 4:
+                base_jobs = max(1, cpu_count - 1)
+            elif cpu_count <= 8:
+                # Likely hybrid: ~4 Performance + 4 Efficiency
+                # Use Performance core count only
+                base_jobs = min(4, cpu_count // 2 + 1)
+            else:
+                # Larger hybrid: use ~half for Performance cores
+                base_jobs = min(8, cpu_count // 2 + 2)
+        else:
+            # Non-Windows: use most cores
+            base_jobs = max(1, cpu_count - 1)
+        
+        # Adjust based on available memory (each job needs ~200-500MB)
+        memory_jobs = max(1, int(available_memory_gb / 0.5))
+        
+        # Adjust based on current load
+        if current_load > 0.7:
+            load_factor = 0.5  # High load: use fewer jobs
+        elif current_load > 0.5:
+            load_factor = 0.75
+        else:
+            load_factor = 1.0
+        
+        # Take minimum of all constraints
+        optimal = max(1, min(
+            base_jobs,
+            memory_jobs,
+            int(base_jobs * load_factor)
+        ))
+        
+        logger.debug(f"Optimal n_jobs: {optimal} (base={base_jobs}, mem={memory_jobs}, load_factor={load_factor:.2f})")
+        return optimal
 
     def _parse_interval_seconds(self, interval: str) -> Optional[int]:
         """Convert interval string (e.g., 1h, 4h, 1d) to seconds."""

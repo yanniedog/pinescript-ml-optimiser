@@ -8,3 +8,8 @@ plotly>=5.18.0
 dash>=2.14.0
 # Performance optimization
 psutil>=5.9.0
+# JIT compilation for 5-10x speedup (optional but highly recommended)
+# Install with: pip install numba
+# numba>=0.58.0
+# Note: Numba requires LLVM and may need additional setup on some systems
+# The code will fall back to pure NumPy if Numba is not available

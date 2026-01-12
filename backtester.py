@@ -2,6 +2,11 @@
 Walk-Forward Backtester
 Implements walk-forward cross-validation with no look-ahead bias.
 Calculates classification and reporting metrics for indicator optimization.
+
+Enhanced with:
+- Autocorrelation analysis for statistical validity
+- Regime-aware performance metrics
+- Effective sample size calculations
 """
 
 import numpy as np
@@ -16,6 +21,54 @@ from objective import calculate_objective_score
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+
+def calculate_autocorrelation(returns: np.ndarray, lag: int = 1) -> float:
+    """
+    Calculate autocorrelation of returns at specified lag.
+    
+    Args:
+        returns: Array of returns
+        lag: Lag for autocorrelation (default 1)
+    
+    Returns:
+        Autocorrelation coefficient
+    """
+    if len(returns) <= lag + 1:
+        return 0.0
+    
+    valid = ~np.isnan(returns)
+    if np.sum(valid) <= lag + 1:
+        return 0.0
+    
+    clean = returns[valid]
+    mean_r = np.mean(clean)
+    var_r = np.var(clean)
+    
+    if var_r == 0:
+        return 0.0
+    
+    cov = np.mean((clean[lag:] - mean_r) * (clean[:-lag] - mean_r))
+    return cov / var_r
+
+
+def calculate_effective_sample_size(n: int, autocorr_lag1: float) -> int:
+    """
+    Calculate effective sample size accounting for autocorrelation.
+    
+    Args:
+        n: Nominal sample size
+        autocorr_lag1: Lag-1 autocorrelation
+    
+    Returns:
+        Effective sample size
+    """
+    if abs(autocorr_lag1) < 0.01 or n < 10:
+        return n
+    
+    rho = max(-0.99, min(0.99, autocorr_lag1))
+    ess = n * (1 - rho) / (1 + rho)
+    return max(3, int(ess))
 
 
 class TradeDirection(Enum):
@@ -73,6 +126,10 @@ class BacktestMetrics:
     fn: int = 0
     mcc_threshold: float = 0.0
     trades: List[Trade] = field(default_factory=list)
+    # Statistical robustness metrics
+    autocorrelation_lag1: float = 0.0  # Return autocorrelation at lag 1
+    effective_sample_size: int = 0  # Adjusted for autocorrelation
+    regime_metrics: Dict = field(default_factory=dict)  # Performance by volatility regime
     
     def to_dict(self) -> Dict:
         return {
@@ -100,7 +157,10 @@ class BacktestMetrics:
             'tn': self.tn,
             'fp': self.fp,
             'fn': self.fn,
-            'mcc_threshold': self.mcc_threshold
+            'mcc_threshold': self.mcc_threshold,
+            'autocorrelation_lag1': self.autocorrelation_lag1,
+            'effective_sample_size': self.effective_sample_size,
+            'regime_metrics': self.regime_metrics
         }
 
 
@@ -402,6 +462,20 @@ class WalkForwardBacktester:
         # Average holding bars
         avg_holding = np.mean([t.holding_bars for t in all_trades]) if all_trades else 0
         
+        # Calculate autocorrelation of returns for statistical robustness
+        if returns:
+            returns_arr = np.array(returns)
+            autocorr = calculate_autocorrelation(returns_arr, lag=1)
+            eff_n = calculate_effective_sample_size(total_samples, autocorr)
+        else:
+            autocorr = 0.0
+            eff_n = total_samples
+        
+        # Calculate regime-aware metrics
+        regime_metrics = self._calculate_regime_metrics(
+            indicator_result, all_trades, median_horizon, use_discrete_signals
+        )
+        
         return BacktestMetrics(
             total_trades=total_trades,
             winning_trades=winning_trades,
@@ -428,7 +502,10 @@ class WalkForwardBacktester:
             fp=total_fp,
             fn=total_fn,
             mcc_threshold=float(np.median([t for t in fold_thresholds if t is not None])) if fold_thresholds and any(t is not None for t in fold_thresholds) else 0.0,
-            trades=all_trades
+            trades=all_trades,
+            autocorrelation_lag1=autocorr,
+            effective_sample_size=eff_n,
+            regime_metrics=regime_metrics
         )
 
     def _calculate_consistency_score(self, fold_metrics: List[BacktestMetrics]) -> float:
@@ -1030,6 +1107,80 @@ class WalkForwardBacktester:
             mcc_threshold=classification_threshold,
             trades=trades
         )
+    
+    def _calculate_regime_metrics(
+        self,
+        indicator_result: IndicatorResult,
+        trades: List[Trade],
+        horizon: int,
+        use_discrete_signals: bool
+    ) -> Dict:
+        """
+        Calculate performance metrics for different volatility regimes.
+        
+        Helps identify if indicator performance is regime-dependent.
+        """
+        if len(trades) < 20:  # Not enough trades for regime analysis
+            return {}
+        
+        # Calculate rolling volatility for regime detection
+        returns = np.diff(self.close) / self.close[:-1]
+        returns = np.concatenate([[0], returns])  # Pad to match length
+        
+        window = min(20, len(returns) // 10)
+        if window < 5:
+            return {}
+        
+        # Rolling volatility (annualized)
+        rolling_vol = np.empty(len(returns))
+        rolling_vol[:window] = np.nan
+        for i in range(window, len(returns)):
+            rolling_vol[i] = np.std(returns[i-window:i]) * np.sqrt(8760 / max(1, horizon))
+        
+        # Define volatility regimes using percentiles
+        valid_vol = rolling_vol[~np.isnan(rolling_vol)]
+        if len(valid_vol) < 20:
+            return {}
+        
+        low_thresh = np.percentile(valid_vol, 33)
+        high_thresh = np.percentile(valid_vol, 67)
+        
+        # Classify trades by regime
+        regime_trades = {'low_vol': [], 'med_vol': [], 'high_vol': []}
+        
+        for trade in trades:
+            if trade.entry_bar >= len(rolling_vol):
+                continue
+            
+            vol = rolling_vol[trade.entry_bar]
+            if np.isnan(vol):
+                continue
+            
+            if vol <= low_thresh:
+                regime_trades['low_vol'].append(trade)
+            elif vol <= high_thresh:
+                regime_trades['med_vol'].append(trade)
+            else:
+                regime_trades['high_vol'].append(trade)
+        
+        # Calculate metrics for each regime
+        regime_metrics = {}
+        for regime, regime_list in regime_trades.items():
+            if len(regime_list) < 5:
+                continue
+            
+            regime_returns = [t.return_pct for t in regime_list]
+            winning = [t for t in regime_list if t.return_pct > 0]
+            
+            regime_metrics[regime] = {
+                'n_trades': len(regime_list),
+                'win_rate': len(winning) / len(regime_list),
+                'avg_return': float(np.mean(regime_returns)),
+                'total_return': float(sum(regime_returns)),
+                'sharpe': float(np.mean(regime_returns) / np.std(regime_returns)) if np.std(regime_returns) > 0 else 0.0
+            }
+        
+        return regime_metrics
     
     def calculate_objective(self, metrics: BacktestMetrics) -> float:
         """
