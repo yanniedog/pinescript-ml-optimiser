@@ -1112,7 +1112,7 @@ class PlotlyRealtimePlotter:
             timeframes = set(timeframes or [])
             if y_metric not in _METRIC_DEFS:
                 y_metric = self._default_y_metric
-            if x_mode not in ("elapsed", "rate", "trial"):
+            if x_mode not in ("elapsed", "rate", "trial", "trials_per_second"):
                 x_mode = self._default_x_mode
             if band_metric not in _METRIC_DEFS:
                 band_metric = None
@@ -1169,6 +1169,37 @@ class PlotlyRealtimePlotter:
                     baseline_val = baselines.get(label, {}).get(y_metric)
                     x_vals = _compute_rate_series(x_vals, y_vals, baseline_val)
 
+                # Filter out None values and ensure matching lengths
+                # First ensure params_vals matches the current x_vals length
+                if len(params_vals) < len(x_vals):
+                    params_vals = params_vals + ["N/A"] * (len(x_vals) - len(params_vals))
+                elif len(params_vals) > len(x_vals):
+                    params_vals = params_vals[:len(x_vals)]
+                
+                if x_mode == "rate":
+                    # For rate mode, filter pairs where either x or y is None
+                    filtered_triples = [(x, y, p) for x, y, p in zip(x_vals, y_vals, params_vals) if x is not None and y is not None]
+                    if not filtered_triples:
+                        continue
+                    x_vals, y_vals, params_vals = zip(*filtered_triples)
+                    x_vals = list(x_vals)
+                    y_vals = list(y_vals)
+                    params_vals = list(params_vals)
+                else:
+                    # For other modes, ensure lengths match and filter None values
+                    min_len = min(len(x_vals), len(y_vals), len(params_vals))
+                    x_vals = x_vals[:min_len]
+                    y_vals = y_vals[:min_len]
+                    params_vals = params_vals[:min_len]
+                    # Filter out pairs where y is None (x can be 0 or any number)
+                    filtered_triples = [(x, y, p) for x, y, p in zip(x_vals, y_vals, params_vals) if y is not None]
+                    if not filtered_triples:
+                        continue
+                    x_vals, y_vals, params_vals = zip(*filtered_triples)
+                    x_vals = list(x_vals)
+                    y_vals = list(y_vals)
+                    params_vals = list(params_vals)
+
                 if x_mode == "rate":
                     x_label = "rate_per_s"
                 elif x_mode == "trial":
@@ -1202,6 +1233,8 @@ class PlotlyRealtimePlotter:
                 x_title = f"Improvement rate ({_metric_label(y_metric)} / s)"
             elif x_mode == "trial":
                 x_title = "Trial #"
+            elif x_mode == "trials_per_second":
+                x_title = "Trials/sec (running rate)"
             else:
                 x_title = "Elapsed (s)"
             fig.update_layout(
