@@ -318,7 +318,7 @@ class WalkForwardBacktester:
         total_pos = sum(m.positive_labels for m in fold_metrics)
         total_neg = sum(m.negative_labels for m in fold_metrics)
         
-        if total_trades == 0 and total_samples == 0:
+        if total_trades == 0 or total_samples == 0:
             return BacktestMetrics()
         
         # Calculate returns
@@ -841,14 +841,14 @@ class WalkForwardBacktester:
             prev_signal[0] = 0
             
             # Enter on signal crossing threshold
-            threshold = 0.3
+            trading_threshold = 0.3
             
             for i in range(len(signal)):
                 bar = test_start + i
                 exit_bar = bar + horizon
                 
                 # Long entry
-                if signal[i] > threshold and prev_signal[i] <= threshold:
+                if signal[i] > trading_threshold and prev_signal[i] <= trading_threshold:
                     trades.append(Trade(
                         entry_bar=bar,
                         exit_bar=exit_bar,
@@ -858,7 +858,7 @@ class WalkForwardBacktester:
                     ))
                 
                 # Short entry
-                if signal[i] < -threshold and prev_signal[i] >= -threshold:
+                if signal[i] < -trading_threshold and prev_signal[i] >= -trading_threshold:
                     trades.append(Trade(
                         entry_bar=bar,
                         exit_bar=exit_bar,
@@ -912,10 +912,10 @@ class WalkForwardBacktester:
         else:
             sig = indicator_result.combined_signal[test_start:effective_end]
             # Use consistent threshold (0.1) for both correct and total_sigs
-            threshold = 0.1
-            correct = np.sum(((sig > threshold) & (test_returns > 0) & valid_mask) | 
-                           ((sig < -threshold) & (test_returns < 0) & valid_mask))
-            total_sigs = np.sum(((sig > threshold) | (sig < -threshold)) & valid_mask)
+            trading_threshold = 0.1
+            correct = np.sum(((sig > trading_threshold) & (test_returns > 0) & valid_mask) | 
+                           ((sig < -trading_threshold) & (test_returns < 0) & valid_mask))
+            total_sigs = np.sum(((sig > trading_threshold) | (sig < -trading_threshold)) & valid_mask)
             directional_accuracy = correct / total_sigs if total_sigs > 0 else 0.5
         
         # Safety clamp: accuracy should be between 0 and 1
