@@ -15,6 +15,7 @@ import socket
 import webbrowser
 import re
 import os
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Callable, Optional, Tuple
 from dataclasses import dataclass, field
@@ -2210,6 +2211,28 @@ class PineOptimizer:
         """Filter parameters to only those worth optimizing."""
         return get_optimizable_params(self.parameters)
     
+    def _adjust_max_for_step(self, min_val: float, max_val: float, step: Optional[float]) -> float:
+        """
+        Adjust max value to be compatible with step size.
+        
+        For Optuna distributions, the range must be divisible by step.
+        Calculates: adjusted_max = min_val + floor((max_val - min_val) / step) * step
+        
+        Args:
+            min_val: Minimum value
+            max_val: Maximum value
+            step: Step size (None means no step constraint)
+            
+        Returns:
+            Adjusted maximum value that is compatible with the step
+        """
+        if step is None or step == 0:
+            return max_val
+        
+        n = math.floor((max_val - min_val) / step)
+        adjusted_max = min_val + n * step
+        return adjusted_max
+    
     def _suggest_param(self, trial: optuna.Trial, param: Parameter) -> Any:
         """Suggest a value for a parameter using Optuna."""
         min_val, max_val, step = param.get_search_space()
@@ -2217,9 +2240,13 @@ class PineOptimizer:
         if param.param_type == 'bool':
             return trial.suggest_categorical(param.name, [True, False])
         elif param.param_type == 'int':
-            return trial.suggest_int(param.name, int(min_val), int(max_val), step=int(step) if step else 1)
+            step_int = int(step) if step else 1
+            adjusted_max = int(self._adjust_max_for_step(float(min_val), float(max_val), float(step_int)))
+            return trial.suggest_int(param.name, int(min_val), adjusted_max, step=step_int)
         else:  # float
-            return trial.suggest_float(param.name, float(min_val), float(max_val), step=float(step) if step else None)
+            step_float = float(step) if step else None
+            adjusted_max = self._adjust_max_for_step(float(min_val), float(max_val), step_float)
+            return trial.suggest_float(param.name, float(min_val), adjusted_max, step=step_float)
     
     def _evaluate_symbol(self, key: Any, params: Dict[str, Any]) -> Tuple[Any, Optional[BacktestMetrics], Optional[float]]:
         """
