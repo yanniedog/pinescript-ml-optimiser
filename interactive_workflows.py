@@ -388,7 +388,7 @@ def run_batch_optimization(dm: DataManager):
         print(f"  - Time per indicator: {per_indicator_minutes:.1f} minute(s)")
         print(f"  - Total time (all indicators): {total_seconds/60:.1f} minute(s)")
     print(f"  - Trials: unlimited (will run as many as possible until time limit)")
-    print(f"  - Early stop: disabled (uses full timeout per indicator)")
+    print(f"  - Early stop: enabled (stall detection active)")
     print(f"  - Press Q anytime to stop early and use current best results")
     
     customize = input("\nCustomize data settings (timeframe, symbols)? [n]: ").strip().lower()
@@ -413,10 +413,14 @@ def run_batch_optimization(dm: DataManager):
         print("="*70)
 
         indicator_timeout = per_indicator_budgets[i - 1]
+        # Calculate adaptive stall settings based on indicator timeout
+        min_runtime = min(30, indicator_timeout // 4)  # At least 30s or 1/4 of timeout
+        stall_time = min(60, indicator_timeout // 3)   # Stall after 60s or 1/3 of timeout without improvement
+        
         options['timeout'] = indicator_timeout
-        options['min_runtime_seconds'] = indicator_timeout
-        options['stall_seconds'] = indicator_timeout + 1
-        options['improvement_rate_floor'] = 0.0
+        options['min_runtime_seconds'] = min_runtime
+        options['stall_seconds'] = stall_time
+        options['improvement_rate_floor'] = 0.01  # 0.01%/s minimum improvement rate
         
         original_argv = sys.argv
         try:
@@ -707,8 +711,8 @@ def run_matrix_optimization(dm: DataManager):
     else:
         print(f"  - Time per combo: {per_combo_minutes:.1f} minute(s)")
         print(f"  - Total time (all combos): {total_seconds/60:.1f} minute(s)")
-    print(f"  - Trials: unlimited (runs until time limit per combo)")
-    print(f"  - Early stop: disabled (uses full timeout per combo)")
+    print(f"  - Trials: unlimited (runs until time limit or stall)")
+    print(f"  - Early stop: enabled (stall detection active)")
     print(f"  - Press Q anytime to stop early and use current best results")
 
     total_combo_entries = list(zip(combos, per_combo_budgets))
@@ -770,13 +774,18 @@ def run_matrix_optimization(dm: DataManager):
 
         combo_label = f"{parse_result.indicator_name or pine_file.stem}:{symbol}@{interval}"
 
+        # Calculate adaptive stall settings based on combo timeout
+        # Use reasonable minimums to allow stall detection to work
+        min_runtime = min(30, combo_timeout // 4)  # At least 30s or 1/4 of timeout
+        stall_time = min(60, combo_timeout // 3)   # Stall after 60s or 1/3 of timeout without improvement
+        
         run_kwargs = {
             "interval": interval,
             "max_trials": None,
             "timeout_seconds": combo_timeout,
-            "min_runtime_seconds": combo_timeout,
-            "stall_seconds": combo_timeout + 1,
-            "improvement_rate_floor": 0.0,
+            "min_runtime_seconds": min_runtime,
+            "stall_seconds": stall_time,
+            "improvement_rate_floor": 0.01,  # 0.01%/s minimum improvement rate
             "indicator_label": combo_label,
         }
         apply_trial_overrides(run_kwargs)

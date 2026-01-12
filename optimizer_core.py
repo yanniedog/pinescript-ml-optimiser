@@ -774,13 +774,40 @@ class PineOptimizer:
         self.last_improvement_trial = None
         study = None
         if self.optimizable_params:
+            # Estimate search space size to adjust sampler settings
+            estimated_space_size = 1
+            for p in self.optimizable_params:
+                min_val, max_val, step = p.get_search_space()
+                if step and step > 0:
+                    estimated_space_size *= max(1, int((max_val - min_val) / step) + 1)
+                else:
+                    estimated_space_size *= 100  # Assume ~100 steps for continuous
+            
+            logger.info(f"Estimated parameter space size: {estimated_space_size:,} combinations")
+            
+            # Adjust n_startup_trials based on search space size
+            # For small spaces, use more random exploration to avoid premature convergence
+            adaptive_startup = self.n_startup_trials
+            if estimated_space_size < 500:
+                adaptive_startup = max(self.n_startup_trials, min(50, estimated_space_size // 5))
+            elif estimated_space_size < 5000:
+                adaptive_startup = max(self.n_startup_trials, min(30, estimated_space_size // 10))
+            
+            if adaptive_startup != self.n_startup_trials:
+                logger.info(f"Adjusted startup trials: {self.n_startup_trials} -> {adaptive_startup} (small search space)")
+            
             # Create Optuna study with requested sampler
             if self.sampler_name.lower() == "random":
                 sampler = optuna.samplers.RandomSampler(seed=42)
             else:
+                # Use multivariate TPE for better parameter correlation modeling
+                # This helps when parameters interact (like fast/slow periods)
                 sampler = optuna.samplers.TPESampler(
-                    n_startup_trials=self.n_startup_trials,
-                    seed=42
+                    n_startup_trials=adaptive_startup,
+                    seed=42,
+                    multivariate=True,  # Model parameter correlations
+                    consider_endpoints=True,  # Include boundary values in probability model
+                    constant_liar=True  # Better for parallel execution
                 )
             
             pruner = optuna.pruners.MedianPruner(
@@ -803,22 +830,69 @@ class PineOptimizer:
                     study.stop()
                 if self.early_stop_patience is not None and self.last_improvement_trial is not None:
                     if (trial.number - self.last_improvement_trial) >= self.early_stop_patience:
+                        logger.info(f"Early stop: No improvement for {self.early_stop_patience} trials (patience reached)")
                         study.stop()
                 if self.last_improvement_time is not None:
                     elapsed = time.time() - self.start_time if self.start_time else 0
+                    time_since_improvement = time.time() - self.last_improvement_time
+                    
                     if elapsed >= self.min_runtime_seconds:
-                        if (time.time() - self.last_improvement_time) >= self.stall_seconds:
+                        # Primary stall check: no improvement for stall_seconds
+                        if time_since_improvement >= self.stall_seconds:
+                            # Calculate what percentage of parameter space we've explored
+                            # For small search spaces, stop earlier
+                            n_params = len(self.optimizable_params)
+                            estimated_space_size = 1
+                            for p in self.optimizable_params:
+                                min_val, max_val, step = p.get_search_space()
+                                if step and step > 0:
+                                    estimated_space_size *= max(1, int((max_val - min_val) / step) + 1)
+                                else:
+                                    estimated_space_size *= 100  # Assume ~100 steps for continuous
+                            
+                            # If we've explored a significant portion of the search space, stop
+                            exploration_ratio = self.trial_count / max(1, estimated_space_size)
+                            
+                            # Stop conditions (any triggers stop):
+                            # 1. Explored >30% of search space with no improvement
+                            # 2. Stalled for 3x the stall_seconds
+                            # 3. Rate-based stall (original logic, as fallback)
+                            
+                            if exploration_ratio >= 0.30:
+                                logger.info(
+                                    f"Stall stop: Explored {exploration_ratio:.1%} of search space "
+                                    f"({self.trial_count}/{estimated_space_size} combos) with no improvement "
+                                    f"for {time_since_improvement:.1f}s"
+                                )
+                                study.stop()
+                                return
+                            
+                            if time_since_improvement >= self.stall_seconds * 3:
+                                logger.info(
+                                    f"Stall stop: No improvement for {time_since_improvement:.1f}s "
+                                    f"(3x stall_seconds={self.stall_seconds}s)"
+                                )
+                                study.stop()
+                                return
+                            
+                            # Rate-based fallback check
                             avg_rate, moving_avg, peak_rate = self._get_improvement_rate_stats()
                             if avg_rate is None or peak_rate is None:
+                                logger.info(f"Stall stop: No improvement rates available after {time_since_improvement:.1f}s")
                                 study.stop()
                                 return
                             
                             threshold = max(self.improvement_rate_floor, 0.2 * peak_rate)
                             if moving_avg is None or moving_avg < threshold:
+                                logger.info(
+                                    f"Stall stop: Moving avg rate {moving_avg:.4f}%/s < threshold {threshold:.4f}%/s"
+                                )
                                 study.stop()
             
             # Run optimization
             try:
+                # Always register the stop_callback - it handles early stop, stall detection, etc.
+                # (not just keyboard monitoring)
                 study.optimize(
                     self._objective,
                     n_trials=self.max_trials,
@@ -826,7 +900,7 @@ class PineOptimizer:
                     n_jobs=self.n_jobs,
                     show_progress_bar=False,
                     catch=(Exception,),
-                    callbacks=[stop_callback] if self.keyboard_monitor else None
+                    callbacks=[stop_callback]
                 )
             finally:
                 # Stop keyboard monitor
