@@ -58,8 +58,17 @@ def main_menu():
 """)
         print("  Enter 'B' at any prompt to return to the previous menu (main menu only).")
         try:
-            user_input = input("  Select option: ")
-            choice = user_input.strip().lower() if user_input else ""
+            user_input = input("  Select option: ").strip()
+            # Handle empty input
+            if not user_input:
+                print("\n  [ERROR] Please enter a valid option (1-6 or Q).")
+                continue
+            
+            choice = user_input.lower()
+            
+            # Debug: Show what was received (can be removed later)
+            # print(f"  [DEBUG] Received input: '{user_input}' -> choice: '{choice}'")
+            
         except GoBack:
             print("  [INFO] Already at the main menu.")
             continue
@@ -71,7 +80,7 @@ def main_menu():
             if isinstance(e, (EOFError, KeyboardInterrupt)):
                 print("\n\nExiting...")
                 break
-            print(f"\n  [ERROR] Unexpected error: {e}")
+            print(f"\n  [ERROR] Unexpected error reading input: {e}")
             import traceback
             traceback.print_exc()
             continue
@@ -87,6 +96,7 @@ def main_menu():
             elif choice == '4':
                 run_batch_optimization(dm)
             elif choice == '5':
+                print("\n  [INFO] Starting matrix optimization...")
                 run_matrix_optimization(dm)
             elif choice == '6':
                 configure_trial_controls()
@@ -94,9 +104,13 @@ def main_menu():
                 print("\nGoodbye!")
                 break
             else:
-                print("\n  [ERROR] Invalid option. Please enter 1, 2, 3, 4, 5, or Q.")
+                print(f"\n  [ERROR] Invalid option '{choice}'. Please enter 1, 2, 3, 4, 5, 6, or Q.")
+                print(f"  (You entered: '{user_input}' -> processed as: '{choice}')")
+        except GoBack:
+            # GoBack should be handled by decorators, but catch it here just in case
+            print("\n  [INFO] Returning to main menu.")
         except Exception as e:
-            print(f"\n  [ERROR] Error executing option {choice}: {e}")
+            print(f"\n  [ERROR] Error executing option '{choice}': {e}")
             import traceback
             traceback.print_exc()
 

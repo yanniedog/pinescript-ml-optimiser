@@ -2,6 +2,31 @@
 
 This directory contains setup scripts to run the Pine Script ML Optimizer on Kaggle cloud computing.
 
+## Python Version Requirements
+
+**Recommended Python Version: 3.8 - 3.11**
+
+The project is designed to work with Python 3.8 through 3.11. Python 3.12 is supported but some packages (like `talib-binary` and `pickle5`) will be automatically skipped.
+
+### How to Set Python Version in Kaggle
+
+1. **In Kaggle Notebooks:**
+   - Go to **Settings** (gear icon in the right sidebar)
+   - Under **Environment**, find **Python version**
+   - Select your desired version (recommended: **3.10** or **3.11**)
+   - Click **Save**
+
+2. **In Kaggle Code:**
+   - Add this at the top of your notebook to check/verify Python version:
+   ```python
+   import sys
+   print(f"Python version: {sys.version}")
+   ```
+
+3. **Alternative: Use a specific Python version in code:**
+   - Kaggle notebooks default to Python 3.10, but you can request a different version
+   - Note: Kaggle may have limited Python version options available
+
 ## Quick Start
 
 ### Option 1: Python Script (Recommended for Kaggle)

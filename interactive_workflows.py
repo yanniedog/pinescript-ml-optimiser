@@ -879,6 +879,10 @@ def run_batch_optimization(dm: DataManager):
 @handle_go_back("[INFO] Returning to main menu.")
 def run_matrix_optimization(dm: DataManager):
     """Run optimization independently for each indicator-symbol-timeframe combination."""
+    print("\n" + "="*70)
+    print("  MATRIX OPTIMIZATION MODE")
+    print("  Optimize all indicators per symbol/timeframe combination")
+    print("="*70)
     print("\n  Enter 'B' at any prompt to return to the previous menu.")
     backup_previous_outputs()
     generated = maybe_generate_all_indicators()
