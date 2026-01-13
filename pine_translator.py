@@ -257,6 +257,16 @@ class PineTranslator:
         else:
             # Generic indicator - use signal detection
             return self._run_generic_indicator()
+
+    @staticmethod
+    def _normalize_signal_causal(values: np.ndarray) -> np.ndarray:
+        """Causally normalize a signal using an expanding max of absolute values."""
+        abs_vals = np.abs(values)
+        abs_vals = np.nan_to_num(abs_vals, nan=0.0, posinf=0.0, neginf=0.0)
+        running_max = np.maximum.accumulate(abs_vals)
+        running_max = np.where(running_max > 0, running_max, 1.0)
+        normalized = values / running_max
+        return np.clip(normalized, -1.0, 1.0)
     
     def _run_mfv_indicator(self) -> IndicatorResult:
         """
@@ -287,15 +297,20 @@ class PineTranslator:
         else:
             mf_volume = raw_mf_volume
         
-        # Cumulative MFV for each range
+        # Cumulative MFV for each range - vectorized implementation
         def calc_cum_mfv(mfv, bar_range):
-            result = np.zeros(len(mfv))
-            for i in range(len(mfv)):
-                if i == 0:
-                    result[i] = mfv[i]
-                else:
-                    subtract = mfv[i - bar_range] if i >= bar_range else 0
-                    result[i] = result[i-1] + mfv[i] - subtract
+            """Calculate cumulative MFV over a rolling window - vectorized."""
+            # Use cumsum for efficiency: rolling sum = cumsum[i] - cumsum[i - bar_range]
+            cumsum = np.cumsum(mfv)
+            result = cumsum.copy()
+            
+            # Subtract the cumsum from bar_range positions ago
+            if bar_range < len(mfv):
+                # For positions >= bar_range, subtract cumsum[i - bar_range]
+                shifted = np.zeros_like(cumsum)
+                shifted[bar_range:] = cumsum[:-bar_range]
+                result = cumsum - shifted
+            
             return result
         
         def normalize_zscore(data, window):
@@ -327,12 +342,8 @@ class PineTranslator:
         buy_signals = ta.crossover(combined_mfv, np.zeros_like(combined_mfv))
         sell_signals = ta.crossunder(combined_mfv, np.zeros_like(combined_mfv))
         
-        # Normalize combined signal to -1 to 1
-        max_val = np.nanmax(np.abs(combined_mfv))
-        if max_val > 0:
-            combined_signal = combined_mfv / max_val
-        else:
-            combined_signal = np.zeros_like(combined_mfv)
+        # Normalize combined signal to -1 to 1 using causal scaling
+        combined_signal = self._normalize_signal_causal(combined_mfv)
         
         return IndicatorResult(
             main_values=combined_mfv,
@@ -447,20 +458,33 @@ class PineTranslator:
         buy_setup = (gauge_c <= buy_level) & is_local_min & (lwcp_reversing_up | gauge_recovering)
         sell_setup = (gauge_c >= sell_level) & is_local_max & (lwcp_reversing_down | gauge_rolling_over)
         
-        # Apply cooldown
+        # Apply cooldown - optimized with numpy operations
+        # First, find all potential signal edges (where setup transitions from False to True)
+        buy_edges = buy_setup & ~np.roll(buy_setup, 1)
+        buy_edges[0] = buy_setup[0]  # Handle first bar
+        sell_edges = sell_setup & ~np.roll(sell_setup, 1)
+        sell_edges[0] = sell_setup[0]
+        
+        # Apply cooldown filter using numba-style iteration (faster than pure Python)
         buy_signals = np.zeros(len(gauge_c), dtype=bool)
         sell_signals = np.zeros(len(gauge_c), dtype=bool)
         
-        last_buy = -cooldown_bars - 1
-        last_sell = -cooldown_bars - 1
+        buy_edge_indices = np.where(buy_edges)[0]
+        sell_edge_indices = np.where(sell_edges)[0]
         
-        for i in range(1, len(gauge_c)):
-            if buy_setup[i] and not buy_setup[i-1] and (i - last_buy >= cooldown_bars):
-                buy_signals[i] = True
-                last_buy = i
-            if sell_setup[i] and not sell_setup[i-1] and (i - last_sell >= cooldown_bars):
-                sell_signals[i] = True
-                last_sell = i
+        # Filter buy signals with cooldown
+        last_buy = -cooldown_bars - 1
+        for idx in buy_edge_indices:
+            if idx - last_buy >= cooldown_bars:
+                buy_signals[idx] = True
+                last_buy = idx
+        
+        # Filter sell signals with cooldown  
+        last_sell = -cooldown_bars - 1
+        for idx in sell_edge_indices:
+            if idx - last_sell >= cooldown_bars:
+                sell_signals[idx] = True
+                last_sell = idx
         
         # Normalize gauge to -1 to 1
         combined_signal = gauge_c / 100.0
@@ -524,6 +548,15 @@ class PineTranslator:
             mom_len = self._get_param('length', 'len', 'period', 'lookback', default=14, param_type='int')
             main_values = ta.roc(self.close, mom_len)
         
+        # Apply optional smoothing/scaling if present
+        smooth_len = self._get_param('smooth_len', 'smoothLen', 'smooth', default=None, param_type='int')
+        if smooth_len is not None and smooth_len > 1:
+            main_values = ta.sma(main_values, int(smooth_len))
+
+        scale_mult = self._get_param('scale_mult', 'scaleMult', 'scale', default=None, param_type='float')
+        if scale_mult is not None:
+            main_values = main_values * float(scale_mult)
+
         # Generate signals based on signal type
         if signal_info.signal_type == SignalType.THRESHOLD:
             buy_level = signal_info.threshold_levels.get('buy', -20)
@@ -536,12 +569,8 @@ class PineTranslator:
             buy_signals = ta.crossover(main_values, zero_line)
             sell_signals = ta.crossunder(main_values, zero_line)
         
-        # Normalize
-        max_val = np.nanmax(np.abs(main_values))
-        if max_val > 0:
-            combined_signal = np.clip(main_values / max_val, -1, 1)
-        else:
-            combined_signal = np.zeros(self.length)
+        # Normalize using causal scaling (avoids global lookahead)
+        combined_signal = self._normalize_signal_causal(main_values)
         
         return IndicatorResult(
             main_values=main_values,
@@ -601,4 +630,3 @@ if __name__ == "__main__":
         print(f"Sell signals: {np.sum(indicator_result.sell_signals)}")
     else:
         print("Usage: python pine_translator.py <pine_script_file>")
-

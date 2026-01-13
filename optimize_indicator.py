@@ -3,7 +3,7 @@
 Pine Script Indicator ML Optimizer
 
 Optimizes Pine Script indicator parameters using Bayesian optimization
-with walk-forward validation to maximize leading indicator profitability.
+with walk-forward validation to maximize MCC with a ROC AUC constraint.
 
 Usage:
     python optimize_indicator.py <pine_script_file> [options]
@@ -28,8 +28,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from data_manager import DataManager, SYMBOLS
 from pine_parser import parse_pine_script
-from optimizer import optimize_indicator
+from optimizer import optimize_indicator, get_optimizable_params
 from output_generator import generate_outputs
+from screen_log import enable_screen_log
 
 # Configure logging
 logging.basicConfig(
@@ -38,7 +39,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_OPTIMIZATION_STRATEGY = "multi_fidelity"
+DEFAULT_OPTIMIZATION_STRATEGY = "tpe"
 
 LAST_RESULT = None
 LAST_OUTPUTS = None
@@ -67,6 +68,8 @@ def main():
     LAST_RESULT = None
     LAST_OUTPUTS = None
     LAST_PINE_PATH = None
+
+    enable_screen_log()
 
     parser = argparse.ArgumentParser(
         description='Optimize Pine Script indicator parameters using ML',
@@ -123,6 +126,47 @@ Examples:
         action='store_true',
         help='Enable verbose logging'
     )
+    parser.add_argument(
+        '--min-runtime-seconds',
+        type=int,
+        default=None,
+        help='Minimum runtime before early-stop checks (default: optimizer setting)'
+    )
+    parser.add_argument(
+        '--stall-seconds',
+        type=int,
+        default=None,
+        help='Stop if no improvement for this many seconds (default: optimizer setting)'
+    )
+    parser.add_argument(
+        '--improvement-rate-floor',
+        type=float,
+        default=None,
+        help='Minimum improvement rate to continue (default: optimizer setting)'
+    )
+    parser.add_argument(
+        '--n-jobs',
+        type=int,
+        default=None,
+        help='Number of parallel jobs for trial execution (default: auto, min(4, cpu_count()))'
+    )
+    parser.add_argument(
+        '--fast-evaluation',
+        action='store_true',
+        help='Use reduced forecast horizons for faster evaluation during optimization'
+    )
+    parser.add_argument(
+        '--holdout-ratio',
+        type=float,
+        default=0.2,
+        help='Fraction of data reserved for lockbox evaluation (0 disables). Default: 0.2'
+    )
+    parser.add_argument(
+        '--holdout-gap-bars',
+        type=int,
+        default=None,
+        help='Purge gap between optimization and holdout in bars (default: auto)'
+    )
     
     args = parser.parse_args()
     
@@ -132,6 +176,10 @@ Examples:
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.holdout_ratio < 0 or args.holdout_ratio >= 0.9:
+        print("Error: --holdout-ratio must be between 0 and 0.9.")
+        sys.exit(1)
     
     # Validate input file
     pine_path = Path(args.pine_script)
@@ -245,19 +293,35 @@ Examples:
             # Multi-timeframe: {symbol: {timeframe: DataFrame}}
             data = {}
             for symbol in symbols:
-                data[symbol] = {}
+                symbol_data = {}
                 for interval in intervals:
                     if dm.symbol_exists(symbol, interval):
                         try:
-                            data[symbol][interval] = dm.load_symbol(symbol, interval)
-                            print(f"   [OK] {symbol} @ {interval}: {len(data[symbol][interval]):,} candles")
+                            symbol_data[interval] = dm.load_symbol(symbol, interval)
+                            print(f"   [OK] {symbol} @ {interval}: {len(symbol_data[interval]):,} candles")
                         except Exception as e:
                             print(f"   [WARN] Failed to load {symbol} @ {interval}: {e}")
+                # Only add symbol to data if at least one timeframe was successfully loaded
+                if symbol_data:
+                    data[symbol] = symbol_data
         
+        # Validation: check if data is empty or (for multi-timeframe) all nested dicts are empty
         if not data:
             print(f"Error: No historical data available for interval(s) '{args.interval}'.")
             print(f"       Run the interactive mode to download data first.")
             sys.exit(1)
+        
+        # Additional check for multi-timeframe: ensure at least one symbol has non-empty timeframes
+        if len(intervals) > 1:
+            has_valid_data = False
+            for symbol, timeframes_dict in data.items():
+                if timeframes_dict:
+                    has_valid_data = True
+                    break
+            if not has_valid_data:
+                print(f"Error: No historical data available for interval(s) '{args.interval}'.")
+                print(f"       Run the interactive mode to download data first.")
+                sys.exit(1)
         
         # Step 2: Parse Pine Script
         print_step(2, total_steps, "Parsing Pine Script parameters...")
@@ -280,25 +344,52 @@ Examples:
             print(f"   Buy signals: {signal_info.buy_conditions}")
         if signal_info.sell_conditions:
             print(f"   Sell signals: {signal_info.sell_conditions}")
+
+        optimizable_params = get_optimizable_params(parse_result.parameters)
+        if len(optimizable_params) < 2:
+            reason = (
+                f"Skipping optimization: only {len(optimizable_params)} optimizable "
+                f"parameter(s) found. This workflow requires at least 2 to avoid "
+                f"trivial or unstable optimizations."
+            )
+            logger.info(reason)
+            print(f"\n[SKIP] {reason}")
+            return
         
         # Step 3: Run Optimization
         trials_str = "unlimited" if args.max_trials is None else str(args.max_trials)
         print_step(3, total_steps, f"Running optimization ({trials_str} trials, ~{args.timeout/60:.1f} min)...")
         print(f"   Sampler: TPE (Tree-Parzen Estimator)")
         print(f"   Validation: 5-fold Walk-Forward with 72-bar embargo")
-        print(f"   Objective: Profit Factor + Directional Accuracy + Sharpe + Extreme Capture + Consistency + Drawdown")
+        print(f"   Objective: MCC (primary) with ROC AUC constraint")
+        print(f"   Lockbox holdout: {args.holdout_ratio:.0%} (gap: {args.holdout_gap_bars if args.holdout_gap_bars is not None else 'auto'} bars)")
         print()
         print(f"   [TIP] Press Q at any time to stop and use current best results")
         print(f"         Watch improvement rate - diminishing returns suggest stopping early")
         print()
         
+        optimizer_kwargs = {}
+        if args.min_runtime_seconds is not None:
+            optimizer_kwargs['min_runtime_seconds'] = args.min_runtime_seconds
+        if args.stall_seconds is not None:
+            optimizer_kwargs['stall_seconds'] = args.stall_seconds
+        if args.improvement_rate_floor is not None:
+            optimizer_kwargs['improvement_rate_floor'] = args.improvement_rate_floor
+        if args.n_jobs is not None:
+            optimizer_kwargs['n_jobs'] = args.n_jobs
+        if args.fast_evaluation:
+            optimizer_kwargs['fast_evaluation'] = True
+
         optimization_result = optimize_indicator(
             parse_result,
             data,
             interval=args.interval,  # Pass full interval string (may be comma-separated)
             max_trials=args.max_trials,
             timeout_seconds=args.timeout,
-            strategy=DEFAULT_OPTIMIZATION_STRATEGY
+            strategy=DEFAULT_OPTIMIZATION_STRATEGY,
+            holdout_ratio=args.holdout_ratio,
+            holdout_gap_bars=args.holdout_gap_bars,
+            **optimizer_kwargs
         )
         
         # Step 4: Generate Optimized Pine Script
@@ -328,6 +419,8 @@ Examples:
 |    * vs Random Baseline: {metrics.improvement_over_random:>+6.1f}%                               |
 |                                                                      |
 |  Key Metrics:                                                        |
+|    * MCC (primary):       {metrics.mcc:>6.3f}                                  |
+|    * ROC AUC:             {metrics.roc_auc:>6.3f}                                  |
 |    * Profit Factor:       {metrics.profit_factor:>6.2f}                                  |
 |    * Win Rate:            {metrics.win_rate*100:>5.1f}%                                  |
 |    * Directional Accuracy:{metrics.directional_accuracy*100:>5.1f}%                                  |
@@ -341,6 +434,17 @@ Examples:
 |                                                                      |
 +======================================================================+
         """)
+
+        if optimization_result.holdout_metrics is not None and optimization_result.holdout_original_metrics is not None:
+            holdout_best = optimization_result.holdout_metrics
+            holdout_orig = optimization_result.holdout_original_metrics
+            print("LOCKBOX (OUT-OF-SAMPLE) RESULTS")
+            print(f"  MCC (primary):       {holdout_orig.mcc:.3f} -> {holdout_best.mcc:.3f}")
+            print(f"  ROC AUC:             {holdout_orig.roc_auc:.3f} -> {holdout_best.roc_auc:.3f}")
+            print(f"  Profit Factor:       {holdout_orig.profit_factor:.2f} -> {holdout_best.profit_factor:.2f}")
+            print(f"  Win Rate:            {holdout_orig.win_rate*100:>5.1f}% -> {holdout_best.win_rate*100:>5.1f}%")
+            print(f"  Directional Accuracy:{holdout_orig.directional_accuracy*100:>5.1f}% -> {holdout_best.directional_accuracy*100:>5.1f}%")
+            print()
         
         def format_val(v):
             if isinstance(v, float):

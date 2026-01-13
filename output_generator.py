@@ -5,6 +5,7 @@ Generates optimized Pine Script files and performance reports.
 
 import re
 import logging
+import json
 from datetime import datetime
 from typing import Dict, Any, List
 from pathlib import Path
@@ -73,9 +74,31 @@ class OutputGenerator:
                 weeks = days / 7
                 return f"{horizon_bars} bars ({weeks:.1f} weeks)"
     
+    def _safe_date_str(self, dt) -> str:
+        """Safely format a date, handling None and NaT (pandas Not-a-Time)."""
+        if dt is None:
+            return "N/A"
+        if hasattr(dt, 'strftime'):
+            try:
+                # Check for pandas NaT
+                import pandas as pd
+                if pd.isna(dt):
+                    return "N/A"
+                return dt.strftime('%Y-%m-%d')
+            except (ValueError, AttributeError, TypeError):
+                return "N/A"
+        return "N/A"
+    
     def _format_date_range(self, start: datetime, end: datetime) -> str:
         """Format date range for display."""
-        return f"{start.strftime('%Y-%m-%d %H:%M:%S')} to {end.strftime('%Y-%m-%d %H:%M:%S')}"
+        start_str = self._safe_date_str(start)
+        end_str = self._safe_date_str(end)
+        if start_str == "N/A" or end_str == "N/A":
+            return "N/A"
+        try:
+            return f"{start.strftime('%Y-%m-%d %H:%M:%S')} to {end.strftime('%Y-%m-%d %H:%M:%S')}"
+        except (ValueError, AttributeError, TypeError):
+            return "N/A"
     
     def _calculate_bar_percentage(self, used: int, total: int) -> float:
         """Calculate percentage of bars used."""
@@ -107,14 +130,38 @@ class OutputGenerator:
                     all_orig_metrics = []
                     for timeframe, metrics_dict in timeframes_dict.items():
                         all_orig_metrics.append(metrics_dict.get('original', BacktestMetrics()))
-                    
-                    # Simple average for now
+
+                    def _aggregate_classification(metrics_list):
+                        total_tp = sum(m.tp for m in metrics_list)
+                        total_tn = sum(m.tn for m in metrics_list)
+                        total_fp = sum(m.fp for m in metrics_list)
+                        total_fn = sum(m.fn for m in metrics_list)
+                        total_samples = sum(m.classification_samples for m in metrics_list)
+                        if total_samples > 0:
+                            roc_auc = sum(m.roc_auc * m.classification_samples for m in metrics_list) / total_samples
+                        else:
+                            roc_auc = 0.5
+                        denom = (total_tp + total_fp) * (total_tp + total_fn) * (total_tn + total_fp) * (total_tn + total_fn)
+                        mcc = (total_tp * total_tn - total_fp * total_fn) / (denom ** 0.5) if denom > 0 else 0.0
+                        return mcc, roc_auc, total_samples, total_tp, total_tn, total_fp, total_fn
+
+                    opt_mcc, opt_auc, opt_samples, opt_tp, opt_tn, opt_fp, opt_fn = _aggregate_classification(all_metrics)
+                    orig_mcc, orig_auc, orig_samples, orig_tp, orig_tn, orig_fp, orig_fn = _aggregate_classification(all_orig_metrics)
+
+                    # Simple average for now (plus classification aggregates)
                     avg_opt_metrics = BacktestMetrics(
                         profit_factor=sum(m.profit_factor for m in all_metrics) / len(all_metrics),
                         win_rate=sum(m.win_rate for m in all_metrics) / len(all_metrics),
                         directional_accuracy=sum(m.directional_accuracy for m in all_metrics) / len(all_metrics),
                         sharpe_ratio=sum(m.sharpe_ratio for m in all_metrics) / len(all_metrics),
-                        total_trades=sum(m.total_trades for m in all_metrics)
+                        total_trades=sum(m.total_trades for m in all_metrics),
+                        mcc=opt_mcc,
+                        roc_auc=opt_auc,
+                        classification_samples=opt_samples,
+                        tp=opt_tp,
+                        tn=opt_tn,
+                        fp=opt_fp,
+                        fn=opt_fn
                     )
                     
                     avg_orig_metrics = BacktestMetrics(
@@ -122,7 +169,14 @@ class OutputGenerator:
                         win_rate=sum(m.win_rate for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
                         directional_accuracy=sum(m.directional_accuracy for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
                         sharpe_ratio=sum(m.sharpe_ratio for m in all_orig_metrics) / len(all_orig_metrics) if all_orig_metrics else 0,
-                        total_trades=sum(m.total_trades for m in all_orig_metrics) if all_orig_metrics else 0
+                        total_trades=sum(m.total_trades for m in all_orig_metrics) if all_orig_metrics else 0,
+                        mcc=orig_mcc,
+                        roc_auc=orig_auc,
+                        classification_samples=orig_samples,
+                        tp=orig_tp,
+                        tn=orig_tn,
+                        fp=orig_fp,
+                        fn=orig_fn
                     )
                     
                     if metric_type == 'objective':
@@ -285,6 +339,8 @@ class OutputGenerator:
             f"// Symbols: {', '.join(data_summary['symbols']) if data_summary['symbols'] else 'Not specified'}",
             f"// Date range: {data_summary['date_range']}",
             "// ---------------------------------------------------------------------------",
+            f"// MCC (primary): {metrics.mcc:.3f}",
+            f"// ROC AUC: {metrics.roc_auc:.3f}",
             f"// Profit Factor: {metrics.profit_factor:.2f} ({opt.improvement_pf:+.1f}% vs original)",
             f"// Win Rate: {metrics.win_rate:.1%}",
             f"// Directional Accuracy: {metrics.directional_accuracy:.1%}",
@@ -293,6 +349,20 @@ class OutputGenerator:
             f"// Sharpe Ratio: {metrics.sharpe_ratio:.2f}",
             f"// Max Drawdown: {metrics.max_drawdown:.1f}%",
             f"// Improvement over Random: {metrics.improvement_over_random:+.1f}%",
+        ]
+
+        if opt.holdout_metrics is not None and opt.holdout_original_metrics is not None:
+            header_lines.extend([
+                "// ---------------------------------------------------------------------------",
+                "// LOCKBOX (OUT-OF-SAMPLE) RESULTS:",
+                f"//   MCC (primary): {opt.holdout_original_metrics.mcc:.3f} -> {opt.holdout_metrics.mcc:.3f}",
+                f"//   ROC AUC: {opt.holdout_original_metrics.roc_auc:.3f} -> {opt.holdout_metrics.roc_auc:.3f}",
+                f"//   Profit Factor: {opt.holdout_original_metrics.profit_factor:.2f} -> {opt.holdout_metrics.profit_factor:.2f}",
+                f"//   Win Rate: {opt.holdout_original_metrics.win_rate:.1%} -> {opt.holdout_metrics.win_rate:.1%}",
+                f"//   Directional Accuracy: {opt.holdout_original_metrics.directional_accuracy:.1%} -> {opt.holdout_metrics.directional_accuracy:.1%}",
+            ])
+
+        header_lines.extend([
             "// ---------------------------------------------------------------------------",
             f"// OPTIMAL FORECAST HORIZON: {metrics.forecast_horizon} hours",
             f"// ",
@@ -300,7 +370,7 @@ class OutputGenerator:
             f"// EXPECTED PROFITABILITY: Best results with ~{metrics.forecast_horizon}h forecast horizon",
             "// ---------------------------------------------------------------------------",
             "// PARAMETER CHANGES:",
-        ]
+        ])
         
         # Add parameter changes
         for name, new_val in opt.best_params.items():
@@ -464,6 +534,9 @@ class OutputGenerator:
         report_lines.append(f"    Rate floor (%/s):    {getattr(opt, 'improvement_rate_floor', 0.0)}")
         report_lines.append(f"    Rate window:         {getattr(opt, 'improvement_rate_window', 0)}")
         report_lines.append(f"    Backtester overrides:{getattr(opt, 'backtester_overrides', {})}")
+        if getattr(opt, "holdout_ratio", 0.0) > 0:
+            report_lines.append(f"    Holdout ratio:       {opt.holdout_ratio:.0%}")
+            report_lines.append(f"    Holdout gap bars:    {getattr(opt, 'holdout_gap_bars', 0)}")
         
         report_lines.extend([
             "",
@@ -477,6 +550,9 @@ class OutputGenerator:
         
         # Add metric comparisons
         metrics_to_compare = [
+            ('MCC (primary)', orig_metrics.mcc, best_metrics.mcc, '.3f'),
+            ('ROC AUC', orig_metrics.roc_auc, best_metrics.roc_auc, '.3f'),
+            ('Classification Samples', orig_metrics.classification_samples, best_metrics.classification_samples, 'd'),
             ('Profit Factor', orig_metrics.profit_factor, best_metrics.profit_factor, '.2f'),
             ('Win Rate', orig_metrics.win_rate * 100, best_metrics.win_rate * 100, '.1f%'),
             ('Directional Accuracy', orig_metrics.directional_accuracy * 100, best_metrics.directional_accuracy * 100, '.1f%'),
@@ -503,8 +579,8 @@ class OutputGenerator:
                 change = best - orig
                 change_str = f"{change:+.1f}pp"
             else:
-                orig_str = f"{orig:.2f}"
-                best_str = f"{best:.2f}"
+                orig_str = f"{orig:{fmt}}"
+                best_str = f"{best:{fmt}}"
                 if orig > 0:
                     change = (best - orig) / orig * 100
                     change_str = f"{change:+.1f}%"
@@ -512,6 +588,57 @@ class OutputGenerator:
                     change_str = "N/A"
             
             report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
+
+        if opt.holdout_metrics is not None and opt.holdout_original_metrics is not None:
+            report_lines.extend([
+                "",
+                "-" * 70,
+                "LOCKBOX (OUT-OF-SAMPLE) PERFORMANCE",
+                "-" * 70,
+                "",
+                f"  {'Metric':<25} {'Original':>12} {'Optimized':>12} {'Change':>12}",
+                f"  {'-'*25} {'-'*12} {'-'*12} {'-'*12}",
+            ])
+
+            holdout_metrics_to_compare = [
+                ('MCC (primary)', opt.holdout_original_metrics.mcc, opt.holdout_metrics.mcc, '.3f'),
+                ('ROC AUC', opt.holdout_original_metrics.roc_auc, opt.holdout_metrics.roc_auc, '.3f'),
+                ('Classification Samples', opt.holdout_original_metrics.classification_samples, opt.holdout_metrics.classification_samples, 'd'),
+                ('Profit Factor', opt.holdout_original_metrics.profit_factor, opt.holdout_metrics.profit_factor, '.2f'),
+                ('Win Rate', opt.holdout_original_metrics.win_rate * 100, opt.holdout_metrics.win_rate * 100, '.1f%'),
+                ('Directional Accuracy', opt.holdout_original_metrics.directional_accuracy * 100, opt.holdout_metrics.directional_accuracy * 100, '.1f%'),
+                ('Extreme Move Capture', opt.holdout_original_metrics.tail_capture_rate * 100, opt.holdout_metrics.tail_capture_rate * 100, '.1f%'),
+                ('Consistency Score', opt.holdout_original_metrics.consistency_score, opt.holdout_metrics.consistency_score, '.2f'),
+                ('Sharpe Ratio', opt.holdout_original_metrics.sharpe_ratio, opt.holdout_metrics.sharpe_ratio, '.2f'),
+                ('Total Trades', opt.holdout_original_metrics.total_trades, opt.holdout_metrics.total_trades, 'd'),
+                ('Avg Return/Trade', opt.holdout_original_metrics.avg_return, opt.holdout_metrics.avg_return, '.2f%'),
+                ('Max Drawdown', opt.holdout_original_metrics.max_drawdown, opt.holdout_metrics.max_drawdown, '.1f%'),
+            ]
+
+            for name, orig, best, fmt in holdout_metrics_to_compare:
+                if 'd' in fmt:
+                    orig_str = f"{int(orig)}"
+                    best_str = f"{int(best)}"
+                    if orig > 0:
+                        change = (best - orig) / orig * 100
+                        change_str = f"{change:+.1f}%"
+                    else:
+                        change_str = "N/A"
+                elif '%' in fmt:
+                    orig_str = f"{orig:.1f}%"
+                    best_str = f"{best:.1f}%"
+                    change = best - orig
+                    change_str = f"{change:+.1f}pp"
+                else:
+                    orig_str = f"{orig:{fmt}}"
+                    best_str = f"{best:{fmt}}"
+                    if orig > 0:
+                        change = (best - orig) / orig * 100
+                        change_str = f"{change:+.1f}%"
+                    else:
+                        change_str = "N/A"
+
+                report_lines.append(f"  {name:<25} {orig_str:>12} {best_str:>12} {change_str:>12}")
         
         # Add Overall Performance by Symbol table (ranked)
         if opt.per_symbol_metrics:
@@ -699,7 +826,11 @@ class OutputGenerator:
             for symbol in sorted(opt.data_usage_info.keys()):
                 for timeframe in sorted(opt.data_usage_info[symbol].keys()):
                     usage = opt.data_usage_info[symbol][timeframe]
-                    date_range_str = f"{usage.date_range[0].strftime('%Y-%m-%d')} to {usage.date_range[1].strftime('%Y-%m-%d')}"
+                    # Handle None or invalid date_range
+                    if usage.date_range and usage.date_range[0] and usage.date_range[1]:
+                        date_range_str = f"{self._safe_date_str(usage.date_range[0])} to {self._safe_date_str(usage.date_range[1])}"
+                    else:
+                        date_range_str = "N/A"
                     train_pct = self._calculate_bar_percentage(usage.total_train_bars, usage.total_bars)
                     test_pct = self._calculate_bar_percentage(usage.total_test_bars, usage.total_bars)
                     embargo_pct = self._calculate_bar_percentage(usage.total_embargo_bars, usage.total_bars)
@@ -712,11 +843,16 @@ class OutputGenerator:
                 for timeframe in sorted(opt.data_usage_info[symbol].keys()):
                     usage = opt.data_usage_info[symbol][timeframe]
                     tf_display = timeframe if timeframe else opt.interval
+                    # Safely format date range
+                    if usage.date_range and usage.date_range[0] and usage.date_range[1]:
+                        detailed_date_range = self._format_date_range(usage.date_range[0], usage.date_range[1])
+                    else:
+                        detailed_date_range = "N/A"
                     report_lines.extend([
                         "",
                         f"  Detailed Breakdown: {symbol} @ {tf_display}",
                         f"    Total bars: {usage.total_bars:,}",
-                        f"    Date range: {self._format_date_range(usage.date_range[0], usage.date_range[1])}",
+                        f"    Date range: {detailed_date_range}",
                         f"    Walk-forward folds: {usage.n_folds}",
                         f"    Train ratio: {usage.train_ratio:.1%}",
                         f"    Embargo period: {usage.embargo_bars} bars",
@@ -729,8 +865,13 @@ class OutputGenerator:
                     for fold in usage.folds:
                         train_range = f"{fold['train_start']}-{fold['train_end']-1}"
                         test_range = f"{fold['test_start']}-{fold['test_end']-1}"
-                        train_date_range = f"{fold['train_start_date'].strftime('%Y-%m-%d')} to {fold['train_end_date'].strftime('%Y-%m-%d')}" if fold['train_start_date'] and fold['train_end_date'] else "N/A"
-                        test_date_range = f"{fold['test_start_date'].strftime('%Y-%m-%d')} to {fold['test_end_date'].strftime('%Y-%m-%d')}" if fold['test_start_date'] and fold['test_end_date'] else "N/A"
+                        # Use safe date formatting for fold dates (handles None and NaT)
+                        train_start_str = self._safe_date_str(fold.get('train_start_date'))
+                        train_end_str = self._safe_date_str(fold.get('train_end_date'))
+                        test_start_str = self._safe_date_str(fold.get('test_start_date'))
+                        test_end_str = self._safe_date_str(fold.get('test_end_date'))
+                        train_date_range = f"{train_start_str} to {train_end_str}" if train_start_str != "N/A" and train_end_str != "N/A" else "N/A"
+                        test_date_range = f"{test_start_str} to {test_end_str}" if test_start_str != "N/A" and test_end_str != "N/A" else "N/A"
                         train_pct = self._calculate_bar_percentage(fold['train_bars'], usage.total_bars)
                         test_pct = self._calculate_bar_percentage(fold['test_bars'], usage.total_bars)
                         report_lines.append(f"    {fold['fold_num']:<6} {train_range:<20} {train_date_range:<35} {test_range:<20} {test_date_range:<35} {fold['embargo_bars']:<10} {train_pct:<9.1f}% {test_pct:<9.1f}%")
@@ -860,49 +1001,19 @@ class OutputGenerator:
             "UNDERSTANDING THE METRICS",
             "-" * 70,
             "",
-            "  PROFIT FACTOR (Primary Metric)",
-            "    What it measures: Gross Profit / Gross Loss",
-            "    Good value: > 1.5 (above 1.0 = profitable)",
-            "    Why it matters: Directly measures profitability. A PF of 1.5 means",
-            "                    you make $1.50 for every $1.00 you lose.",
+            "  MCC (PRIMARY OBJECTIVE)",
+            "    What it measures: Correlation between predicted and actual direction",
+            "    Good value: > 0.10 (0.0 = random, 1.0 = perfect, -1.0 = inverse)",
+            "    Why it matters: Robust to class imbalance and penalizes all error types.",
             "",
-            "  WIN RATE",
-            "    What it measures: Percentage of trades that are profitable",
-            "    Good value: > 55%",
-            "    Why it matters: Psychological comfort - easier to trade with higher",
-            "                    win rates. But high win rate with small wins and",
-            "                    big losses can still lose money!",
+            "  ROC AUC (CONSTRAINT)",
+            "    What it measures: Threshold-independent ranking quality",
+            "    Good value: >= 0.52 (0.50 = random)",
+            "    Why it matters: Ensures genuine predictive signal beyond threshold tuning.",
             "",
-            "  DIRECTIONAL ACCURACY",
-            "    What it measures: How well signals predict future price direction",
-            "    Good value: > 55% (50% = random chance)",
-            "    Why it matters: Shows if the indicator has genuine predictive power",
-            "                    vs just getting lucky. Doesn't account for move size.",
-            "",
-            "  EXTREME MOVE CAPTURE",
-            "    What it measures: Balance of recall/precision for major up/down moves",
-            "    Good value: > 35% (higher means fewer misses and fewer false signals)",
-            "    Why it matters: Targets significant highs/lows without flooding signals.",
-            "",
-            "  CONSISTENCY SCORE",
-            "    What it measures: Stability of performance across walk-forward folds",
-            "    Good value: > 0.60 (lower means results are erratic across regimes)",
-            "    Why it matters: Reliable signals should work in multiple market phases.",
-            "",
-            "  SHARPE RATIO",
-            "    What it measures: Risk-adjusted return (return / volatility)",
-            "    Good value: > 1.0 (> 2.0 = excellent)",
-            "    Why it matters: Balances returns against risk. High Sharpe = more",
-            "                    consistent returns with less volatility/drawdowns.",
-            "",
-            "  OPTIMIZATION WEIGHTS USED:",
-            "    * Profit Factor:        25% (primary - are we making money?)",
-            "    * Directional Accuracy: 20% (does the indicator actually predict?)",
-            "    * Sharpe Ratio:         15% (is it consistent/low risk?)",
-            "    * Win Rate:             10% (psychological tradability)",
-            "    * Extreme Move Capture: 15% (detects major highs/lows)",
-            "    * Consistency Score:    10% (stability across folds)",
-            "    * Drawdown Control:      5% (avoid deep equity dips)",
+            "  REPORTING METRICS (NOT OPTIMIZED)",
+            "    Profit Factor, Win Rate, Sharpe, Directional Accuracy, Tail Capture,",
+            "    Consistency, and Drawdown are provided for context only.",
             "",
             "-" * 70,
             "OPTIMAL FORECAST HORIZON",
@@ -911,10 +1022,11 @@ class OutputGenerator:
             f"  Optimal forecast horizon: ~{best_metrics.forecast_horizon} hours",
             "",
             "-" * 70,
-            "EXPECTED PROFITABILITY",
+            "EXPECTED SIGNAL QUALITY",
             "-" * 70,
-            f"  Improvement over random baseline: {best_metrics.improvement_over_random:+.1f}%",
-            f"  Improvement over original config: {opt.improvement_pf:+.1f}% (profit factor)",
+            f"  MCC (OOS): {best_metrics.mcc:.3f}",
+            f"  ROC AUC (OOS): {best_metrics.roc_auc:.3f}",
+            f"  Classification samples: {best_metrics.classification_samples}",
             "",
             "  WHEN TO TRADE:",
             f"    * Best during: {self._get_optimal_conditions()}",
@@ -1024,6 +1136,330 @@ class OutputGenerator:
         
         return report_content
     
+    def generate_html_report(self, output_path: str = None) -> str:
+        """
+        Generate interactive HTML report with Plotly charts.
+        
+        Args:
+            output_path: Optional path for output file
+            
+        Returns:
+            Path to generated file
+        """
+        opt = self.optimization_result
+        orig_metrics = opt.original_metrics
+        best_metrics = opt.best_metrics
+        
+        # Prepare chart data from improvement history
+        chart_data = self._prepare_chart_data(opt)
+        
+        # Get JavaScript file path (relative to HTML output)
+        # HTML files are in optimized_outputs/reports/, assets is at project root
+        # So relative path is ../../assets/plotly_rightclick_hide.js
+        # Use forward slashes for cross-platform web compatibility
+        js_path_str = "../../assets/plotly_rightclick_hide.js"
+        
+        # Build HTML content
+        html_content = self._build_html_content(
+            chart_data, 
+            orig_metrics, 
+            best_metrics, 
+            opt,
+            js_path_str
+        )
+        
+        # Determine output path
+        if output_path is None:
+            source_path = Path(self.parse_result.indicator_name.replace(' ', '_').replace('/', '_'))
+            output_path = f"optimized_outputs/reports/optimised_{source_path.stem}_report.html"
+        
+        # Write file
+        Path(output_path).write_text(html_content, encoding='utf-8')
+        logger.info(f"Generated HTML report: {output_path}")
+        
+        return output_path
+    
+    def _prepare_chart_data(self, opt: OptimizationResult) -> Dict[str, Any]:
+        """Prepare data for Plotly charts from improvement history."""
+        if not opt.improvement_history:
+            return {"traces": [], "has_data": False}
+        
+        # Extract data from improvement history
+        elapsed_times = []
+        objectives = []
+        labels = []
+        
+        for i, entry in enumerate(opt.improvement_history):
+            elapsed = entry.get('elapsed_seconds', i * 10)  # Fallback if missing
+            objective = entry.get('objective', 0)
+            elapsed_times.append(elapsed)
+            objectives.append(objective)
+            
+            # Create label from params
+            params = entry.get('params', {})
+            param_strs = [f"{k}={v:.3g}" if isinstance(v, float) else f"{k}={v}" 
+                         for k, v in sorted(params.items())]
+            label = ", ".join(param_strs[:3])  # Limit to first 3 params for readability
+            if len(param_strs) > 3:
+                label += "..."
+            labels.append(label or f"Trial {i+1}")
+        
+        # Add baseline point at time 0
+        baseline_objective = opt.baseline_objective
+        
+        return {
+            "traces": [
+                {
+                    "x": [0] + elapsed_times,
+                    "y": [baseline_objective] + objectives,
+                    "type": "scatter",
+                    "mode": "lines+markers",
+                    "name": "Objective Score",
+                    "customdata": ["Baseline"] + labels,
+                    "line": {"color": "rgb(31, 119, 180)"},
+                    "marker": {"size": 6}
+                }
+            ],
+            "has_data": True,
+            "x_title": "Elapsed Time (seconds)",
+            "y_title": "Objective Score"
+        }
+    
+    def _build_html_content(self, chart_data: Dict[str, Any], orig_metrics: BacktestMetrics, 
+                           best_metrics: BacktestMetrics, opt: OptimizationResult, js_path: str) -> str:
+        """Build the complete HTML content."""
+        
+        # Calculate objective scores
+        from objective import calculate_objective_score
+        orig_objective = calculate_objective_score(orig_metrics)
+        best_objective = calculate_objective_score(best_metrics)
+        
+        # Prepare metrics comparison data
+        metrics_comparison = [
+            ("MCC (primary)", orig_metrics.mcc, best_metrics.mcc, ".3f"),
+            ("ROC AUC", orig_metrics.roc_auc, best_metrics.roc_auc, ".3f"),
+            ("Profit Factor", orig_metrics.profit_factor, best_metrics.profit_factor, ".2f"),
+            ("Win Rate", orig_metrics.win_rate * 100, best_metrics.win_rate * 100, ".1f"),
+            ("Directional Accuracy", orig_metrics.directional_accuracy * 100, best_metrics.directional_accuracy * 100, ".1f"),
+            ("Sharpe Ratio", orig_metrics.sharpe_ratio, best_metrics.sharpe_ratio, ".2f"),
+        ]
+        
+        # Format chart JSON
+        chart_json = json.dumps(chart_data["traces"]) if chart_data["has_data"] else "[]"
+        layout_json = json.dumps({
+            "title": "Optimization Progress",
+            "xaxis": {"title": chart_data.get("x_title", "Trial Number")},
+            "yaxis": {"title": chart_data.get("y_title", "Objective Score")},
+            "hovermode": "closest",
+            "showlegend": True,
+            "margin": {"l": 60, "r": 20, "t": 40, "b": 60}
+        })
+        
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optimization Report: {self.parse_result.indicator_name}</title>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #333;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }}
+        h2 {{
+            color: #555;
+            margin-top: 30px;
+        }}
+        .metrics-table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }}
+        .metrics-table th, .metrics-table td {{
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        .metrics-table th {{
+            background-color: #4CAF50;
+            color: white;
+        }}
+        .metrics-table tr:hover {{
+            background-color: #f5f5f5;
+        }}
+        .improvement {{
+            color: #4CAF50;
+            font-weight: bold;
+        }}
+        .decline {{
+            color: #f44336;
+            font-weight: bold;
+        }}
+        #objective-graph {{
+            width: 100%;
+            height: 500px;
+            margin: 20px 0;
+        }}
+        #legend-box {{
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f9f9f9;
+            border-radius: 4px;
+        }}
+        .legend-button {{
+            display: inline-block;
+            margin: 5px;
+            padding: 8px 12px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }}
+        .legend-button:hover {{
+            background-color: #45a049;
+        }}
+        .legend-button.hidden {{
+            background-color: #ccc;
+            opacity: 0.5;
+        }}
+        .summary {{
+            background-color: #e8f5e9;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 20px 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ML Optimization Report: {self.parse_result.indicator_name}</h1>
+        <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        
+        <div class="summary">
+            <h2>Summary</h2>
+            <p><strong>Trials:</strong> {opt.n_trials} | <strong>Time:</strong> {opt.optimization_time:.1f}s</p>
+            <p><strong>Objective Score:</strong> {orig_objective:.4f} → <strong class="improvement">{best_objective:.4f}</strong></p>
+            <p><strong>Improvement:</strong> {((best_objective - orig_objective) / orig_objective * 100) if orig_objective > 0 else 0:+.1f}%</p>
+        </div>
+        
+        <h2>Optimization Progress</h2>
+        <div id="objective-graph"></div>
+        <div id="legend-box"></div>
+        
+        <h2>Performance Metrics Comparison</h2>
+        <table class="metrics-table">
+            <thead>
+                <tr>
+                    <th>Metric</th>
+                    <th>Original</th>
+                    <th>Optimized</th>
+                    <th>Change</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        
+        for metric_name, orig_val, best_val, fmt in metrics_comparison:
+            change = best_val - orig_val
+            change_pct = (change / orig_val * 100) if orig_val != 0 else 0
+            change_class = "improvement" if change >= 0 else "decline"
+            change_sign = "+" if change >= 0 else ""
+            
+            if "%" in fmt:
+                change_str = f"{change_sign}{change:.1f}%"
+            else:
+                change_str = f"{change_sign}{change:.{fmt.split('.')[1].split('f')[0] if '.' in fmt else '2'}f}"
+            
+            html += f"""                <tr>
+                    <td>{metric_name}</td>
+                    <td>{orig_val:{fmt}}</td>
+                    <td>{best_val:{fmt}}</td>
+                    <td class="{change_class}">{change_str}</td>
+                </tr>
+"""
+        
+        html += """            </tbody>
+        </table>
+        
+        <h2>Optimized Parameters</h2>
+        <table class="metrics-table">
+            <thead>
+                <tr>
+                    <th>Parameter</th>
+                    <th>Original</th>
+                    <th>Optimized</th>
+                    <th>Change</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        
+        for param_name in sorted(set(list(opt.original_params.keys()) + list(opt.best_params.keys()))):
+            orig_val = opt.original_params.get(param_name, "N/A")
+            best_val = opt.best_params.get(param_name, "N/A")
+            if orig_val != best_val:
+                html += f"""                <tr>
+                    <td>{param_name}</td>
+                    <td>{self._format_value(orig_val)}</td>
+                    <td class="improvement">{self._format_value(best_val)}</td>
+                    <td>{self._format_value(best_val) if orig_val == "N/A" else f"{self._format_value(orig_val)} → {self._format_value(best_val)}"}</td>
+                </tr>
+"""
+        
+        html += """            </tbody>
+        </table>
+    </div>
+    
+    <script>
+        // Initialize Plotly chart
+        var chartData = """ + chart_json + """;
+        var layout = """ + layout_json + """;
+        
+        if (chartData.length > 0) {
+            Plotly.newPlot('objective-graph', chartData, layout, {responsive: true});
+            
+            // Create legend buttons
+            var legendBox = document.getElementById('legend-box');
+            chartData.forEach(function(trace, index) {
+                var button = document.createElement('button');
+                button.className = 'legend-button';
+                button.setAttribute('data-label', trace.name || 'Trace ' + index);
+                button.textContent = trace.name || 'Trace ' + index;
+                button.onclick = function() {
+                    var visibility = chartData[index].visible === false ? true : false;
+                    var update = {visible: visibility};
+                    Plotly.restyle('objective-graph', update, index);
+                    this.classList.toggle('hidden');
+                };
+                legendBox.appendChild(button);
+            });
+        } else {
+            document.getElementById('objective-graph').innerHTML = 
+                '<p style="text-align: center; color: #999; padding: 50px;">No optimization history data available.</p>';
+        }
+    </script>
+    <script src=\"""" + js_path + """\"></script>
+</body>
+</html>"""
+        
+        return html
+    
     def print_summary(self):
         """Print a concise summary to console."""
         opt = self.optimization_result
@@ -1033,8 +1469,8 @@ class OutputGenerator:
         print(f"OPTIMIZATION COMPLETE: {self.parse_result.indicator_name}")
         print("=" * 60)
         print(f"Peak Forecast Timeframe: {metrics.forecast_horizon} hours")
+        print(f"MCC (primary):          {metrics.mcc:.3f} | AUC: {metrics.roc_auc:.3f}")
         print(f"Performance vs Original: {opt.improvement_pf:+.1f}% profit factor improvement")
-        print(f"Performance vs Random:   {metrics.improvement_over_random:+.1f}% improvement")
         print(f"Extreme Move Capture:    {metrics.tail_capture_rate:.1%}")
         print(f"Consistency Score:       {metrics.consistency_score:.2f}")
         print(f"Expected Profitability:  Best during {self._get_optimal_conditions()}")
@@ -1055,7 +1491,8 @@ class OutputGenerator:
 def generate_outputs(
     parse_result: ParseResult,
     optimization_result: OptimizationResult,
-    source_filename: str
+    source_filename: str,
+    output_tag: str = None
 ) -> Dict[str, str]:
     """
     Generate all output files.
@@ -1078,12 +1515,20 @@ def generate_outputs(
     pine_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
     
-    pine_output = str(pine_dir / f"optimised_{source_path.stem}.pine")
-    report_output = str(report_dir / f"optimised_{source_path.stem}_report.txt")
+    if output_tag:
+        safe_tag = re.sub(r"[^A-Za-z0-9_-]+", "_", output_tag.strip()).strip("_")
+    else:
+        safe_tag = ""
+
+    suffix = f"_{safe_tag}" if safe_tag else ""
+    pine_output = str(pine_dir / f"optimised_{source_path.stem}{suffix}.pine")
+    report_output = str(report_dir / f"optimised_{source_path.stem}{suffix}_report.txt")
+    html_output = str(report_dir / f"optimised_{source_path.stem}{suffix}_report.html")
     
     # Generate files
     pine_path = generator.generate_optimized_pine(pine_output)
     report_content = generator.generate_report(report_output)
+    html_path = generator.generate_html_report(html_output)
     
     # Print summary
     generator.print_summary()
@@ -1091,7 +1536,8 @@ def generate_outputs(
     return {
         'pine_script': pine_path,
         'report': report_output,
-        'report_content': report_content
+        'report_content': report_content,
+        'html_report': html_path
     }
 
 

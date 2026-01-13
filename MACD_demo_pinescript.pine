@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 indicator("MACD", shorttitle="MACD", overlay=false)
 
 // Inputs (standard defaults)

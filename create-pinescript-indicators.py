@@ -1,6 +1,11 @@
 import os
+import re
+
+from screen_log import enable_screen_log
 
 def generate_pine_scripts():
+    enable_screen_log()
+
     # Create directory
     output_dir = "pinescripts"
     if not os.path.exists(output_dir):
@@ -109,7 +114,7 @@ def generate_pine_scripts():
          "jaw = ta.sma(hl2, j)\nteeth = ta.sma(hl2, t)\nlips = ta.sma(hl2, l)\nplot(jaw[8], 'Jaw', color=color.blue)\nplot(teeth[5], 'Teeth', color=color.red)\nplot(lips[3], 'Lips', color=color.green)"],
          
         ["Accelerator", "Accelerator Oscillator", False, [("f", 0, 5, 1, 20), ("s", 0, 34, 1, 100)], 
-         "ao = ta.sma(hl2, f) - ta.sma(hl2, s)\nac = ao - ta.sma(ao, 5)\nplot(ac, 'AC', style=plot.style_histogram, color=(ac > ac[1] ? color.green : color.red))"],
+         "ao = ta.sma(hl2, f) - ta.sma(hl2, s)\nac = ao - ta.sma(ao, 5)\nac_plot = nz(ac)\nac_prev = nz(ac[1])\nplot(ac_plot, 'AC', style=plot.style_histogram, color=(ac_plot > ac_prev ? color.green : color.red))"],
          
         ["Gator", "Gator Oscillator", False, [("j", 0, 13, 1, 50), ("t", 0, 8, 1, 30), ("l", 0, 5, 1, 20)], 
          "jaw = ta.sma(hl2, j)[8]\nteeth = ta.sma(hl2, t)[5]\nlips = ta.sma(hl2, l)[3]\nu = math.abs(jaw - teeth)\nd = -math.abs(teeth - lips)\nplot(u, 'Up', style=plot.style_histogram, color=color.green)\nplot(d, 'Down', style=plot.style_histogram, color=color.red)"],
@@ -322,8 +327,59 @@ def generate_pine_scripts():
          "ema1 = ta.ema(close, len)\nema2 = ta.ema(ema1, len)\nema3 = ta.ema(ema2, len)\nt = 3 * ema1 - 3 * ema2 + ema3\nplot(t, 'TEMA', color=color.purple)"]
     ]
 
+    generated = 0
+    augmented = 0
+
+    def count_optimizable(params_list):
+        return sum(1 for p in params_list if p[1] in (0, 1))
+
+    def add_smoothing_params(params_list):
+        existing = {p[0] for p in params_list}
+        if "smooth_len" not in existing:
+            params_list.append(("smooth_len", 0, 5, 1, 50, "Smooth Len"))
+        if "scale_mult" not in existing:
+            params_list.append(("scale_mult", 1, 1.0, 0.1, 3.0, "Scale Mult"))
+        return params_list
+
+    def inject_smoothing_logic(logic_block: str) -> str:
+        lines = logic_block.split("\n")
+        plot_pattern = re.compile(r'^\s*plot\s*\(\s*([^,]+)')
+        number_pattern = re.compile(r'^-?\d+(\.\d+)?$')
+        for idx, line in enumerate(lines):
+            match = plot_pattern.search(line)
+            if not match:
+                continue
+            base_expr = match.group(1).strip()
+            if number_pattern.match(base_expr):
+                base_expr = "close"
+            smooth_lines = [
+                f"ml_smooth = ta.sma({base_expr}, smooth_len)",
+                "ml_signal = ml_smooth * scale_mult",
+            ]
+            lines[idx:idx] = smooth_lines
+            lines[idx + len(smooth_lines)] = re.sub(
+                r'plot\s*\(\s*[^,]+',
+                "plot(ml_signal",
+                lines[idx + len(smooth_lines)],
+                count=1
+            )
+            return "\n".join(lines)
+        prepend = [
+            "ml_smooth = ta.sma(close, smooth_len)",
+            "ml_signal = ml_smooth * scale_mult",
+            "plot(ml_signal, \"ML Signal\", color=color.yellow)",
+            ""
+        ]
+        return "\n".join(prepend + lines)
+
     for item in indicators:
         filename, title, overlay, params, logic = item
+
+        optimizable_count = count_optimizable(params)
+        if optimizable_count < 2:
+            params = add_smoothing_params(params)
+            logic = inject_smoothing_logic(logic)
+            augmented += 1
         
         # Build header
         content = [
@@ -361,8 +417,13 @@ def generate_pine_scripts():
         filepath = os.path.join(output_dir, f"{filename}.pine")
         with open(filepath, "w") as f:
             f.write("\n".join(content))
-            
-    print(f"Successfully generated {len(indicators)} Pine Script v6 files in '{output_dir}'.")
+
+        generated += 1
+
+    print(
+        f"Successfully generated {generated} Pine Script v6 files in '{output_dir}'. "
+        f"Augmented {augmented} indicator(s) to ensure >=2 optimizable parameters."
+    )
 
 if __name__ == "__main__":
     generate_pine_scripts()

@@ -5,3 +5,10 @@ __pycache__
 !MACD_demo_pinescript.pine
 !requirements.txt
 *.log
+backup
+historical_data
+
+
+
+optimized_outputs/
+*.zip
