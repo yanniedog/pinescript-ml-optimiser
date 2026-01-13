@@ -6,6 +6,8 @@ matplotlib>=3.7.0
 # Plotly/Dash for interactive charts (optional but recommended)
 plotly>=5.18.0
 dash>=2.14.0
+# Ngrok for exposing Plotly server in cloud environments (Colab)
+pyngrok>=5.0.0
 # Performance optimization
 psutil>=5.9.0
 # JIT compilation for 5-10x speedup (optional but highly recommended)

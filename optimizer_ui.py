@@ -664,7 +664,7 @@ class PlotlyRealtimePlotter:
             self._enabled = False
             return False
 
-        self._port = self._find_free_port()
+        self._port = 9107
         self._app = Dash(__name__)
         logging.getLogger("werkzeug").setLevel(logging.ERROR)
         logging.getLogger("dash").setLevel(logging.ERROR)
@@ -1156,7 +1156,7 @@ class PlotlyRealtimePlotter:
             self._app.run(
                 debug=False,
                 port=self._port,
-                host="127.0.0.1",
+                host="0.0.0.0",
                 use_reloader=False,
                 threaded=True
             )
