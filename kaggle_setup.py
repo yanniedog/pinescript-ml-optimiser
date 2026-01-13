@@ -90,6 +90,8 @@ def run_command(cmd, check=True, shell=False, capture_output=False):
 
 def step1_clone_repo():
     """Step 1: Clone the repository."""
+    global _LOG_FILE_PATH  # Declare global at the start
+    
     print("[1/5] Cloning repository...")
     
     repo_path = Path(REPO_DIR)
@@ -103,9 +105,20 @@ def step1_clone_repo():
     # Move logfile to repo directory after cloning
     new_log_path = None
     if repo_path.exists():
+        print(f"  Moving logfile to repo directory: {repo_path}")
         new_log_path = move_logfile_to_repo(repo_path)
         if new_log_path:
             print(f"  ✓ Logfile moved to: {new_log_path}")
+            # Verify the file exists
+            if Path(new_log_path).exists():
+                print(f"  ✓ Logfile verified at: {new_log_path}")
+            else:
+                print(f"  ⚠ WARNING: Logfile path reported but file not found: {new_log_path}")
+        else:
+            print(f"  ⚠ Could not move logfile to repo directory")
+            # Check if original logfile still exists
+            if _LOG_FILE_PATH and Path(_LOG_FILE_PATH).exists():
+                print(f"  ℹ Original logfile still at: {_LOG_FILE_PATH}")
     
     print()
     return new_log_path  # Return the new log path
@@ -131,6 +144,10 @@ def step2_install_dependencies():
         # Packages to skip on Python 3.12/Kaggle (not needed or not available)
         skip_packages = ["talib-binary", "pickle5"]
         
+        # Check Python version for compatibility fixes
+        python_version = sys.version_info
+        is_python_312 = python_version.major == 3 and python_version.minor >= 12
+        
         # Try to install requirements, handling problematic packages gracefully
         if req_fixed.exists():
             print("  Using requirements_fixed.txt")
@@ -151,6 +168,23 @@ def step2_install_dependencies():
                 
                 if skipped_count > 0:
                     print(f"  Filtered out {skipped_count} package(s) not compatible with this environment")
+                
+                # For Python 3.12, install compatible versions first to avoid import errors
+                if is_python_312:
+                    print("  Installing Python 3.12 compatible package versions...")
+                    # Upgrade NumPy to a version compatible with Python 3.12 (fixes _center import error)
+                    # NumPy 2.x has breaking changes, so we stick with 1.x for compatibility
+                    print("    Upgrading NumPy for Python 3.12 compatibility...")
+                    run_command(
+                        [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--force-reinstall", "numpy>=1.26.0,<2.0.0"],
+                        check=False
+                    )
+                    # Upgrade Optuna to a version compatible with Python 3.12 (fixes _INTEGRATION_IMPORT_ERROR_TEMPLATE error)
+                    print("    Upgrading Optuna for Python 3.12 compatibility...")
+                    run_command(
+                        [sys.executable, "-m", "pip", "install", "-q", "--upgrade", "--force-reinstall", "optuna>=3.5.0"],
+                        check=False
+                    )
                 
                 # Try installing filtered requirements
                 result = run_command(
@@ -245,11 +279,51 @@ def step3_setup_ngrok():
         from pyngrok import ngrok  # type: ignore[import-untyped]
         import pyngrok.ngrok  # type: ignore[import-untyped]
         
-        pyngrok.ngrok.set_auth_token(NGROK_AUTHTOKEN)
-        print("    ✓ Ngrok authtoken configured")
+        # Try to set authtoken - this may trigger ngrok download
+        try:
+            pyngrok.ngrok.set_auth_token(NGROK_AUTHTOKEN)
+            print("    ✓ Ngrok authtoken configured")
+        except Exception as token_error:
+            # If setting authtoken fails due to download issue, try to download ngrok manually
+            error_str = str(token_error).lower()
+            if "download" in error_str or "noneType" in error_str or "not callable" in error_str:
+                print(f"    ⚠ Ngrok download issue detected: {token_error}")
+                print("    ℹ Attempting to download ngrok manually...")
+                try:
+                    # Try to download ngrok directly
+                    import urllib.request
+                    ngrok_url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip"
+                    ngrok_zip = "/tmp/ngrok.zip"
+                    ngrok_bin = "/tmp/ngrok"
+                    
+                    # Download ngrok
+                    urllib.request.urlretrieve(ngrok_url, ngrok_zip)
+                    
+                    # Extract it
+                    import zipfile
+                    with zipfile.ZipFile(ngrok_zip, 'r') as zip_ref:
+                        zip_ref.extractall("/tmp")
+                    
+                    # Make it executable
+                    os.chmod(ngrok_bin, 0o755)
+                    
+                    # Set the ngrok path in pyngrok config
+                    pyngrok.config.DEFAULT_CONFIG_PATH = ngrok_bin
+                    
+                    # Set the authtoken
+                    pyngrok.ngrok.set_auth_token(NGROK_AUTHTOKEN)
+                    print("    ✓ Ngrok downloaded and authtoken configured")
+                except Exception as download_error:
+                    print(f"    ⚠ Manual download also failed: {download_error}")
+                    print(f"    ℹ Continuing without ngrok - application will run locally only")
+                    return None
+            else:
+                # Re-raise if it's a different error
+                raise token_error
     except Exception as e:
-        print(f"    ERROR: Failed to configure ngrok: {e}")
-        sys.exit(1)
+        print(f"    ⚠ Failed to configure ngrok: {e}")
+        print(f"    ℹ Continuing without ngrok - application will run locally only")
+        return None
     
     # Check if there's already a tunnel on the desired port
     print(f"  Checking for existing tunnel on port {NGROK_PORT}...")
@@ -360,27 +434,38 @@ def step5_launch_app():
     
     # Change to the repo directory if not already there
     repo_path = Path(REPO_DIR).resolve()
+    original_cwd = Path.cwd()
+    
     if Path.cwd() != repo_path:
         os.chdir(repo_path)
     
-    # Use subprocess to run launch.py - this bypasses IPython's traceback handling
-    # and keeps the ngrok tunnel alive since it's in the parent process
-    # Set PYTHONUNBUFFERED for real-time output
-    env = os.environ.copy()
-    env['PYTHONUNBUFFERED'] = '1'
+    # Add repo to Python path so we can import modules
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
     
     try:
-        # Run launch.py as a subprocess but keep it interactive
-        # This avoids IPython traceback issues while maintaining interactivity
-        subprocess.run(
-            [sys.executable, "-u", "launch.py"],
-            cwd=str(repo_path),
-            env=env,
-            check=False  # Don't raise on non-zero exit
-        )
+        # Directly import and run instead of using subprocess
+        # This works better for interactive input in Kaggle notebooks
+        try:
+            # Try to import and run the interactive optimizer directly
+            from interactive_optimizer import main as run_optimizer
+            run_optimizer()
+        except ImportError as import_err:
+            # If direct import fails, try using launch.py's approach
+            print(f"  ℹ Direct import failed, trying launch.py approach: {import_err}")
+            from launch import main as launch_main
+            launch_main()
     except KeyboardInterrupt:
         print("\n\nApplication interrupted by user.")
+        os.chdir(original_cwd)
         sys.exit(0)
+    except EOFError:
+        # EOFError can occur in notebook environments when input() is called
+        print("\n\n⚠ Input stream ended (EOF).")
+        print("  This can happen in some notebook environments.")
+        print("  Try running the script in a different way or check your environment.")
+        os.chdir(original_cwd)
+        sys.exit(1)
     except Exception as e:
         print(f"\n\nERROR: Failed to launch application: {e}")
         import traceback
@@ -391,7 +476,11 @@ def step5_launch_app():
             # Fallback if traceback formatting fails
             print(f"Error type: {type(e).__name__}")
             print(f"Error message: {str(e)}")
+        os.chdir(original_cwd)
         sys.exit(1)
+    finally:
+        # Restore original directory
+        os.chdir(original_cwd)
 
 
 def check_python_version():
@@ -461,7 +550,7 @@ def setup_logging(repo_dir: Path = None):
             def flush(self):
                 self.stream.flush()
                 if self.log_file:
-                    self.log_file.flush()()
+                    self.log_file.flush()
             
             def isatty(self):
                 return self.stream.isatty()
@@ -472,10 +561,24 @@ def setup_logging(repo_dir: Path = None):
         sys.stdout = LogWriter(_ORIGINAL_STDOUT, _LOG_FILE)
         sys.stderr = LogWriter(_ORIGINAL_STDERR, _LOG_FILE)
         
+        # Write initial message to confirm logfile is working
+        _LOG_FILE.write(f"Logfile created at: {log_path}\n")
+        _LOG_FILE.write(f"Working directory: {Path.cwd()}\n")
+        _LOG_FILE.flush()
+        
         return str(log_path)
     except Exception as e:
         # If logging setup fails, continue without logging
-        print(f"  ⚠ Could not setup logfile: {e}", file=_ORIGINAL_STDERR if _ORIGINAL_STDERR else sys.stderr)
+        error_msg = f"  ⚠ Could not setup logfile: {e}"
+        if _ORIGINAL_STDERR:
+            _ORIGINAL_STDERR.write(error_msg + "\n")
+        else:
+            sys.stderr.write(error_msg + "\n")
+        import traceback
+        if _ORIGINAL_STDERR:
+            traceback.print_exc(file=_ORIGINAL_STDERR)
+        else:
+            traceback.print_exc()
         return None
 
 
@@ -541,8 +644,8 @@ def move_logfile_to_repo(repo_dir: Path):
 
 def main():
     """Main setup function."""
-    # Declare globals at the start of the function
-    global _LOG_FILE_PATH
+    # Declare globals at the start of the function (before any use)
+    global _LOG_FILE, _LOG_FILE_PATH
     
     # Setup logging first (before any output) - will be moved to repo after cloning
     log_path = setup_logging()
@@ -551,7 +654,9 @@ def main():
     print("Pine Script ML Optimizer - Kaggle Setup")
     print("=" * 50)
     if log_path:
-        print(f"Logfile: {log_path}")
+        abs_log_path = Path(log_path).resolve()
+        print(f"Logfile: {abs_log_path}")
+        print(f"  (Absolute path: {abs_log_path})")
         print("  (All output is being saved to this file)")
         print("  (Will be moved to pinescript-ml-optimiser/logs/ after cloning)")
     else:
@@ -576,7 +681,12 @@ def main():
         # Get current log path from global
         current_log = _LOG_FILE_PATH if _LOG_FILE_PATH else log_path
         if current_log:
-            print(f"  Logfile saved: {current_log}")
+            abs_log_path = Path(current_log).resolve()
+            print(f"  Logfile saved: {abs_log_path}")
+            print(f"  (Absolute path: {abs_log_path})")
+            if abs_log_path.exists():
+                size = abs_log_path.stat().st_size
+                print(f"  (File size: {size} bytes)")
         sys.exit(0)
     except Exception as e:
         print(f"\n\nERROR: Setup failed: {e}")
@@ -591,17 +701,38 @@ def main():
         # Get current log path from global
         current_log = _LOG_FILE_PATH if _LOG_FILE_PATH else log_path
         if current_log:
-            print(f"\n  Logfile saved: {current_log}")
+            abs_log_path = Path(current_log).resolve()
+            print(f"\n  Logfile saved: {abs_log_path}")
+            print(f"  (Absolute path: {abs_log_path})")
+            if abs_log_path.exists():
+                size = abs_log_path.stat().st_size
+                print(f"  (File size: {size} bytes)")
         sys.exit(1)
     finally:
-        # Close log file if it was opened
-        global _LOG_FILE
+        # Close log file if it was opened and show final location
+        # Note: _LOG_FILE and _LOG_FILE_PATH are already declared as global at function start
         if _LOG_FILE:
             try:
                 _LOG_FILE.flush()
                 _LOG_FILE.close()
             except Exception:
                 pass
+        
+        # Print final logfile location
+        if _LOG_FILE_PATH:
+            final_log_path = Path(_LOG_FILE_PATH).resolve()
+            print("\n" + "=" * 50)
+            print("LOGFILE LOCATION:")
+            print("=" * 50)
+            print(f"  Path: {final_log_path}")
+            print(f"  Absolute: {final_log_path}")
+            if final_log_path.exists():
+                size = final_log_path.stat().st_size
+                print(f"  Size: {size} bytes")
+                print(f"  ✓ Logfile exists and is accessible")
+            else:
+                print(f"  ⚠ WARNING: Logfile path reported but file not found!")
+            print("=" * 50)
 
 
 if __name__ == "__main__":
