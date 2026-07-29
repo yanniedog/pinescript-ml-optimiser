@@ -9,13 +9,16 @@ permissions:
 
 jobs:
   review:
+    # Fork PRs do not receive GEMINI_API_KEY / write tokens on pull_request.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: "Checkout Repo"
         uses: actions/checkout@v4
 
       - name: "Run AI Code Review"
-        uses: sshnaidm/gemini-code-review-action@v2
+        # Pin v2 tag (ecc2434…) so the secret-backed action cannot drift via a mutable tag.
+        uses: sshnaidm/gemini-code-review-action@ecc2434351ef76b0084b788a3d61ec7d3acf44f9 # v2
         with:
           gemini-key: ${{ secrets.GEMINI_API_KEY }}
           model: "gemini-flash-latest"
